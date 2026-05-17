@@ -694,6 +694,139 @@ function getVisibleSessions(sessions) {
   return filterVisible(sessions, _serverSettings, _activeView);
 }
 
+// =============================================================================
+// Operation layer (Phase 2)
+//
+// Two layers:
+//   1. Pure data ops: _opAddMembership/_opRemoveMembership/_opHide/_opUnhide —
+//      narrow, composable, no side effects beyond their name. Operate on a
+//      local settings object (typically a clone of _serverSettings) so callers
+//      can compose multiple operations before PATCHing.
+//   2. User-intent ops: hideSessionOp/unhideSessionOp/addSessionToViewOp/
+//      removeSessionFromViewOp — express what the *user* meant. Some compose
+//      multiple pure ops:
+//        - hideSessionOp  = hide + removeFromAllViews  (asymmetric: v1
+//          federation-safe; matches current UX)
+//        - addSessionToViewOp = unhide + addMembership  (auto-unhide on add,
+//          explicit composition)
+//        - unhideSessionOp = unhide (orthogonal — does NOT touch membership)
+//        - removeSessionFromViewOp = removeMembership (orthogonal — does NOT
+//          hide)
+//
+//   The asymmetry between hideSessionOp (which removes from views) and
+//   addSessionToViewOp (which unhides) is intentional. See
+//   docs/plans/2026-05-17-hidden-state-redesign-design.md.
+// =============================================================================
+
+// --- Pure data ops ---
+
+// Add `key` to view's session list if absent. No-op if view doesn't exist.
+function _opAddMembership(state, viewName, key) {
+  var views = state.views || [];
+  for (var i = 0; i < views.length; i++) {
+    if (views[i].name === viewName) {
+      var sessions = views[i].sessions || [];
+      if (sessions.indexOf(key) === -1) {
+        sessions.push(key);
+        views[i].sessions = sessions;
+      }
+      break;
+    }
+  }
+}
+
+// Remove `key` from view's session list. No-op if view or key absent.
+function _opRemoveMembership(state, viewName, key) {
+  var views = state.views || [];
+  for (var i = 0; i < views.length; i++) {
+    if (views[i].name === viewName) {
+      var sessions = views[i].sessions || [];
+      var pos = sessions.indexOf(key);
+      if (pos !== -1) {
+        sessions.splice(pos, 1);
+        views[i].sessions = sessions;
+      }
+      break;
+    }
+  }
+}
+
+// Remove `key` from every view's session list.
+function _opRemoveFromAllViews(state, key) {
+  var views = state.views || [];
+  for (var i = 0; i < views.length; i++) {
+    var sessions = views[i].sessions || [];
+    var pos = sessions.indexOf(key);
+    if (pos !== -1) {
+      sessions.splice(pos, 1);
+      views[i].sessions = sessions;
+    }
+  }
+}
+
+// Append `key` to hidden_sessions if absent.
+function _opHide(state, key) {
+  if (state.hidden_sessions.indexOf(key) === -1) {
+    state.hidden_sessions.push(key);
+  }
+}
+
+// Remove `key` from hidden_sessions. No-op if absent.
+function _opUnhide(state, key) {
+  var pos = state.hidden_sessions.indexOf(key);
+  if (pos !== -1) {
+    state.hidden_sessions.splice(pos, 1);
+  }
+}
+
+// Helper: deep-clone the bits we mutate (avoid touching the cached
+// _serverSettings before the PATCH confirms).
+function _cloneOpState(settings) {
+  return JSON.parse(JSON.stringify({
+    hidden_sessions: (settings && settings.hidden_sessions) || [],
+    views: (settings && settings.views) || []
+  }));
+}
+
+// --- User-intent ops ---
+// Each returns the patch body for /api/settings.
+
+// hideSessionOp: hide(k) + removeFromAllViews(k).
+// Asymmetric — removes from all views. This is the v1 federation-safe
+// behaviour; matching the current UX. Returns { hidden_sessions, views }.
+function hideSessionOp(settings, key) {
+  var state = _cloneOpState(settings);
+  _opHide(state, key);
+  _opRemoveFromAllViews(state, key);
+  return { hidden_sessions: state.hidden_sessions, views: state.views };
+}
+
+// unhideSessionOp: unhide(k) only.
+// Orthogonal — does NOT touch view membership. Returns { hidden_sessions }.
+function unhideSessionOp(settings, key) {
+  var state = _cloneOpState(settings);
+  _opUnhide(state, key);
+  return { hidden_sessions: state.hidden_sessions };
+}
+
+// addSessionToViewOp: unhide(k) + addMembership(k, viewName).
+// Auto-unhide on add is explicit composition here, not an invariant
+// enforced elsewhere. Returns { hidden_sessions, views }.
+function addSessionToViewOp(settings, viewName, key) {
+  var state = _cloneOpState(settings);
+  _opUnhide(state, key);
+  _opAddMembership(state, viewName, key);
+  return { hidden_sessions: state.hidden_sessions, views: state.views };
+}
+
+// removeSessionFromViewOp: removeMembership(k, viewName) only.
+// Orthogonal — does NOT hide the session. Returns { views }.
+function removeSessionFromViewOp(settings, viewName, key) {
+  var state = _cloneOpState(settings);
+  _opRemoveMembership(state, viewName, key);
+  return { views: state.views };
+}
+
 /**
  * Resolve the active view name against the known views list.
  *
@@ -1924,32 +2057,21 @@ function _openMobileViewPicker(sessionKey, sessionName, unhideFirst) {
       if (!viewBtn) return;
 
       var idx = parseInt(viewBtn.dataset.viewIndex, 10);
-      var updatedViews = JSON.parse(JSON.stringify((_serverSettings && _serverSettings.views) || []));
-      var view = updatedViews[idx];
+      var views = (_serverSettings && _serverSettings.views) || [];
+      var view = views[idx];
       if (!view) return;
 
       var sessions = view.sessions || [];
-      var pos = sessions.indexOf(sessionKey);
+      var isAlreadyInView = sessions.indexOf(sessionKey) !== -1;
+
+      var patch;
       var nowIn;
-      if (pos !== -1) {
-        sessions.splice(pos, 1);
+      if (isAlreadyInView) {
+        patch = removeSessionFromViewOp(_serverSettings, view.name, sessionKey);
         nowIn = false;
       } else {
-        sessions.push(sessionKey);
+        patch = addSessionToViewOp(_serverSettings, view.name, sessionKey);
         nowIn = true;
-      }
-      view.sessions = sessions;
-
-      var patch = { views: updatedViews };
-      if (unhideFirst && nowIn) {
-        var hidden = (_serverSettings && _serverSettings.hidden_sessions) || [];
-        var hiddenIdx = hidden.indexOf(sessionKey);
-        if (hiddenIdx !== -1) {
-          var updatedHidden = hidden.slice();
-          updatedHidden.splice(hiddenIdx, 1);
-          patch.hidden_sessions = updatedHidden;
-          unhideFirst = false;  // only unhide on first successful add
-        }
       }
 
       // Update checkmark immediately for responsiveness
@@ -1959,10 +2081,10 @@ function _openMobileViewPicker(sessionKey, sessionName, unhideFirst) {
       api('PATCH', '/api/settings', patch)
         .then(function() {
           if (_serverSettings) {
-            _serverSettings.views = updatedViews;
+            _serverSettings.views = patch.views;
             if (patch.hidden_sessions) _serverSettings.hidden_sessions = patch.hidden_sessions;
           }
-          if (patch.hidden_sessions) renderGrid(_currentSessions || []);
+          if (nowIn && patch.hidden_sessions) renderGrid(_currentSessions || []);
         })
         .catch(function(err) {
           showToast('Couldn\u2019t save \u2014 try again');
@@ -2086,7 +2208,6 @@ function _openFlyoutSubmenu(triggerItem, unhideFirst) {
     var newViewAction = e.target.closest('[data-action="new-view-in-flyout"]');
     if (newViewAction) {
       var capturedKey = sessionKey;
-      var capturedUnhide = unhideFirst;
       closeFlyoutMenu();
       var newName = prompt('View name:');
       if (!newName || !newName.trim()) return;
@@ -2100,23 +2221,21 @@ function _openFlyoutSubmenu(triggerItem, unhideFirst) {
         showToast('View \'' + newName + '\' already exists');
         return;
       }
+      // New-view creation: addSessionToViewOp doesn't model view creation, but
+      // we use it on a temp settings (with the new view already appended) so
+      // that the hidden_sessions update is expressed via the op layer.
       var newView = { name: newName, sessions: [capturedKey] };
       var newViews = existViews.concat([newView]);
-      var flyoutPatch = { views: newViews };
-      if (capturedUnhide) {
-        var hiddenList = (_serverSettings && _serverSettings.hidden_sessions) || [];
-        var hi = hiddenList.indexOf(capturedKey);
-        if (hi !== -1) {
-          var updHidden = hiddenList.slice();
-          updHidden.splice(hi, 1);
-          flyoutPatch.hidden_sessions = updHidden;
-        }
-      }
+      var tempSettings = {
+        hidden_sessions: (_serverSettings && _serverSettings.hidden_sessions) || [],
+        views: newViews
+      };
+      var flyoutPatch = addSessionToViewOp(tempSettings, newName, capturedKey);
       api('PATCH', '/api/settings', flyoutPatch)
         .then(function() {
           if (_serverSettings) {
-            _serverSettings.views = newViews;
-            if (flyoutPatch.hidden_sessions) _serverSettings.hidden_sessions = flyoutPatch.hidden_sessions;
+            _serverSettings.views = flyoutPatch.views;
+            _serverSettings.hidden_sessions = flyoutPatch.hidden_sessions;
           }
           switchView(newName);
         })
@@ -2130,35 +2249,24 @@ function _openFlyoutSubmenu(triggerItem, unhideFirst) {
     if (!btn) return;
     var idx = parseInt(btn.dataset.viewIndex, 10);
 
-    var updatedViews = JSON.parse(JSON.stringify((_serverSettings && _serverSettings.views) || []));
-    var view = updatedViews[idx];
+    var views = (_serverSettings && _serverSettings.views) || [];
+    var view = views[idx];
     if (!view) return;
 
     var sessions = view.sessions || [];
-    var pos = sessions.indexOf(sessionKey);
-    if (pos !== -1) {
-      sessions.splice(pos, 1);
+    var isAlreadyInView = sessions.indexOf(sessionKey) !== -1;
+
+    var patch;
+    if (isAlreadyInView) {
+      patch = removeSessionFromViewOp(_serverSettings, view.name, sessionKey);
     } else {
-      sessions.push(sessionKey);
-    }
-    view.sessions = sessions;
-
-    var patch = { views: updatedViews };
-
-    if (unhideFirst) {
-      var hidden = (_serverSettings && _serverSettings.hidden_sessions) || [];
-      var hiddenIdx = hidden.indexOf(sessionKey);
-      if (hiddenIdx !== -1) {
-        var updatedHidden = hidden.slice();
-        updatedHidden.splice(hiddenIdx, 1);
-        patch.hidden_sessions = updatedHidden;
-      }
+      patch = addSessionToViewOp(_serverSettings, view.name, sessionKey);
     }
 
     api('PATCH', '/api/settings', patch)
       .then(function() {
         if (_serverSettings) {
-          _serverSettings.views = updatedViews;
+          _serverSettings.views = patch.views;
           if (patch.hidden_sessions) _serverSettings.hidden_sessions = patch.hidden_sessions;
         }
         // Update checkmarks in submenu
@@ -2167,12 +2275,13 @@ function _openFlyoutSubmenu(triggerItem, unhideFirst) {
           for (var ci = 0; ci < checkItems.length; ci++) {
             var vi = parseInt(checkItems[ci].dataset.viewIndex, 10);
             var checkEl = checkItems[ci].querySelector('.flyout-submenu__check');
-            if (checkEl && updatedViews[vi]) {
-              checkEl.textContent = (updatedViews[vi].sessions || []).indexOf(sessionKey) !== -1 ? '\u2713' : '';
+            var updViews = (_serverSettings && _serverSettings.views) || [];
+            if (checkEl && updViews[vi]) {
+              checkEl.textContent = (updViews[vi].sessions || []).indexOf(sessionKey) !== -1 ? '\u2713' : '';
             }
           }
         }
-        if (unhideFirst) {
+        if (!isAlreadyInView && patch.hidden_sessions) {
           renderGrid(_currentSessions || []);
         }
       })
@@ -2191,30 +2300,15 @@ function _doHideSession() {
   var sessionKey = _flyoutSessionKey;
   if (!sessionKey) return;
 
-  var hidden = (_serverSettings && _serverSettings.hidden_sessions) || [];
-  var views = (_serverSettings && _serverSettings.views) || [];
-
-  // Add to hidden_sessions
-  var updatedHidden = hidden.slice();
-  if (updatedHidden.indexOf(sessionKey) === -1) {
-    updatedHidden.push(sessionKey);
-  }
-
-  // Remove from all views (mutual exclusion)
-  var updatedViews = JSON.parse(JSON.stringify(views));
-  for (var i = 0; i < updatedViews.length; i++) {
-    var sessions = updatedViews[i].sessions || [];
-    var idx = sessions.indexOf(sessionKey);
-    if (idx !== -1) sessions.splice(idx, 1);
-  }
+  var patch = hideSessionOp(_serverSettings, sessionKey);
 
   closeFlyoutMenu();
 
-  api('PATCH', '/api/settings', { hidden_sessions: updatedHidden, views: updatedViews })
+  api('PATCH', '/api/settings', patch)
     .then(function() {
       if (_serverSettings) {
-        _serverSettings.hidden_sessions = updatedHidden;
-        _serverSettings.views = updatedViews;
+        _serverSettings.hidden_sessions = patch.hidden_sessions;
+        _serverSettings.views = patch.views;
       }
       renderGrid(_currentSessions || []);
       renderViewDropdown();
@@ -2233,18 +2327,17 @@ function _doUnhideSession() {
   var sessionKey = _flyoutSessionKey;
   if (!sessionKey) return;
 
+  // Early-exit if session is not hidden (no PATCH needed).
   var hidden = (_serverSettings && _serverSettings.hidden_sessions) || [];
-  var idx = hidden.indexOf(sessionKey);
-  if (idx === -1) { closeFlyoutMenu(); return; }
+  if (hidden.indexOf(sessionKey) === -1) { closeFlyoutMenu(); return; }
 
-  var updatedHidden = hidden.slice();
-  updatedHidden.splice(idx, 1);
+  var patch = unhideSessionOp(_serverSettings, sessionKey);
 
   closeFlyoutMenu();
 
-  api('PATCH', '/api/settings', { hidden_sessions: updatedHidden })
+  api('PATCH', '/api/settings', patch)
     .then(function() {
-      if (_serverSettings) _serverSettings.hidden_sessions = updatedHidden;
+      if (_serverSettings) _serverSettings.hidden_sessions = patch.hidden_sessions;
       renderGrid(_currentSessions || []);
       renderViewDropdown();
     })
@@ -2262,24 +2355,13 @@ function _doRemoveFromView() {
   var sessionKey = _flyoutSessionKey;
   if (!sessionKey || _activeView === 'all' || _activeView === 'hidden') return;
 
-  var views = (_serverSettings && _serverSettings.views) || [];
-  var updatedViews = JSON.parse(JSON.stringify(views));
-
-  // Find the active view and remove the session
-  for (var i = 0; i < updatedViews.length; i++) {
-    if (updatedViews[i].name === _activeView) {
-      var sessions = updatedViews[i].sessions || [];
-      var idx = sessions.indexOf(sessionKey);
-      if (idx !== -1) sessions.splice(idx, 1);
-      break;
-    }
-  }
+  var patch = removeSessionFromViewOp(_serverSettings, _activeView, sessionKey);
 
   closeFlyoutMenu();
 
-  api('PATCH', '/api/settings', { views: updatedViews })
+  api('PATCH', '/api/settings', patch)
     .then(function() {
-      if (_serverSettings) _serverSettings.views = updatedViews;
+      if (_serverSettings) _serverSettings.views = patch.views;
       renderGrid(_currentSessions || []);
     })
     .catch(function(err) {
@@ -2606,40 +2688,18 @@ function renderManageViewList() {
     if (!cb) return;
     var sessionKey = cb.dataset.sessionKey;
     var isChecked = cb.checked;
-    var isHiddenSession = cb.dataset.isHidden === '1';
 
-    var views = (_serverSettings && _serverSettings.views) || [];
-    var updatedViews = JSON.parse(JSON.stringify(views));
-
-    for (var vi = 0; vi < updatedViews.length; vi++) {
-      if (updatedViews[vi].name === _activeView) {
-        var vs = updatedViews[vi].sessions || [];
-        if (isChecked) {
-          if (vs.indexOf(sessionKey) === -1) vs.push(sessionKey);
-        } else {
-          var pos = vs.indexOf(sessionKey);
-          if (pos !== -1) vs.splice(pos, 1);
-        }
-        updatedViews[vi].sessions = vs;
-        break;
-      }
-    }
-
-    var patch = { views: updatedViews };
-    if (isHiddenSession && isChecked) {
-      var hiddenList = (_serverSettings && _serverSettings.hidden_sessions) || [];
-      var hi = hiddenList.indexOf(sessionKey);
-      if (hi !== -1) {
-        var updatedHidden = hiddenList.slice();
-        updatedHidden.splice(hi, 1);
-        patch.hidden_sessions = updatedHidden;
-      }
+    var patch;
+    if (isChecked) {
+      patch = addSessionToViewOp(_serverSettings, _activeView, sessionKey);
+    } else {
+      patch = removeSessionFromViewOp(_serverSettings, _activeView, sessionKey);
     }
 
     api('PATCH', '/api/settings', patch)
       .then(function() {
         if (_serverSettings) {
-          _serverSettings.views = updatedViews;
+          _serverSettings.views = patch.views;
           if (patch.hidden_sessions) _serverSettings.hidden_sessions = patch.hidden_sessions;
         }
         // Update summary count in-place — do NOT re-render the full list (avoids layout thrash)
@@ -4528,6 +4588,18 @@ if (typeof module !== 'undefined' && module.exports) {
     isHidden,
     filterVisible,
     visibleCount,
+    // Operation layer (Phase 2) — pure data ops
+    _opAddMembership,
+    _opRemoveMembership,
+    _opRemoveFromAllViews,
+    _opHide,
+    _opUnhide,
+    _cloneOpState,
+    // Operation layer (Phase 2) — user-intent ops
+    hideSessionOp,
+    unhideSessionOp,
+    addSessionToViewOp,
+    removeSessionFromViewOp,
     // Federation tiles
     buildStatusTileHTML,
     // Constants

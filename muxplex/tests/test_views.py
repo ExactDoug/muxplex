@@ -3,10 +3,15 @@ Tests for muxplex/views.py — views invariant enforcement and v2 visibility hel
 """
 
 from muxplex.views import (
+    add_membership,
     enforce_mutual_exclusion,
     filter_visible,
+    hide,
     is_hidden,
     normalize_session_keys,
+    remove_from_all_views,
+    remove_membership,
+    unhide,
     validate_view_name,
     visible_count,
 )
@@ -404,3 +409,163 @@ def test_normalize_handles_cross_device_name_collisions_safely():
     # implementation uses setdefault, so first-seen wins. Document the behavior
     # in this test so the choice is visible.
     assert result["hidden_sessions"][0] in {"dev1:a", "dev2:a"}
+
+
+# ---------------------------------------------------------------------------
+# Pure data operations (Phase 2)
+# See docs/plans/2026-05-17-hidden-state-redesign-design.md
+# ---------------------------------------------------------------------------
+
+
+def _settings_with_state() -> dict:
+    """Return a settings dict with both views and hidden_sessions populated."""
+    return {
+        "hidden_sessions": ["dev1:a", "dev1:b"],
+        "views": [
+            {"name": "Work", "sessions": ["dev1:a", "dev1:c"]},
+            {"name": "Personal", "sessions": ["dev1:b", "dev1:d"]},
+        ],
+    }
+
+
+# --- add_membership ---
+
+
+def test_add_membership_adds_key_when_absent():
+    settings = _settings_with_state()
+    result = add_membership(settings, "Work", "dev1:new")
+    assert "dev1:new" in result["views"][0]["sessions"]
+
+
+def test_add_membership_is_idempotent():
+    settings = _settings_with_state()
+    add_membership(settings, "Work", "dev1:a")  # already present
+    assert settings["views"][0]["sessions"].count("dev1:a") == 1
+
+
+def test_add_membership_is_noop_for_unknown_view():
+    settings = _settings_with_state()
+    original_work = settings["views"][0]["sessions"][:]
+    original_personal = settings["views"][1]["sessions"][:]
+    result = add_membership(settings, "DoesNotExist", "dev1:new")
+    assert result["views"][0]["sessions"] == original_work
+    assert result["views"][1]["sessions"] == original_personal
+
+
+def test_add_membership_does_not_touch_hidden_sessions():
+    """Pure op: add_membership must not touch hidden_sessions."""
+    settings = _settings_with_state()
+    original_hidden = settings["hidden_sessions"][:]
+    add_membership(settings, "Work", "dev1:new")
+    assert settings["hidden_sessions"] == original_hidden
+
+
+# --- remove_membership ---
+
+
+def test_remove_membership_removes_the_key():
+    settings = _settings_with_state()
+    result = remove_membership(settings, "Work", "dev1:a")
+    assert "dev1:a" not in result["views"][0]["sessions"]
+
+
+def test_remove_membership_is_noop_when_key_absent():
+    settings = _settings_with_state()
+    before = settings["views"][0]["sessions"][:]
+    remove_membership(settings, "Work", "dev1:nothere")
+    assert settings["views"][0]["sessions"] == before
+
+
+def test_remove_membership_is_noop_for_unknown_view():
+    settings = _settings_with_state()
+    original_work = settings["views"][0]["sessions"][:]
+    original_personal = settings["views"][1]["sessions"][:]
+    result = remove_membership(settings, "DoesNotExist", "dev1:a")
+    assert result["views"][0]["sessions"] == original_work
+    assert result["views"][1]["sessions"] == original_personal
+
+
+def test_remove_membership_does_not_touch_hidden_sessions():
+    """Pure op: remove_membership must not touch hidden_sessions."""
+    settings = _settings_with_state()
+    original_hidden = settings["hidden_sessions"][:]
+    remove_membership(settings, "Work", "dev1:a")
+    assert settings["hidden_sessions"] == original_hidden
+
+
+# --- remove_from_all_views ---
+
+
+def test_remove_from_all_views_clears_key_from_all_views():
+    settings = {
+        "hidden_sessions": ["dev1:x"],
+        "views": [
+            {"name": "Work", "sessions": ["dev1:x", "dev1:y"]},
+            {"name": "Personal", "sessions": ["dev1:x", "dev1:z"]},
+        ],
+    }
+    result = remove_from_all_views(settings, "dev1:x")
+    assert "dev1:x" not in result["views"][0]["sessions"]
+    assert "dev1:x" not in result["views"][1]["sessions"]
+    assert "dev1:y" in result["views"][0]["sessions"]
+    assert "dev1:z" in result["views"][1]["sessions"]
+
+
+def test_remove_from_all_views_does_not_touch_hidden_sessions():
+    """Pure op: remove_from_all_views must not touch hidden_sessions."""
+    settings = _settings_with_state()
+    original_hidden = settings["hidden_sessions"][:]
+    remove_from_all_views(settings, "dev1:a")
+    assert settings["hidden_sessions"] == original_hidden
+
+
+# --- hide ---
+
+
+def test_hide_adds_to_hidden_sessions_when_absent():
+    settings = {"hidden_sessions": ["dev1:b"], "views": []}
+    result = hide(settings, "dev1:new")
+    assert "dev1:new" in result["hidden_sessions"]
+
+
+def test_hide_is_idempotent():
+    settings = {"hidden_sessions": ["dev1:a"], "views": []}
+    hide(settings, "dev1:a")  # already present
+    assert settings["hidden_sessions"].count("dev1:a") == 1
+
+
+def test_hide_does_not_touch_views():
+    """Pure op: hide must not touch views."""
+    settings = _settings_with_state()
+    original_work = settings["views"][0]["sessions"][:]
+    original_personal = settings["views"][1]["sessions"][:]
+    hide(settings, "dev1:new")
+    assert settings["views"][0]["sessions"] == original_work
+    assert settings["views"][1]["sessions"] == original_personal
+
+
+# --- unhide ---
+
+
+def test_unhide_removes_from_hidden_sessions():
+    settings = {"hidden_sessions": ["dev1:a", "dev1:b"], "views": []}
+    result = unhide(settings, "dev1:a")
+    assert "dev1:a" not in result["hidden_sessions"]
+    assert "dev1:b" in result["hidden_sessions"]
+
+
+def test_unhide_is_noop_when_absent():
+    settings = {"hidden_sessions": ["dev1:b"], "views": []}
+    before = settings["hidden_sessions"][:]
+    unhide(settings, "dev1:nothere")
+    assert settings["hidden_sessions"] == before
+
+
+def test_unhide_does_not_touch_views():
+    """Pure op: unhide must not touch views."""
+    settings = _settings_with_state()
+    original_work = settings["views"][0]["sessions"][:]
+    original_personal = settings["views"][1]["sessions"][:]
+    unhide(settings, "dev1:a")
+    assert settings["views"][0]["sessions"] == original_work
+    assert settings["views"][1]["sessions"] == original_personal

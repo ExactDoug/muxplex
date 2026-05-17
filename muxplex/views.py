@@ -203,6 +203,65 @@ def enforce_mutual_exclusion(settings: dict) -> dict:
     return settings
 
 
+# ---------------------------------------------------------------------------
+# Pure data ops (Phase 2)
+#
+# Pure data ops. Composable. No tangling of concerns. User-intent ops live on
+# the frontend (where the PATCH boundary is) and call these to build the final
+# state.
+#
+# Each mutates the settings dict in place and returns it. No side effects
+# beyond the named operation.
+# ---------------------------------------------------------------------------
+
+
+def add_membership(settings: dict, view_name: str, key: str) -> dict:
+    """Add `key` to view's session list if absent. No-op if view doesn't exist."""
+    for view in settings.get("views") or []:
+        if view.get("name") == view_name:
+            sessions = view.setdefault("sessions", [])
+            if key not in sessions:
+                sessions.append(key)
+            break
+    return settings
+
+
+def remove_membership(settings: dict, view_name: str, key: str) -> dict:
+    """Remove `key` from view's session list. No-op if view or key absent."""
+    for view in settings.get("views") or []:
+        if view.get("name") == view_name:
+            sessions = view.get("sessions") or []
+            if key in sessions:
+                sessions.remove(key)
+            break
+    return settings
+
+
+def remove_from_all_views(settings: dict, key: str) -> dict:
+    """Remove `key` from every view's session list."""
+    for view in settings.get("views") or []:
+        sessions = view.get("sessions") or []
+        if key in sessions:
+            sessions.remove(key)
+    return settings
+
+
+def hide(settings: dict, key: str) -> dict:
+    """Append `key` to hidden_sessions if absent."""
+    hidden = settings.setdefault("hidden_sessions", [])
+    if key not in hidden:
+        hidden.append(key)
+    return settings
+
+
+def unhide(settings: dict, key: str) -> dict:
+    """Remove `key` from hidden_sessions. No-op if absent."""
+    hidden = settings.get("hidden_sessions") or []
+    if key in hidden:
+        hidden.remove(key)
+    return settings
+
+
 def validate_view_name(name: str, existing_views: list[dict]) -> str | None:
     """Validate a view name. Returns an error message string, or None if valid.
 

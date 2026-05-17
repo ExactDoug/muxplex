@@ -5066,3 +5066,286 @@ test('visibleCount always equals filterVisible().length for the same inputs', ()
     );
   }
 });
+
+// =============================================================================
+// Phase 2 operation layer
+// =============================================================================
+
+// Helper: build a settings-like object with both views and hidden_sessions.
+function _settingsWithState() {
+  return {
+    hidden_sessions: ['dev1:a', 'dev1:b'],
+    views: [
+      { name: 'Work',     sessions: ['dev1:a', 'dev1:c'] },
+      { name: 'Personal', sessions: ['dev1:b', 'dev1:d'] },
+    ],
+  };
+}
+
+// --- Exports check ---
+
+test('app.js exports all Phase 2 operation layer functions', () => {
+  const fns = [
+    '_opAddMembership', '_opRemoveMembership', '_opRemoveFromAllViews',
+    '_opHide', '_opUnhide', '_cloneOpState',
+    'hideSessionOp', 'unhideSessionOp', 'addSessionToViewOp', 'removeSessionFromViewOp',
+  ];
+  for (const fn of fns) {
+    assert.ok(fn in app, `app.js should export "${fn}"`);
+    assert.strictEqual(typeof app[fn], 'function', `"${fn}" should be a function`);
+  }
+});
+
+// --- _cloneOpState ---
+
+test('_cloneOpState returns a deep clone — mutations do not affect the original', () => {
+  const settings = _settingsWithState();
+  const clone = app._cloneOpState(settings);
+  clone.hidden_sessions.push('dev1:new');
+  clone.views[0].sessions.push('dev1:extra');
+  // Original untouched
+  assert.strictEqual(settings.hidden_sessions.indexOf('dev1:new'), -1);
+  assert.strictEqual(settings.views[0].sessions.indexOf('dev1:extra'), -1);
+});
+
+// --- Pure op isolation: each op affects ONLY its named field ---
+
+test('_opAddMembership does not touch hidden_sessions', () => {
+  const settings = _settingsWithState();
+  const state = app._cloneOpState(settings);
+  const hiddenBefore = JSON.stringify(state.hidden_sessions);
+  app._opAddMembership(state, 'Work', 'dev1:new');
+  assert.strictEqual(JSON.stringify(state.hidden_sessions), hiddenBefore);
+});
+
+test('_opRemoveMembership does not touch hidden_sessions', () => {
+  const settings = _settingsWithState();
+  const state = app._cloneOpState(settings);
+  const hiddenBefore = JSON.stringify(state.hidden_sessions);
+  app._opRemoveMembership(state, 'Work', 'dev1:a');
+  assert.strictEqual(JSON.stringify(state.hidden_sessions), hiddenBefore);
+});
+
+test('_opRemoveFromAllViews does not touch hidden_sessions', () => {
+  const settings = _settingsWithState();
+  const state = app._cloneOpState(settings);
+  const hiddenBefore = JSON.stringify(state.hidden_sessions);
+  app._opRemoveFromAllViews(state, 'dev1:a');
+  assert.strictEqual(JSON.stringify(state.hidden_sessions), hiddenBefore);
+});
+
+test('_opHide does not touch views', () => {
+  const settings = _settingsWithState();
+  const state = app._cloneOpState(settings);
+  const viewsBefore = JSON.stringify(state.views);
+  app._opHide(state, 'dev1:new');
+  assert.strictEqual(JSON.stringify(state.views), viewsBefore);
+});
+
+test('_opUnhide does not touch views', () => {
+  const settings = _settingsWithState();
+  const state = app._cloneOpState(settings);
+  const viewsBefore = JSON.stringify(state.views);
+  app._opUnhide(state, 'dev1:a');
+  assert.strictEqual(JSON.stringify(state.views), viewsBefore);
+});
+
+// --- _opAddMembership ---
+
+test('_opAddMembership adds key when absent', () => {
+  const state = app._cloneOpState(_settingsWithState());
+  app._opAddMembership(state, 'Work', 'dev1:new');
+  assert.ok(state.views[0].sessions.includes('dev1:new'));
+});
+
+test('_opAddMembership is idempotent — no duplicate', () => {
+  const state = app._cloneOpState(_settingsWithState());
+  app._opAddMembership(state, 'Work', 'dev1:a'); // already present
+  assert.strictEqual(state.views[0].sessions.filter(k => k === 'dev1:a').length, 1);
+});
+
+test('_opAddMembership is no-op for unknown view', () => {
+  const settings = _settingsWithState();
+  const state = app._cloneOpState(settings);
+  const viewsBefore = JSON.stringify(state.views);
+  app._opAddMembership(state, 'DoesNotExist', 'dev1:new');
+  assert.strictEqual(JSON.stringify(state.views), viewsBefore);
+});
+
+// --- _opRemoveMembership ---
+
+test('_opRemoveMembership removes key when present', () => {
+  const state = app._cloneOpState(_settingsWithState());
+  app._opRemoveMembership(state, 'Work', 'dev1:a');
+  assert.ok(!state.views[0].sessions.includes('dev1:a'));
+});
+
+test('_opRemoveMembership is no-op when key absent', () => {
+  const settings = _settingsWithState();
+  const state = app._cloneOpState(settings);
+  const workBefore = JSON.stringify(state.views[0].sessions);
+  app._opRemoveMembership(state, 'Work', 'dev1:nothere');
+  assert.strictEqual(JSON.stringify(state.views[0].sessions), workBefore);
+});
+
+test('_opRemoveMembership is no-op for unknown view', () => {
+  const settings = _settingsWithState();
+  const state = app._cloneOpState(settings);
+  const viewsBefore = JSON.stringify(state.views);
+  app._opRemoveMembership(state, 'DoesNotExist', 'dev1:a');
+  assert.strictEqual(JSON.stringify(state.views), viewsBefore);
+});
+
+// --- _opRemoveFromAllViews ---
+
+test('_opRemoveFromAllViews removes key from every view', () => {
+  const state = {
+    hidden_sessions: ['dev1:x'],
+    views: [
+      { name: 'Work',     sessions: ['dev1:x', 'dev1:y'] },
+      { name: 'Personal', sessions: ['dev1:x', 'dev1:z'] },
+    ],
+  };
+  app._opRemoveFromAllViews(state, 'dev1:x');
+  assert.ok(!state.views[0].sessions.includes('dev1:x'));
+  assert.ok(!state.views[1].sessions.includes('dev1:x'));
+  // Other keys untouched
+  assert.ok(state.views[0].sessions.includes('dev1:y'));
+  assert.ok(state.views[1].sessions.includes('dev1:z'));
+});
+
+// --- _opHide ---
+
+test('_opHide adds key to hidden_sessions when absent', () => {
+  const state = { hidden_sessions: ['dev1:b'], views: [] };
+  app._opHide(state, 'dev1:new');
+  assert.ok(state.hidden_sessions.includes('dev1:new'));
+});
+
+test('_opHide is idempotent — no duplicate', () => {
+  const state = { hidden_sessions: ['dev1:a'], views: [] };
+  app._opHide(state, 'dev1:a');
+  assert.strictEqual(state.hidden_sessions.filter(k => k === 'dev1:a').length, 1);
+});
+
+// --- _opUnhide ---
+
+test('_opUnhide removes key from hidden_sessions', () => {
+  const state = { hidden_sessions: ['dev1:a', 'dev1:b'], views: [] };
+  app._opUnhide(state, 'dev1:a');
+  assert.ok(!state.hidden_sessions.includes('dev1:a'));
+  assert.ok(state.hidden_sessions.includes('dev1:b'));
+});
+
+test('_opUnhide is no-op when key absent', () => {
+  const state = { hidden_sessions: ['dev1:b'], views: [] };
+  app._opUnhide(state, 'dev1:nothere');
+  assert.deepStrictEqual(state.hidden_sessions, ['dev1:b']);
+});
+
+// --- hideSessionOp (user-intent, asymmetric) ---
+
+test('hideSessionOp puts key in hidden_sessions AND removes from all views', () => {
+  const settings = _settingsWithState();
+  // dev1:a is in Work and in hidden_sessions already; dev1:c is in Work, not hidden
+  // Let's use a clean state where dev1:c is visible (in Work, not hidden)
+  const s = {
+    hidden_sessions: [],
+    views: [
+      { name: 'Work',     sessions: ['dev1:c', 'dev1:d'] },
+      { name: 'Personal', sessions: ['dev1:c', 'dev1:e'] },
+    ],
+  };
+  const patch = app.hideSessionOp(s, 'dev1:c');
+  assert.ok(patch.hidden_sessions.includes('dev1:c'), 'hidden_sessions must contain dev1:c');
+  assert.ok(!patch.views[0].sessions.includes('dev1:c'), 'Work must not contain dev1:c');
+  assert.ok(!patch.views[1].sessions.includes('dev1:c'), 'Personal must not contain dev1:c');
+  // Other keys unaffected
+  assert.ok(patch.views[0].sessions.includes('dev1:d'));
+  assert.ok(patch.views[1].sessions.includes('dev1:e'));
+});
+
+test('hideSessionOp returns both hidden_sessions and views in patch', () => {
+  const patch = app.hideSessionOp(_settingsWithState(), 'dev1:x');
+  assert.ok('hidden_sessions' in patch, 'patch must have hidden_sessions');
+  assert.ok('views' in patch, 'patch must have views');
+});
+
+// --- unhideSessionOp (user-intent, orthogonal) ---
+
+test('unhideSessionOp removes key from hidden_sessions', () => {
+  const settings = _settingsWithState(); // dev1:a is in hidden_sessions
+  const patch = app.unhideSessionOp(settings, 'dev1:a');
+  assert.ok(!patch.hidden_sessions.includes('dev1:a'));
+});
+
+test('unhideSessionOp returns ONLY hidden_sessions — views key is absent', () => {
+  const patch = app.unhideSessionOp(_settingsWithState(), 'dev1:a');
+  assert.ok('hidden_sessions' in patch, 'patch must have hidden_sessions');
+  assert.ok(!('views' in patch), 'patch must NOT have views');
+});
+
+// --- addSessionToViewOp (user-intent, auto-unhide) ---
+
+test('addSessionToViewOp adds key to named view AND removes from hidden_sessions', () => {
+  // dev1:b is hidden AND not in Work view
+  const settings = {
+    hidden_sessions: ['dev1:b'],
+    views: [
+      { name: 'Work', sessions: ['dev1:a'] },
+    ],
+  };
+  const patch = app.addSessionToViewOp(settings, 'Work', 'dev1:b');
+  assert.ok(patch.views[0].sessions.includes('dev1:b'), 'Work must now contain dev1:b');
+  assert.ok(!patch.hidden_sessions.includes('dev1:b'), 'hidden_sessions must not contain dev1:b');
+});
+
+test('addSessionToViewOp returns both hidden_sessions and views', () => {
+  const patch = app.addSessionToViewOp(_settingsWithState(), 'Work', 'dev1:z');
+  assert.ok('hidden_sessions' in patch, 'patch must have hidden_sessions');
+  assert.ok('views' in patch, 'patch must have views');
+});
+
+// --- removeSessionFromViewOp (user-intent, orthogonal) ---
+
+test('removeSessionFromViewOp removes key from named view', () => {
+  const settings = _settingsWithState(); // dev1:a is in Work
+  const patch = app.removeSessionFromViewOp(settings, 'Work', 'dev1:a');
+  assert.ok(!patch.views[0].sessions.includes('dev1:a'));
+});
+
+test('removeSessionFromViewOp returns ONLY views — hidden_sessions is absent', () => {
+  const patch = app.removeSessionFromViewOp(_settingsWithState(), 'Work', 'dev1:a');
+  assert.ok('views' in patch, 'patch must have views');
+  assert.ok(!('hidden_sessions' in patch), 'patch must NOT have hidden_sessions');
+});
+
+// --- No mutation of _serverSettings ---
+
+test('hideSessionOp does not mutate its settings argument', () => {
+  const settings = _settingsWithState();
+  const before = JSON.stringify(settings);
+  app.hideSessionOp(settings, 'dev1:c');
+  assert.strictEqual(JSON.stringify(settings), before, 'settings must not be mutated');
+});
+
+test('unhideSessionOp does not mutate its settings argument', () => {
+  const settings = _settingsWithState();
+  const before = JSON.stringify(settings);
+  app.unhideSessionOp(settings, 'dev1:a');
+  assert.strictEqual(JSON.stringify(settings), before, 'settings must not be mutated');
+});
+
+test('addSessionToViewOp does not mutate its settings argument', () => {
+  const settings = _settingsWithState();
+  const before = JSON.stringify(settings);
+  app.addSessionToViewOp(settings, 'Work', 'dev1:b');
+  assert.strictEqual(JSON.stringify(settings), before, 'settings must not be mutated');
+});
+
+test('removeSessionFromViewOp does not mutate its settings argument', () => {
+  const settings = _settingsWithState();
+  const before = JSON.stringify(settings);
+  app.removeSessionFromViewOp(settings, 'Work', 'dev1:a');
+  assert.strictEqual(JSON.stringify(settings), before, 'settings must not be mutated');
+});
