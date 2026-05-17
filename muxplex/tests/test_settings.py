@@ -1137,3 +1137,37 @@ def test_peer_supports_v2_handles_legacy_payload():
     assert peer_supports_v2({}) is False  # legacy peer omits the field
     assert peer_supports_v2({"_schema_version": "garbage"}) is False
     assert peer_supports_v2({"_schema_version": None}) is False
+
+
+# ============================================================
+# stale_key_grace_hours (Phase 4)
+# See docs/plans/2026-05-17-hidden-state-redesign-design.md
+# ============================================================
+
+
+def test_stale_key_grace_hours_default_is_24():
+    """DEFAULT_SETTINGS must include stale_key_grace_hours defaulting to 24.0."""
+    assert "stale_key_grace_hours" in DEFAULT_SETTINGS, (
+        "DEFAULT_SETTINGS must include 'stale_key_grace_hours'"
+    )
+    assert DEFAULT_SETTINGS["stale_key_grace_hours"] == 24.0, (
+        f"stale_key_grace_hours default must be 24.0, "
+        f"got: {DEFAULT_SETTINGS['stale_key_grace_hours']!r}"
+    )
+
+
+def test_stale_key_grace_hours_is_in_syncable_keys():
+    """stale_key_grace_hours must be in SYNCABLE_KEYS so peers can share the grace period."""
+    assert "stale_key_grace_hours" in SYNCABLE_KEYS, (
+        "stale_key_grace_hours must be in SYNCABLE_KEYS"
+    )
+
+
+def test_stale_key_grace_hours_is_not_pruning_state():
+    """pruning_state bookkeeping must NOT be in SYNCABLE_KEYS under any circumstances."""
+    assert "pruning_state" not in SYNCABLE_KEYS, (
+        "pruning_state must never be in SYNCABLE_KEYS (it is local-only bookkeeping)"
+    )
+    assert "first_missed_at" not in SYNCABLE_KEYS, (
+        "first_missed_at must never be in SYNCABLE_KEYS (it is local-only bookkeeping)"
+    )

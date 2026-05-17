@@ -1,5 +1,6 @@
 """
-Views invariant enforcement, visibility filtering, and validation for muxplex.
+Views invariant enforcement, visibility filtering, validation, and stale-key
+pruning for muxplex.
 
 Schema v2 semantics (see docs/plans/2026-05-17-hidden-state-redesign-design.md):
 - "hidden" is a property of a session, determined by membership in
@@ -15,6 +16,8 @@ Other invariants:
 - Duplicate session keys within a view are deduplicated by
   `enforce_mutual_exclusion`.
 """
+
+import time
 
 RESERVED_VIEW_NAMES = frozenset({"all", "hidden"})
 MAX_VIEW_NAME_LENGTH = 30
@@ -282,3 +285,127 @@ def validate_view_name(name: str, existing_views: list[dict]) -> str | None:
     if trimmed in existing_names:
         return f"A view named '{trimmed}' already exists"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Stale key pruning (Phase 4)
+#
+# Each device independently tracks which session keys it has failed to observe,
+# and prunes them from its own settings once the grace period expires.
+#
+# CRITICAL: pruning bookkeeping (first-missed-at timestamps) does NOT sync.
+# The bookkeeping lives in ~/.config/muxplex/pruning.json (see pruning.py).
+# The prune ACTION (removing keys from views/hidden_sessions) IS a normal
+# settings write and syncs via the existing LWW mechanism.
+# ---------------------------------------------------------------------------
+
+
+def prune_stale_keys(
+    settings: dict,
+    live_keys: set[str],
+    *,
+    pruning_state: dict | None = None,
+    grace_seconds: float = 86400.0,  # 24 hours
+    now: float | None = None,
+) -> tuple[dict, dict, bool]:
+    """Drop session keys that have been missing past the grace period.
+
+    Args:
+        settings: settings dict (will be mutated if pruning happens).
+        live_keys: the set of session keys that currently exist (live).
+        pruning_state: local bookkeeping dict of the form
+            {"first_missed_at": {key: timestamp}}. Defaults to an empty
+            structure if None. Mutated in place.
+        grace_seconds: how long a key may be missing before it's pruned.
+        now: current time (for testing). Defaults to time.time().
+
+    Returns:
+        (settings, pruning_state, settings_changed) — settings_changed is True
+        iff any key was actually removed from view.sessions or hidden_sessions.
+
+    Behavior:
+      1. For each key in settings.hidden_sessions or any view.sessions:
+         - If key in live_keys: drop the key from pruning_state["first_missed_at"]
+           (it's alive, nothing to prune).
+         - If key not in live_keys:
+             - If first_missed_at[key] is absent, record now.
+             - Else if now - first_missed_at[key] >= grace_seconds, remove the
+               key from hidden_sessions and from every view's sessions list;
+               drop the bookkeeping entry for it.
+             - Else: leave both alone (within grace).
+      2. The pruning_state dict is the source of truth for "when did we first
+         miss this key" — never check live_keys against pruning_state's keys
+         that aren't actually in stored settings (clean up bookkeeping for
+         keys that are no longer referenced anywhere).
+
+    Federation note: each device only knows its own live sessions natively.
+    If remote-device keys are also tracked in hidden_sessions or view.sessions,
+    this function will start their grace timer on the pruning device.  Because
+    the grace period is 24 hours by default, brief sync gaps will not cause
+    thrash.  A remote device's keys are also pruned by that remote device from
+    its own perspective; a deletion syncs back via the LWW mechanism.
+    """
+    if pruning_state is None:
+        pruning_state = {}
+    if "first_missed_at" not in pruning_state:
+        pruning_state["first_missed_at"] = {}
+
+    first_missed: dict[str, float] = pruning_state["first_missed_at"]
+
+    if now is None:
+        now = time.time()
+
+    # Collect all session keys currently referenced in settings.
+    all_settings_keys: set[str] = set()
+    for key in settings.get("hidden_sessions") or []:
+        all_settings_keys.add(key)
+    for view in settings.get("views") or []:
+        for key in view.get("sessions") or []:
+            all_settings_keys.add(key)
+
+    settings_changed = False
+
+    # Evaluate each referenced key.
+    for key in all_settings_keys:
+        if key in live_keys:
+            # Session is alive — clear any stale bookkeeping for it.
+            first_missed.pop(key, None)
+        else:
+            # Session is currently missing from live_keys.
+            if key not in first_missed:
+                # First time we notice it's missing — start the clock.
+                first_missed[key] = now
+            elif now - first_missed[key] >= grace_seconds:
+                # Grace period expired — remove the key from settings.
+                hidden = settings.get("hidden_sessions") or []
+                if key in hidden:
+                    settings["hidden_sessions"] = [k for k in hidden if k != key]
+                    settings_changed = True
+                for view in settings.get("views") or []:
+                    view_sessions = view.get("sessions") or []
+                    if key in view_sessions:
+                        view["sessions"] = [k for k in view_sessions if k != key]
+                        settings_changed = True
+                # Drop the bookkeeping entry now that the key is gone.
+                del first_missed[key]
+            # else: still within grace — leave settings and bookkeeping alone.
+
+    # Garbage-collect bookkeeping entries that no longer correspond to any key
+    # in settings (they may have been removed by an external edit, a peer sync,
+    # or a previous prune cycle that ran on another device).  This prevents
+    # first_missed_at from accumulating forever.
+    #
+    # Recompute the live settings key set AFTER the pruning loop above, so
+    # keys that were just pruned don't count as "referenced".
+    current_settings_keys: set[str] = set()
+    for key in settings.get("hidden_sessions") or []:
+        current_settings_keys.add(key)
+    for view in settings.get("views") or []:
+        for key in view.get("sessions") or []:
+            current_settings_keys.add(key)
+
+    for key in list(first_missed):
+        if key not in current_settings_keys:
+            del first_missed[key]
+
+    return settings, pruning_state, settings_changed

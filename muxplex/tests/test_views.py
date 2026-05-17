@@ -9,6 +9,7 @@ from muxplex.views import (
     hide,
     is_hidden,
     normalize_session_keys,
+    prune_stale_keys,
     remove_from_all_views,
     remove_membership,
     unhide,
@@ -569,3 +570,273 @@ def test_unhide_does_not_touch_views():
     unhide(settings, "dev1:a")
     assert settings["views"][0]["sessions"] == original_work
     assert settings["views"][1]["sessions"] == original_personal
+
+
+# ---------------------------------------------------------------------------
+# Stale-key pruning (Phase 4)
+# See docs/plans/2026-05-17-hidden-state-redesign-design.md, Phase 4 and
+# the section "Stale key pruning (separate concern, local-only state)".
+# ---------------------------------------------------------------------------
+
+_GRACE = 86400.0  # 24 hours in seconds — default grace period used in tests
+_T0 = 1_700_000_000.0  # arbitrary stable "now" for deterministic tests
+
+
+def _pruning_settings() -> dict:
+    """Settings with one view and a hidden_sessions list for pruning tests."""
+    return {
+        "hidden_sessions": ["dev1:hidden"],
+        "views": [
+            {
+                "name": "Work",
+                "sessions": ["dev1:work-a", "dev1:work-b"],
+            },
+            {
+                "name": "Personal",
+                "sessions": ["dev1:personal-a"],
+            },
+        ],
+    }
+
+
+# 1. Live key clears bookkeeping
+def test_prune_live_key_clears_first_missed_at():
+    """If a key is in live_keys, any existing first_missed_at entry is removed."""
+    settings = _pruning_settings()
+    pruning_state = {"first_missed_at": {"dev1:work-a": _T0 - 1000.0}}
+
+    _, ps, changed = prune_stale_keys(
+        settings,
+        live_keys={"dev1:work-a", "dev1:work-b", "dev1:hidden", "dev1:personal-a"},
+        pruning_state=pruning_state,
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+
+    assert "dev1:work-a" not in ps["first_missed_at"]
+    assert changed is False
+
+
+# 2. Newly missing key records first_missed_at, settings unchanged
+def test_prune_newly_missing_key_records_timestamp():
+    """A key that is in settings but absent from live_keys gets a first_missed_at entry."""
+    settings = _pruning_settings()
+    pruning_state = {"first_missed_at": {}}
+
+    _, ps, changed = prune_stale_keys(
+        settings,
+        live_keys={"dev1:work-b", "dev1:hidden", "dev1:personal-a"},
+        # dev1:work-a is missing from live_keys
+        pruning_state=pruning_state,
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+
+    assert ps["first_missed_at"]["dev1:work-a"] == _T0
+    assert changed is False
+    # key still in settings — not pruned yet
+    assert "dev1:work-a" in settings["views"][0]["sessions"]
+
+
+# 3. Missing within grace — settings unchanged
+def test_prune_within_grace_period_leaves_settings_unchanged():
+    """A key with first_missed_at = now - grace + 1 is within grace; nothing changes."""
+    settings = _pruning_settings()
+    # first missed 1 second before grace expires
+    first_missed_at = _T0 - _GRACE + 1.0
+    pruning_state = {"first_missed_at": {"dev1:work-a": first_missed_at}}
+
+    _, ps, changed = prune_stale_keys(
+        settings,
+        live_keys={"dev1:work-b", "dev1:hidden", "dev1:personal-a"},
+        pruning_state=pruning_state,
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+
+    assert changed is False
+    assert "dev1:work-a" in settings["views"][0]["sessions"]
+    assert ps["first_missed_at"]["dev1:work-a"] == first_missed_at  # unchanged
+
+
+# 4. Missing past grace — key removed from hidden_sessions AND view.sessions
+def test_prune_past_grace_removes_key_from_settings():
+    """A key missing for > grace_seconds is removed from hidden_sessions and every view."""
+    settings = {
+        "hidden_sessions": ["dev1:stale", "dev1:live-hidden"],
+        "views": [
+            {"name": "Work", "sessions": ["dev1:stale", "dev1:live-work"]},
+            {"name": "Personal", "sessions": ["dev1:stale", "dev1:live-personal"]},
+        ],
+    }
+    # stale key has been missing for grace + 1 second
+    pruning_state = {"first_missed_at": {"dev1:stale": _T0 - _GRACE - 1.0}}
+
+    updated, ps, changed = prune_stale_keys(
+        settings,
+        live_keys={"dev1:live-hidden", "dev1:live-work", "dev1:live-personal"},
+        pruning_state=pruning_state,
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+
+    assert changed is True
+    # Removed from hidden_sessions
+    assert "dev1:stale" not in updated["hidden_sessions"]
+    assert "dev1:live-hidden" in updated["hidden_sessions"]
+    # Removed from every view
+    assert "dev1:stale" not in updated["views"][0]["sessions"]
+    assert "dev1:live-work" in updated["views"][0]["sessions"]
+    assert "dev1:stale" not in updated["views"][1]["sessions"]
+    assert "dev1:live-personal" in updated["views"][1]["sessions"]
+    # Bookkeeping entry dropped
+    assert "dev1:stale" not in ps["first_missed_at"]
+
+
+# 5. Re-appearance after partial absence clears bookkeeping
+def test_prune_reappearance_clears_bookkeeping():
+    """A key that was missing (has bookkeeping) but returns to live_keys is forgiven."""
+    settings = _pruning_settings()
+    # dev1:work-a was previously seen as missing
+    pruning_state = {"first_missed_at": {"dev1:work-a": _T0 - 3600.0}}
+
+    _, ps, changed = prune_stale_keys(
+        settings,
+        live_keys={
+            "dev1:work-a",  # back!
+            "dev1:work-b",
+            "dev1:hidden",
+            "dev1:personal-a",
+        },
+        pruning_state=pruning_state,
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+
+    assert "dev1:work-a" not in ps["first_missed_at"]
+    assert changed is False
+    # key is still in settings (was never pruned)
+    assert "dev1:work-a" in settings["views"][0]["sessions"]
+
+
+# 6. Bookkeeping GC — stale entries not in settings are dropped
+def test_prune_gc_drops_orphaned_bookkeeping_entries():
+    """A first_missed_at entry whose key is no longer in settings is garbage-collected."""
+    settings = _pruning_settings()
+    # "dev1:ghost" is in bookkeeping but not in any settings list
+    pruning_state = {
+        "first_missed_at": {
+            "dev1:ghost": _T0 - 100.0,  # not in settings, not expired
+        }
+    }
+
+    _, ps, changed = prune_stale_keys(
+        settings,
+        live_keys={"dev1:work-a", "dev1:work-b", "dev1:hidden", "dev1:personal-a"},
+        pruning_state=pruning_state,
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+
+    # Orphaned entry removed — it was never in settings
+    assert "dev1:ghost" not in ps["first_missed_at"]
+    assert changed is False
+
+
+# 7. settings_changed flag is True only when a key is actually dropped
+def test_prune_changed_flag_is_false_when_nothing_pruned():
+    """settings_changed is False when all keys are live or within grace."""
+    settings = _pruning_settings()
+    _, _, changed = prune_stale_keys(
+        settings,
+        live_keys={"dev1:work-a", "dev1:work-b", "dev1:hidden", "dev1:personal-a"},
+        pruning_state={"first_missed_at": {}},
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+    assert changed is False
+
+
+def test_prune_changed_flag_is_true_when_key_dropped():
+    """settings_changed is True when at least one key is actually removed."""
+    settings = {
+        "hidden_sessions": ["dev1:stale"],
+        "views": [],
+    }
+    pruning_state = {"first_missed_at": {"dev1:stale": _T0 - _GRACE - 1.0}}
+
+    _, _, changed = prune_stale_keys(
+        settings,
+        live_keys=set(),
+        pruning_state=pruning_state,
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+    assert changed is True
+
+
+# 8. Idempotent on stable state
+def test_prune_idempotent_on_stable_state():
+    """Calling prune twice with the same inputs produces the same result the second time."""
+    # First call: some keys are missing → bookkeeping recorded, settings unchanged.
+    settings_a = _pruning_settings()
+    ps_a: dict = {"first_missed_at": {}}
+
+    settings_a, ps_a, changed_a = prune_stale_keys(
+        settings_a,
+        live_keys={"dev1:hidden", "dev1:personal-a"},  # work keys missing
+        pruning_state=ps_a,
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+    assert changed_a is False  # within grace (first miss)
+
+    # Second call with SAME now — bookkeeping is the same, nothing changes.
+    import copy
+
+    settings_b = copy.deepcopy(settings_a)
+    ps_b = copy.deepcopy(ps_a)
+
+    settings_b, ps_b, changed_b = prune_stale_keys(
+        settings_b,
+        live_keys={"dev1:hidden", "dev1:personal-a"},
+        pruning_state=ps_b,
+        grace_seconds=_GRACE,
+        now=_T0,  # same now — grace not expired
+    )
+
+    assert changed_b is False
+    assert settings_b == settings_a
+    assert ps_b == ps_a
+
+
+# 9. Does NOT touch unrelated keys or memberships
+def test_prune_does_not_touch_unrelated_keys():
+    """Pruning one stale key leaves all live keys and other view memberships intact."""
+    settings = {
+        "hidden_sessions": ["dev1:stale", "dev1:live-hidden"],
+        "views": [
+            {
+                "name": "Work",
+                "sessions": ["dev1:stale", "dev1:live-work-1", "dev1:live-work-2"],
+            },
+        ],
+    }
+    pruning_state = {"first_missed_at": {"dev1:stale": _T0 - _GRACE - 1.0}}
+
+    updated, _, changed = prune_stale_keys(
+        settings,
+        live_keys={"dev1:live-hidden", "dev1:live-work-1", "dev1:live-work-2"},
+        pruning_state=pruning_state,
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+
+    assert changed is True
+    # Stale key gone
+    assert "dev1:stale" not in updated["hidden_sessions"]
+    assert "dev1:stale" not in updated["views"][0]["sessions"]
+    # Live keys untouched
+    assert "dev1:live-hidden" in updated["hidden_sessions"]
+    assert "dev1:live-work-1" in updated["views"][0]["sessions"]
+    assert "dev1:live-work-2" in updated["views"][0]["sessions"]

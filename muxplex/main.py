@@ -70,7 +70,10 @@ from muxplex.settings import (
     load_federation_key,
     load_settings,
     patch_settings,
+    save_settings,
 )
+from muxplex.pruning import load_pruning_state, save_pruning_state
+from muxplex.views import prune_stale_keys
 from muxplex.identity import load_device_id
 from muxplex.ttyd import kill_orphan_ttyd, kill_ttyd, spawn_ttyd, TTYD_PORT
 
@@ -268,6 +271,48 @@ async def _run_poll_cycle() -> None:
                 await _sync_settings_with_remotes(settings, _federation_client)
             except Exception:
                 _log.exception("settings sync cycle error")
+
+    # 14. Prune stale session keys from views and hidden_sessions.
+    #
+    #     Each device only knows its own live sessions natively.  The live_keys
+    #     set below includes both the bare session name (legacy bare-name entries)
+    #     and the canonical device_id:name form.  Remote-device keys tracked in
+    #     views/hidden_sessions are also covered: if this device has not seen a
+    #     remote key for the full grace period the key is pruned locally; the
+    #     remote device handles pruning for its own keys independently.  The grace
+    #     period prevents thrash when sessions briefly disappear during restarts
+    #     or sync gaps.
+    #
+    #     Pruning bookkeeping (first-missed-at timestamps) is NEVER written to
+    #     settings.json and is NEVER sent to peers — it lives in pruning.json.
+    #     The prune action (removing dead keys from settings) IS a normal
+    #     settings write that syncs via the existing LWW mechanism.
+    try:
+        _prune_settings = load_settings()
+        _prune_state = load_pruning_state()
+        _grace_hours = float(_prune_settings.get("stale_key_grace_hours", 24.0))
+        _grace_seconds = _grace_hours * 3600.0
+
+        _local_device_id = load_device_id()
+        _live_keys: set[str] = set()
+        for _name in names:
+            # Include both the bare name (for legacy stored entries) and the
+            # canonical device_id:name form.
+            _live_keys.add(_name)
+            _live_keys.add(f"{_local_device_id}:{_name}")
+
+        _prune_settings, _prune_state, _prune_changed = prune_stale_keys(
+            _prune_settings,
+            _live_keys,
+            pruning_state=_prune_state,
+            grace_seconds=_grace_seconds,
+        )
+        save_pruning_state(_prune_state)
+        if _prune_changed:
+            # Stale keys were removed — persist (triggers LWW sync on next cycle).
+            save_settings(_prune_settings)
+    except Exception:
+        _log.exception("stale-key prune cycle error")
 
 
 # ---------------------------------------------------------------------------

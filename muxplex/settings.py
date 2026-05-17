@@ -57,6 +57,11 @@ DEFAULT_SETTINGS: dict = {
     "sidebarOpen": None,
     "settings_updated_at": 0.0,
     "_schema_version": SCHEMA_VERSION,
+    # Grace period (hours) before a session key missing from all live sessions
+    # is removed from views/hidden_sessions. Syncable so the operator can tune
+    # it federation-wide; the per-device first-missed-at bookkeeping that drives
+    # the actual prune is local-only (pruning.json, never synced).
+    "stale_key_grace_hours": 24.0,
 }
 
 SYNCABLE_KEYS: frozenset[str] = frozenset(
@@ -82,6 +87,10 @@ SYNCABLE_KEYS: frozenset[str] = frozenset(
         # Schema version — sent so peers can detect our version, but never
         # accepted from the wire (see apply_synced_settings).
         "_schema_version",
+        # Pruning grace period — synced so the operator can tune it
+        # federation-wide. The per-device bookkeeping (first-missed-at
+        # timestamps) is NOT synced; it lives in pruning.json locally.
+        "stale_key_grace_hours",
     }
 )
 
