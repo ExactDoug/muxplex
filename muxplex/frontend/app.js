@@ -624,51 +624,74 @@ function buildStatusTileHTML(deviceName, statusText, statusClass) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// v2 visibility helpers — single source of truth for session filtering.
+// See docs/plans/2026-05-17-hidden-state-redesign-design.md
+// ---------------------------------------------------------------------------
+
+// Returns true if the session key is in settings.hidden_sessions.
+function isHidden(key, settings) {
+  var hidden = (settings && settings.hidden_sessions) || [];
+  return hidden.indexOf(key) !== -1;
+}
+
+// Canonical session-list filter. Single source of truth for "what is in this
+// view right now". See docs/plans/2026-05-17-hidden-state-redesign-design.md.
+// view: "all" | "hidden" | <user view name>
+// options.includeHidden: when true, hidden sessions are NOT filtered out of
+//   "all" or user views. Ignored for "hidden" (always shows only hidden).
+function filterVisible(sessions, settings, view, options) {
+  options = options || {};
+  var includeHidden = options.includeHidden === true;
+  var hiddenList = (settings && settings.hidden_sessions) || [];
+  var live = (sessions || []).filter(function (s) { return !s.status; });
+
+  function keyOf(s) { return s.sessionKey || s.name; }
+  function isSessionHidden(s) {
+    return hiddenList.indexOf(keyOf(s)) !== -1 || hiddenList.indexOf(s.name) !== -1;
+  }
+
+  if (view === "hidden") {
+    return live.filter(isSessionHidden);
+  }
+  if (view === "all") {
+    if (includeHidden) return live.slice();
+    return live.filter(function (s) { return !isSessionHidden(s); });
+  }
+
+  var views = (settings && settings.views) || [];
+  var userView = null;
+  for (var i = 0; i < views.length; i++) {
+    if (views[i].name === view) { userView = views[i]; break; }
+  }
+  if (!userView) return [];
+  var members = userView.sessions || [];
+
+  function inView(s) {
+    return members.indexOf(keyOf(s)) !== -1 || members.indexOf(s.name) !== -1;
+  }
+  if (includeHidden) {
+    return live.filter(inView);
+  }
+  return live.filter(function (s) { return inView(s) && !isSessionHidden(s); });
+}
+
+function visibleCount(sessions, settings, view, options) {
+  return filterVisible(sessions, settings, view, options).length;
+}
+
 /**
  * Returns sessions filtered by the active view.
  *
- * - 'all' view:    excludes hidden sessions (sessions in hidden_sessions list)
- * - 'hidden' view: shows only hidden sessions
- * - user view:     shows only sessions whose sessionKey is in that view's sessions list
- *
- * Status entries (unreachable, auth_failed, empty) are always excluded —
- * they are rendered separately as status tiles.
- *
- * Falls back to 'all' behaviour if the active view no longer exists.
+ * Thin wrapper around filterVisible() — the canonical filter that is the
+ * single source of truth for "what is in this view right now".
+ * See docs/plans/2026-05-17-hidden-state-redesign-design.md.
  *
  * @param {object[]} sessions
  * @returns {object[]}
  */
 function getVisibleSessions(sessions) {
-  var hidden = (_serverSettings && _serverSettings.hidden_sessions) || [];
-  var views = (_serverSettings && _serverSettings.views) || [];
-  var view = _resolveActiveView(_activeView, views);
-
-  return (sessions || []).filter(function(s) {
-    // Skip status entries (unreachable, auth_failed, empty) — rendered separately as status tiles
-    if (s.status) return false;
-
-    if (view === 'hidden') {
-      // 'hidden' view: only show sessions that are in the hidden list
-      return hidden.length > 0 && (hidden.includes(s.sessionKey || s.name) || hidden.includes(s.name));
-    }
-
-    if (view !== 'all') {
-      // User-defined view: show only sessions whose sessionKey is in this view's sessions list
-      var userView = views.find(function(v) { return v.name === view; });
-      if (userView) {
-        var viewSessions = userView.sessions || [];
-        return viewSessions.includes(s.sessionKey || s.name) || viewSessions.includes(s.name);
-      }
-      // View no longer exists — fall through to 'all' behaviour
-    }
-
-    // 'all' view: exclude hidden sessions
-    if (hidden.length > 0 && (hidden.includes(s.sessionKey || s.name) || hidden.includes(s.name))) {
-      return false;
-    }
-    return true;
-  });
+  return filterVisible(sessions, _serverSettings, _activeView);
 }
 
 /**
@@ -890,17 +913,12 @@ function renderViewDropdown() {
   if (!menu) return;
 
   var views = (_serverSettings && _serverSettings.views) || [];
-  var hidden = (_serverSettings && _serverSettings.hidden_sessions) || [];
-  var hiddenCount = hidden.length;
+  var hiddenCount = visibleCount(_currentSessions, _serverSettings, "hidden");
 
   var html = '';
 
   // — All Sessions (always first) — show count of non-hidden sessions
-  var allHiddenSessions = (_serverSettings && _serverSettings.hidden_sessions) || [];
-  var allCount = (_currentSessions || []).filter(function(s) {
-    if (s.status) return false;
-    return allHiddenSessions.indexOf(s.sessionKey || s.name) === -1 && allHiddenSessions.indexOf(s.name) === -1;
-  }).length;
+  var allCount = visibleCount(_currentSessions, _serverSettings, "all");
   var allActive = _activeView === 'all' ? ' view-dropdown__item--active' : '';
   html += '<button class="view-dropdown__item' + allActive + '" role="menuitem" data-view="all">All Sessions <span class="view-dropdown__count">' + allCount + '</span></button>';
 
@@ -910,7 +928,7 @@ function renderViewDropdown() {
     for (var i = 0; i < views.length && i < 7; i++) {
       var v = views[i];
       var vActive = _activeView === v.name ? ' view-dropdown__item--active' : '';
-      html += '<button class="view-dropdown__item' + vActive + '" role="menuitem" data-view="' + escapeHtml(v.name) + '">' + escapeHtml(v.name) + ' <span class="view-dropdown__count">' + (v.sessions || []).length + '</span></button>';
+      html += '<button class="view-dropdown__item' + vActive + '" role="menuitem" data-view="' + escapeHtml(v.name) + '">' + escapeHtml(v.name) + ' <span class="view-dropdown__count">' + visibleCount(_currentSessions, _serverSettings, v.name) + '</span></button>';
     }
   }
 
@@ -987,17 +1005,12 @@ function renderSidebarViewDropdown() {
   if (!menu) return;
 
   var views = (_serverSettings && _serverSettings.views) || [];
-  var hidden = (_serverSettings && _serverSettings.hidden_sessions) || [];
-  var hiddenCount = hidden.length;
+  var hiddenCount = visibleCount(_currentSessions, _serverSettings, "hidden");
 
   var html = '';
 
   // — All Sessions (always first) — show count of non-hidden sessions
-  var sbHiddenSessions = (_serverSettings && _serverSettings.hidden_sessions) || [];
-  var sbAllCount = (_currentSessions || []).filter(function(s) {
-    if (s.status) return false;
-    return sbHiddenSessions.indexOf(s.sessionKey || s.name) === -1 && sbHiddenSessions.indexOf(s.name) === -1;
-  }).length;
+  var sbAllCount = visibleCount(_currentSessions, _serverSettings, "all");
   var allActive = _activeView === 'all' ? ' view-dropdown__item--active' : '';
   html += '<button class="view-dropdown__item' + allActive + '" role="menuitem" data-view="all">All Sessions <span class="view-dropdown__count">' + sbAllCount + '</span></button>';
 
@@ -1007,7 +1020,7 @@ function renderSidebarViewDropdown() {
     for (var i = 0; i < views.length && i < 7; i++) {
       var v = views[i];
       var vActive = _activeView === v.name ? ' view-dropdown__item--active' : '';
-      html += '<button class="view-dropdown__item' + vActive + '" role="menuitem" data-view="' + escapeHtml(v.name) + '">' + escapeHtml(v.name) + ' <span class="view-dropdown__count">' + (v.sessions || []).length + '</span></button>';
+      html += '<button class="view-dropdown__item' + vActive + '" role="menuitem" data-view="' + escapeHtml(v.name) + '">' + escapeHtml(v.name) + ' <span class="view-dropdown__count">' + visibleCount(_currentSessions, _serverSettings, v.name) + '</span></button>';
     }
   }
 
@@ -1262,8 +1275,9 @@ function renderViewsSettingsTab() {
   // Build the list of view rows (no inline rename — rename is in Manage View panel)
   listEl.innerHTML = '';
   views.forEach(function(view, idx) {
-    var viewSessions = view.sessions || [];
-    var sessionCount = viewSessions.length;
+    var sessionCount = visibleCount(_currentSessions, _serverSettings, view.name);
+    var inclHidden = visibleCount(_currentSessions, _serverSettings, view.name, { includeHidden: true });
+    var hiddenInViewCount = inclHidden - sessionCount;
 
     var row = document.createElement('div');
     row.className = 'views-settings-row';
@@ -1274,10 +1288,10 @@ function renderViewsSettingsTab() {
     nameSpan.className = 'views-settings-name';
     nameSpan.textContent = view.name;
 
-    // Session count
+    // Session count — show "(M hidden)" suffix when M > 0
     var countSpan = document.createElement('span');
     countSpan.className = 'views-settings-count';
-    countSpan.textContent = sessionCount + (sessionCount === 1 ? ' session' : ' sessions');
+    countSpan.textContent = sessionCount + (sessionCount === 1 ? ' session' : ' sessions') + (hiddenInViewCount > 0 ? ' (' + hiddenInViewCount + ' hidden)' : '');
 
     // Actions container
     var actionsDiv = document.createElement('div');
@@ -2537,7 +2551,7 @@ function renderManageViewList() {
 
   // Update summary line
   if (summaryEl) {
-    summaryEl.textContent = allSessions.length + ' sessions · ' + viewSessions.length + ' in this view';
+    summaryEl.textContent = allSessions.length + ' sessions · ' + visibleCount(_currentSessions, _serverSettings, _activeView, { includeHidden: true }) + ' in this view';
   }
 
   // Partition into inView (checked first) and notInView
@@ -4510,6 +4524,10 @@ if (typeof module !== 'undefined' && module.exports) {
     // Manage Views settings tab
     renderViewsSettingsTab,
     _saveViewsAndRerender,
+    // v2 visibility helpers (Phase 1)
+    isHidden,
+    filterVisible,
+    visibleCount,
     // Federation tiles
     buildStatusTileHTML,
     // Constants

@@ -14,6 +14,18 @@ from pathlib import Path
 SETTINGS_PATH = Path.home() / ".config" / "muxplex" / "settings.json"
 FEDERATION_KEY_PATH = Path.home() / ".config" / "muxplex" / "federation_key"
 
+# Settings schema version. Incremented when settings semantics change.
+#
+# v1 (implicit, missing field): legacy. The mutual-exclusion invariant between
+#     hidden_sessions and view.sessions is enforced at write time. Federation
+#     peers without this field are assumed to be v1.
+# v2: hidden_sessions and view.sessions are allowed to overlap; visibility is
+#     determined by a read-time filter. In practice the v1 backstop
+#     enforce_mutual_exclusion still runs in v2 — see
+#     docs/plans/2026-05-17-hidden-state-redesign-design.md for the deferral
+#     of its removal (Phase 3).
+SCHEMA_VERSION: int = 2
+
 DEFAULT_SETTINGS: dict = {
     "host": "127.0.0.1",
     "port": 8088,
@@ -44,6 +56,7 @@ DEFAULT_SETTINGS: dict = {
     "gridViewMode": "flat",
     "sidebarOpen": None,
     "settings_updated_at": 0.0,
+    "_schema_version": SCHEMA_VERSION,
 }
 
 SYNCABLE_KEYS: frozenset[str] = frozenset(
@@ -66,6 +79,9 @@ SYNCABLE_KEYS: frozenset[str] = frozenset(
         "default_session",
         "window_size_largest",
         "auto_open_created",
+        # Schema version — sent so peers can detect our version, but never
+        # accepted from the wire (see apply_synced_settings).
+        "_schema_version",
     }
 )
 
@@ -95,11 +111,17 @@ def save_settings(data: dict) -> None:
 
     Creates parent directories as needed. Writes JSON with indent=2 and a
     trailing newline.
+
+    The `_schema_version` field is always written as the current
+    SCHEMA_VERSION regardless of *data*. Clients do not get to write older
+    versions — that would defeat the version field's purpose as a marker for
+    federated peers.
     """
     merged = copy.deepcopy(DEFAULT_SETTINGS)
     for key in DEFAULT_SETTINGS:
         if key in data:
             merged[key] = data[key]
+    merged["_schema_version"] = SCHEMA_VERSION
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS_PATH.write_text(json.dumps(merged, indent=2) + "\n")
 
@@ -167,6 +189,11 @@ def apply_synced_settings(incoming_settings: dict, incoming_timestamp: float) ->
     Only applies keys that are in SYNCABLE_KEYS. Sets settings_updated_at
     to the incoming timestamp (NOT time.time()) to prevent sync loops.
 
+    `_schema_version` is intentionally **never** accepted from the wire.
+    Each device speaks for its own schema version; receiving a peer's version
+    must not downgrade ours. The peer's version is observable on the incoming
+    payload (use `peer_supports_v2()`) before this function applies anything.
+
     After applying synced keys, enforces the mutual exclusion invariant:
     any session key that appears in both hidden_sessions and a view's sessions
     is removed from hidden_sessions (visibility wins over hiding).
@@ -176,12 +203,31 @@ def apply_synced_settings(incoming_settings: dict, incoming_timestamp: float) ->
 
     current = load_settings()
     for key in SYNCABLE_KEYS:
+        if key == "_schema_version":
+            # Never downgrade local schema version from sync.
+            continue
         if key in incoming_settings:
             current[key] = incoming_settings[key]
     enforce_mutual_exclusion(current)
     current["settings_updated_at"] = incoming_timestamp
     save_settings(current)
     return current
+
+
+def peer_supports_v2(peer_settings: dict) -> bool:
+    """Return True if a peer's settings payload indicates schema version >= 2.
+
+    Legacy peers omit `_schema_version` (or send a lower value) and are
+    treated as v1. v1 peers enforce the mutual-exclusion invariant between
+    hidden_sessions and view.sessions; v2 peers tolerate overlap.
+
+    Used during federation handshake to decide whether outgoing settings
+    need to be pre-flattened for legacy compatibility.
+    """
+    try:
+        return int(peer_settings.get("_schema_version", 0)) >= 2
+    except (TypeError, ValueError):
+        return False
 
 
 def get_syncable_settings() -> dict:

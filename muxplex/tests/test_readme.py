@@ -49,10 +49,16 @@ def test_readme_shows_restart_workflow():
 
 
 def test_readme_documents_all_settings_keys():
-    """README must document every key from DEFAULT_SETTINGS."""
+    """README must document every user-facing key from DEFAULT_SETTINGS.
+
+    Internal keys prefixed with `_` (e.g. `_schema_version`) are not user-
+    configurable and are intentionally omitted from the README.
+    """
     from muxplex.settings import DEFAULT_SETTINGS
 
     for key in DEFAULT_SETTINGS:
+        if key.startswith("_"):
+            continue
         assert f"`{key}`" in README, f"README must document setting key '{key}'"
 
 
@@ -265,6 +271,7 @@ def test_readme_tls_setup_tls_entry_with_method_flag():
 
 def test_readme_images_use_absolute_urls():
     import re
+
     readme = Path(__file__).resolve().parents[2] / "README.md"
     content = readme.read_text()
     images = re.findall(r"!\[([^\]]*)\]\(([^)]+)\)", content)

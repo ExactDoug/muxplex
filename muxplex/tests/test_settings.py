@@ -1051,3 +1051,89 @@ def test_apply_synced_settings_enforces_mutual_exclusion(redirect_settings_path)
         f"'abc:dev' must remain in views[0]['sessions'] after mutual exclusion repair; "
         f"got views={result['views']!r}"
     )
+
+
+# ============================================================
+# Schema version (Phase 0)
+# See docs/plans/2026-05-17-hidden-state-redesign-design.md
+# ============================================================
+
+
+def test_save_settings_always_writes_current_schema_version():
+    """save_settings forces _schema_version to SCHEMA_VERSION regardless of input."""
+    from muxplex.settings import SCHEMA_VERSION
+
+    # Caller tries to write an old version (e.g. a buggy legacy client).
+    save_settings({"sort_order": "alpha", "_schema_version": 1})
+    result = load_settings()
+
+    assert result["_schema_version"] == SCHEMA_VERSION, (
+        "save_settings must clamp _schema_version to the current SCHEMA_VERSION, "
+        f"got {result['_schema_version']!r}"
+    )
+
+
+def test_save_settings_defaults_schema_version_when_absent():
+    """save_settings writes the current SCHEMA_VERSION when the caller omits the field."""
+    from muxplex.settings import SCHEMA_VERSION
+
+    save_settings({"sort_order": "alpha"})
+    result = load_settings()
+
+    assert result["_schema_version"] == SCHEMA_VERSION
+
+
+def test_schema_version_is_in_syncable_keys():
+    """_schema_version must be sent to peers so they can detect our version."""
+    assert "_schema_version" in SYNCABLE_KEYS
+
+
+def test_get_syncable_settings_includes_schema_version():
+    """The outgoing federation payload includes our schema version."""
+    from muxplex.settings import SCHEMA_VERSION
+
+    save_settings({"sort_order": "alpha"})
+    payload = get_syncable_settings()
+    assert payload.get("_schema_version") == SCHEMA_VERSION
+
+
+def test_apply_synced_settings_never_downgrades_schema_version(redirect_settings_path):
+    """Receiving a legacy peer's sync must not lower our local _schema_version.
+
+    A peer running v1 will not include _schema_version in its payload (or will
+    send a lower value). Either case must leave our local version at the
+    current SCHEMA_VERSION.
+    """
+    from muxplex.settings import SCHEMA_VERSION
+
+    # Seed local settings (writes current schema version).
+    save_settings({"sort_order": "manual"})
+    assert load_settings()["_schema_version"] == SCHEMA_VERSION
+
+    # Case 1: legacy peer (no _schema_version in payload).
+    apply_synced_settings({"sort_order": "alpha"}, 1712600000.0)
+    assert load_settings()["_schema_version"] == SCHEMA_VERSION, (
+        "incoming legacy sync (no _schema_version) must not downgrade local version"
+    )
+
+    # Case 2: explicit lower version on the wire.
+    apply_synced_settings(
+        {"sort_order": "manual", "_schema_version": 1},
+        1712600001.0,
+    )
+    assert load_settings()["_schema_version"] == SCHEMA_VERSION, (
+        "incoming explicit _schema_version=1 must not downgrade local version"
+    )
+
+
+def test_peer_supports_v2_handles_legacy_payload():
+    """peer_supports_v2 returns False when the version is missing or < 2."""
+    from muxplex.settings import peer_supports_v2
+
+    assert peer_supports_v2({"_schema_version": 2}) is True
+    assert peer_supports_v2({"_schema_version": 3}) is True  # forward-compatible
+    assert peer_supports_v2({"_schema_version": 1}) is False
+    assert peer_supports_v2({"_schema_version": 0}) is False
+    assert peer_supports_v2({}) is False  # legacy peer omits the field
+    assert peer_supports_v2({"_schema_version": "garbage"}) is False
+    assert peer_supports_v2({"_schema_version": None}) is False

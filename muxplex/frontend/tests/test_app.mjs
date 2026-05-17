@@ -4875,3 +4875,194 @@ test('heartbeat uses setTimeout not setInterval for async-safe scheduling', () =
   assert.ok(fnBody.includes('setTimeout'),
     'startHeartbeat must use setTimeout for self-scheduling async loop');
 });
+
+// ---------------------------------------------------------------------------
+// v2 visibility helpers: isHidden, filterVisible, visibleCount
+// See docs/plans/2026-05-17-hidden-state-redesign-design.md
+// Mirror of the Python test matrix in tests/test_views.py
+// ---------------------------------------------------------------------------
+
+// Helper: build a session dict matching the backend test fixture convention.
+function _session(name, deviceId, status) {
+  deviceId = deviceId || 'dev1';
+  var d = { sessionKey: deviceId + ':' + name, name: name };
+  if (status !== undefined) d.status = status;
+  return d;
+}
+
+// --- app.js exports the three v2 helpers ---
+
+test('app.js exports isHidden, filterVisible, visibleCount', () => {
+  for (const fn of ['isHidden', 'filterVisible', 'visibleCount']) {
+    assert.ok(fn in app, `app.js should export "${fn}"`);
+    assert.strictEqual(typeof app[fn], 'function', `"${fn}" should be a function`);
+  }
+});
+
+// --- isHidden ---
+
+test('isHidden returns true when key is in hidden_sessions', () => {
+  const settings = { hidden_sessions: ['dev1:a', 'dev1:b'] };
+  assert.strictEqual(app.isHidden('dev1:a', settings), true);
+  assert.strictEqual(app.isHidden('dev1:b', settings), true);
+});
+
+test('isHidden returns false when key is absent from hidden_sessions', () => {
+  const settings = { hidden_sessions: ['dev1:a'] };
+  assert.strictEqual(app.isHidden('dev1:b', settings), false);
+});
+
+test('isHidden returns false when hidden_sessions field is missing', () => {
+  assert.strictEqual(app.isHidden('dev1:a', {}), false);
+  assert.strictEqual(app.isHidden('dev1:a', { hidden_sessions: null }), false);
+  assert.strictEqual(app.isHidden('dev1:a', null), false);
+});
+
+// --- filterVisible: view="all" ---
+
+test('filterVisible view="all" excludes hidden sessions by default', () => {
+  const sessions = [_session('a'), _session('b'), _session('c')];
+  const settings = { hidden_sessions: ['dev1:b'], views: [] };
+  const result = app.filterVisible(sessions, settings, 'all');
+  assert.deepStrictEqual(result.map(s => s.name), ['a', 'c']);
+});
+
+test('filterVisible view="all" includeHidden:true returns all live sessions', () => {
+  const sessions = [_session('a'), _session('b'), _session('c')];
+  const settings = { hidden_sessions: ['dev1:b'], views: [] };
+  const result = app.filterVisible(sessions, settings, 'all', { includeHidden: true });
+  assert.deepStrictEqual(result.map(s => s.name), ['a', 'b', 'c']);
+});
+
+test('filterVisible view="all" excludes status tiles', () => {
+  const sessions = [
+    _session('a'),
+    _session('disconnected', 'dev1', 'error'),
+    _session('b'),
+  ];
+  const settings = { hidden_sessions: [], views: [] };
+  const result = app.filterVisible(sessions, settings, 'all');
+  assert.deepStrictEqual(result.map(s => s.name), ['a', 'b']);
+});
+
+// --- filterVisible: view="hidden" ---
+
+test('filterVisible view="hidden" returns only hidden sessions', () => {
+  const sessions = [_session('a'), _session('b'), _session('c')];
+  const settings = { hidden_sessions: ['dev1:a', 'dev1:c'], views: [] };
+  const result = app.filterVisible(sessions, settings, 'hidden');
+  assert.deepStrictEqual(result.map(s => s.name), ['a', 'c']);
+});
+
+test('filterVisible view="hidden" returns empty list when no sessions are hidden', () => {
+  const sessions = [_session('a'), _session('b')];
+  const settings = { hidden_sessions: [], views: [] };
+  const result = app.filterVisible(sessions, settings, 'hidden');
+  assert.deepStrictEqual(result, []);
+});
+
+test('filterVisible view="hidden" excludes dead keys (hidden_sessions entries with no live match)', () => {
+  const sessions = [_session('a')];
+  const settings = { hidden_sessions: ['dev1:a', 'dev1:ghost'], views: [] };
+  const result = app.filterVisible(sessions, settings, 'hidden');
+  assert.deepStrictEqual(result.map(s => s.name), ['a']);
+});
+
+// --- filterVisible: user view ---
+
+test('filterVisible user view filters by membership AND visibility', () => {
+  const sessions = [_session('a'), _session('b'), _session('c')];
+  const settings = {
+    hidden_sessions: ['dev1:b'],
+    views: [{ name: 'Work', sessions: ['dev1:a', 'dev1:b'] }],
+  };
+  // 'a' is in view and not hidden; 'b' is in view but hidden → excluded by default.
+  const result = app.filterVisible(sessions, settings, 'Work');
+  assert.deepStrictEqual(result.map(s => s.name), ['a']);
+});
+
+test('filterVisible user view includeHidden:true lifts visibility filter but NOT membership filter', () => {
+  const sessions = [_session('a'), _session('b'), _session('c')];
+  const settings = {
+    hidden_sessions: ['dev1:b'],
+    views: [{ name: 'Work', sessions: ['dev1:a', 'dev1:b'] }],
+  };
+  // 'b' is in view AND hidden — includeHidden surfaces it.
+  // 'c' is NOT in view — still excluded.
+  const result = app.filterVisible(sessions, settings, 'Work', { includeHidden: true });
+  assert.deepStrictEqual(result.map(s => s.name), ['a', 'b']);
+});
+
+test('filterVisible returns empty list for unknown view name', () => {
+  const sessions = [_session('a'), _session('b')];
+  const settings = { hidden_sessions: [], views: [] };
+  assert.deepStrictEqual(app.filterVisible(sessions, settings, 'Nonexistent'), []);
+});
+
+// --- Overlap state (key in both view.sessions AND hidden_sessions) ---
+
+test('filterVisible overlap state: hidden filter wins by default, includeHidden surfaces it', () => {
+  const sessions = [_session('a'), _session('b')];
+  const settings = {
+    hidden_sessions: ['dev1:a'],   // also in Work view
+    views: [{ name: 'Work', sessions: ['dev1:a', 'dev1:b'] }],
+  };
+
+  // Default: 'a' is excluded from Work because it is hidden.
+  const defaultResult = app.filterVisible(sessions, settings, 'Work');
+  assert.deepStrictEqual(defaultResult.map(s => s.name), ['b']);
+
+  // includeHidden: 'a' is surfaced again.
+  const inclResult = app.filterVisible(sessions, settings, 'Work', { includeHidden: true });
+  assert.deepStrictEqual(inclResult.map(s => s.name), ['a', 'b']);
+});
+
+// --- Bare-name dual-lookup ---
+
+test('filterVisible bare-name in hidden_sessions matches session by name', () => {
+  // hidden_sessions stores bare 'a'; session has name:'a', sessionKey:'dev1:a'.
+  const sessions = [_session('a'), _session('b')];
+  const settings = { hidden_sessions: ['a'], views: [] };
+  // 'a' is hidden; 'b' is not.
+  const result = app.filterVisible(sessions, settings, 'all');
+  assert.deepStrictEqual(result.map(s => s.name), ['b']);
+});
+
+test('filterVisible bare-name in view.sessions matches session by name', () => {
+  const sessions = [_session('a'), _session('b'), _session('c')];
+  const settings = {
+    hidden_sessions: [],
+    views: [{ name: 'Work', sessions: ['a', 'b'] }],  // bare names
+  };
+  const result = app.filterVisible(sessions, settings, 'Work');
+  assert.deepStrictEqual(result.map(s => s.name), ['a', 'b']);
+});
+
+// --- visibleCount ---
+
+test('visibleCount always equals filterVisible().length for the same inputs', () => {
+  const sessions = [_session('a'), _session('b'), _session('c')];
+  const settings = {
+    hidden_sessions: ['dev1:b'],
+    views: [{ name: 'Work', sessions: ['dev1:a', 'dev1:b', 'dev1:c'] }],
+  };
+
+  const matrix = [
+    { view: 'all',         opts: undefined },
+    { view: 'all',         opts: { includeHidden: true } },
+    { view: 'hidden',      opts: undefined },
+    { view: 'Work',        opts: undefined },
+    { view: 'Work',        opts: { includeHidden: true } },
+    { view: 'Nonexistent', opts: undefined },
+  ];
+
+  for (const { view, opts } of matrix) {
+    const expected = app.filterVisible(sessions, settings, view, opts).length;
+    const actual   = app.visibleCount(sessions, settings, view, opts);
+    assert.strictEqual(
+      actual,
+      expected,
+      `visibleCount(${view}, ${JSON.stringify(opts)}) = ${actual} !== filterVisible length ${expected}`
+    );
+  }
+});

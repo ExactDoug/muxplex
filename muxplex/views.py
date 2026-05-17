@@ -1,14 +1,170 @@
 """
-Views invariant enforcement and validation for muxplex.
+Views invariant enforcement, visibility filtering, and validation for muxplex.
 
-Core invariants:
-- hidden_sessions and any views[].sessions never share a session key.
+Schema v2 semantics (see docs/plans/2026-05-17-hidden-state-redesign-design.md):
+- "hidden" is a property of a session, determined by membership in
+  hidden_sessions. View membership and hidden state are orthogonal.
+- A session key MAY appear in both hidden_sessions and one or more
+  view.sessions. Lists are filtered at read time via `filter_visible`.
+- The legacy mutual-exclusion invariant (`enforce_mutual_exclusion`) is
+  retained as a backstop in v1 for mixed-version federation compatibility.
+  It will be removed in Phase 3 once all peers report _schema_version >= 2.
+
+Other invariants:
 - View names are non-empty, max 30 chars, trimmed, unique, not reserved.
-- Duplicate session keys within a view are deduplicated.
+- Duplicate session keys within a view are deduplicated by
+  `enforce_mutual_exclusion`.
 """
 
 RESERVED_VIEW_NAMES = frozenset({"all", "hidden"})
 MAX_VIEW_NAME_LENGTH = 30
+
+
+# ---------------------------------------------------------------------------
+# Schema v2: visibility filtering (read-time)
+# ---------------------------------------------------------------------------
+
+
+def _key_of(session: dict) -> str:
+    """Canonical key for a session dict: prefer `sessionKey`, fall back to `name`."""
+    return session.get("sessionKey") or session.get("name") or ""
+
+
+def is_hidden(key: str, settings: dict) -> bool:
+    """Return True if the given key is in settings['hidden_sessions']."""
+    return key in (settings.get("hidden_sessions") or [])
+
+
+def filter_visible(
+    sessions: list[dict],
+    settings: dict,
+    view: str,
+    *,
+    include_hidden: bool = False,
+) -> list[dict]:
+    """Return the canonical visible session list for the given view.
+
+    This is the single source of truth for "what is in this view right now."
+    Every count display and every list render must go through this function
+    (or the frontend equivalent) — never read raw lengths off stored arrays.
+
+    Parameters:
+        sessions: live session dicts (from sessions.list_sessions or similar).
+            Each should have `sessionKey` and/or `name`; entries with a truthy
+            `status` field are treated as non-session tiles and excluded.
+        settings: dict containing `views` and `hidden_sessions`.
+        view: "all", "hidden", or a user view name.
+        include_hidden: when True, hidden sessions are NOT filtered out of
+            "all" or user views. Ignored for "hidden" (which always shows
+            only hidden sessions).
+
+    Behavior:
+        - Unknown view name → empty list (callers can detect missing views
+          by comparing to the user's view list, not via this function).
+        - "hidden" view → only sessions whose key (or bare name) appears in
+          hidden_sessions. include_hidden is meaningless here.
+        - "all" view → all live sessions; exclude hidden unless include_hidden.
+        - User view → sessions whose key (or bare name) is in view.sessions;
+          exclude hidden unless include_hidden.
+
+    Dual-lookup against `sessionKey` and `name` handles legacy bare-name
+    entries in stored data. Once `normalize_session_keys` has run on the
+    install, all stored entries should be in `device_id:name` form and the
+    fallback is harmless.
+    """
+    hidden = set(settings.get("hidden_sessions") or [])
+    live = [s for s in (sessions or []) if not s.get("status")]
+
+    def is_session_hidden(s: dict) -> bool:
+        return _key_of(s) in hidden or s.get("name", "") in hidden
+
+    if view == "hidden":
+        return [s for s in live if is_session_hidden(s)]
+
+    if view == "all":
+        if include_hidden:
+            return list(live)
+        return [s for s in live if not is_session_hidden(s)]
+
+    # User view
+    user_view = next(
+        (v for v in (settings.get("views") or []) if v.get("name") == view),
+        None,
+    )
+    if user_view is None:
+        return []
+    members = set(user_view.get("sessions") or [])
+
+    def in_view(s: dict) -> bool:
+        return _key_of(s) in members or s.get("name", "") in members
+
+    if include_hidden:
+        return [s for s in live if in_view(s)]
+    return [s for s in live if in_view(s) and not is_session_hidden(s)]
+
+
+def visible_count(
+    sessions: list[dict],
+    settings: dict,
+    view: str,
+    *,
+    include_hidden: bool = False,
+) -> int:
+    """Length of `filter_visible(...)`. Use this for every count display."""
+    return len(filter_visible(sessions, settings, view, include_hidden=include_hidden))
+
+
+# ---------------------------------------------------------------------------
+# Key normalization (one-shot or idempotent, run after fetching live sessions)
+# ---------------------------------------------------------------------------
+
+
+def normalize_session_keys(settings: dict, sessions: list[dict]) -> dict:
+    """Upgrade bare-name entries in stored keys to `device_id:name` form.
+
+    Pre-v2 stored entries used bare `name` strings. v2 stores
+    `device_id:name`. This function walks `hidden_sessions` and each
+    `view.sessions`, and for any bare-name entry that has a matching live
+    session with a `sessionKey`, replaces the entry in place with the
+    canonical form.
+
+    Idempotent: entries already in canonical form are left untouched.
+    Entries that have no matching live session are also left untouched —
+    they may match in the future, or they may be pruned by
+    `prune_stale_keys` (Phase 4).
+
+    Mutates and returns *settings*.
+    """
+    # Build a name → sessionKey map from live sessions. Only sessions that
+    # actually have a sessionKey contribute; bare-name live sessions are
+    # never the target of an upgrade.
+    name_to_key: dict[str, str] = {}
+    for s in sessions or []:
+        name = s.get("name")
+        key = s.get("sessionKey")
+        if name and key and name != key:
+            # Prefer the first sessionKey we see for a given name. If two
+            # live sessions share a name across devices, we cannot pick a
+            # single canonical form anyway; leave the bare-name entry alone.
+            name_to_key.setdefault(name, key)
+
+    def upgrade(entries: list[str]) -> list[str]:
+        result: list[str] = []
+        for entry in entries:
+            if entry in name_to_key:
+                result.append(name_to_key[entry])
+            else:
+                result.append(entry)
+        return result
+
+    if isinstance(settings.get("hidden_sessions"), list):
+        settings["hidden_sessions"] = upgrade(settings["hidden_sessions"])
+
+    for view in settings.get("views") or []:
+        if isinstance(view.get("sessions"), list):
+            view["sessions"] = upgrade(view["sessions"])
+
+    return settings
 
 
 def enforce_mutual_exclusion(settings: dict) -> dict:

@@ -2146,7 +2146,11 @@ def test_create_terminal_has_default_font_size_14() -> None:
 
 
 def test_get_visible_sessions_filters_hidden_sessions() -> None:
-    """getVisibleSessions() must filter sessions using _serverSettings.hidden_sessions."""
+    """getVisibleSessions() must filter sessions using _serverSettings.hidden_sessions.
+
+    Phase 1 refactor: getVisibleSessions is now a thin wrapper around filterVisible(),
+    which is the single canonical filter. hidden_sessions handling lives in filterVisible().
+    """
     match = re.search(
         r"function getVisibleSessions\s*\(\w+\)\s*\{(.*?)(?=\n(?:function|//|window\.))",
         _JS,
@@ -2154,11 +2158,12 @@ def test_get_visible_sessions_filters_hidden_sessions() -> None:
     )
     assert match, "getVisibleSessions function not found in app.js"
     body = match.group(1)
-    assert "hidden_sessions" in body, (
-        "getVisibleSessions must filter sessions using _serverSettings.hidden_sessions"
+    # Phase 1: body is a thin wrapper — delegates to filterVisible() with _serverSettings
+    assert "filterVisible" in body, (
+        "getVisibleSessions must delegate to filterVisible() (Phase 1 refactor)"
     )
     assert "_serverSettings" in body, (
-        "getVisibleSessions must reference _serverSettings to access hidden_sessions"
+        "getVisibleSessions must pass _serverSettings to filterVisible for hidden_sessions access"
     )
 
 
@@ -2810,13 +2815,14 @@ def test_build_sidebar_html_uses_remote_id_for_data_remote_id() -> None:
 
 
 def test_get_visible_sessions_checks_session_key_in_hidden() -> None:
-    """getVisibleSessions must check sessionKey (as well as name) against the hidden_sessions list.
+    """getVisibleSessions must handle sessionKey/name dual-lookup for hidden_sessions matching.
 
     hidden_sessions may contain either:
     - old format: plain session name (e.g. 'dev')
     - new format: device_id:name key (e.g. 'abc-123:dev')
 
-    Both formats must be matched for backward compatibility.
+    Phase 1 refactor: this is now handled inside filterVisible(). getVisibleSessions delegates
+    to filterVisible(), which is the single canonical filter implementing dual-lookup.
     """
     match = re.search(
         r"function getVisibleSessions\s*\(\w+\)\s*\{(.*?)(?=\n(?:function|//|window\.))",
@@ -2825,9 +2831,10 @@ def test_get_visible_sessions_checks_session_key_in_hidden() -> None:
     )
     assert match, "getVisibleSessions function not found"
     body = match.group(1)
-    assert "sessionKey" in body, (
-        "getVisibleSessions must check s.sessionKey (in addition to s.name) against hidden_sessions "
-        "for backward compatibility: hidden_sessions may contain plain names OR device_id:name keys"
+    # Phase 1: thin wrapper — dual-lookup lives in filterVisible()
+    assert "filterVisible" in body, (
+        "getVisibleSessions must delegate to filterVisible() which implements "
+        "sessionKey/name dual-lookup for backward compatibility"
     )
 
 
@@ -3011,7 +3018,11 @@ def test_get_visible_sessions_all_view_excludes_hidden() -> None:
 
 
 def test_get_visible_sessions_hidden_view_shows_hidden() -> None:
-    """getVisibleSessions must handle the 'hidden' view case."""
+    """getVisibleSessions must handle the 'hidden' view case.
+
+    Phase 1 refactor: getVisibleSessions is a thin wrapper around filterVisible().
+    The 'hidden' view logic lives in filterVisible(), not in getVisibleSessions().
+    """
     match = re.search(
         r"function getVisibleSessions\(sessions\)\s*\{(.*?)\n\}",
         _JS,
@@ -3019,13 +3030,18 @@ def test_get_visible_sessions_hidden_view_shows_hidden() -> None:
     )
     assert match, "getVisibleSessions function not found"
     body = match.group(1)
-    assert "'hidden'" in body or '"hidden"' in body, (
-        "getVisibleSessions must explicitly handle the 'hidden' view (show only hidden sessions)"
+    # Phase 1: thin wrapper — 'hidden' view handling lives in filterVisible()
+    assert "filterVisible" in body, (
+        "getVisibleSessions must delegate to filterVisible() which handles the 'hidden' view"
     )
 
 
 def test_get_visible_sessions_user_view_filters_by_session_key() -> None:
-    """getVisibleSessions must use sessionKey when filtering for a user-defined view."""
+    """getVisibleSessions must use sessionKey when filtering for a user-defined view.
+
+    Phase 1 refactor: getVisibleSessions is a thin wrapper around filterVisible().
+    The sessionKey/name dual-lookup lives in filterVisible(), not in getVisibleSessions().
+    """
     match = re.search(
         r"function getVisibleSessions\(sessions\)\s*\{(.*?)\n\}",
         _JS,
@@ -3033,9 +3049,10 @@ def test_get_visible_sessions_user_view_filters_by_session_key() -> None:
     )
     assert match, "getVisibleSessions function not found"
     body = match.group(1)
-    assert "sessionKey" in body, (
-        "getVisibleSessions must use sessionKey to match sessions against the user view's "
-        "sessions list"
+    # Phase 1: thin wrapper — sessionKey handling lives in filterVisible()
+    assert "filterVisible" in body, (
+        "getVisibleSessions must delegate to filterVisible() which implements "
+        "sessionKey/name dual-lookup for user view filtering"
     )
 
 
@@ -4340,7 +4357,12 @@ def test_render_sidebar_view_dropdown_no_shortcut_spans() -> None:
 
 
 def test_render_view_dropdown_shows_user_view_session_count() -> None:
-    """renderViewDropdown must show session count for user views."""
+    """renderViewDropdown must show session count for user views.
+
+    Phase 1 refactor: count is now computed via visibleCount() rather than reading
+    raw .sessions.length. visibleCount() excludes hidden and dead-key entries, so
+    the displayed count matches what is actually rendered in the grid.
+    """
     match = re.search(
         r"function renderViewDropdown\s*\(\s*\)\s*\{(.*?)(?=\nfunction |\n// )",
         _JS,
@@ -4348,8 +4370,9 @@ def test_render_view_dropdown_shows_user_view_session_count() -> None:
     )
     assert match, "renderViewDropdown function not found"
     body = match.group(1)
-    assert "sessions.length" in body or "sessions || []).length" in body, (
-        "renderViewDropdown must show session count for user views (view.sessions.length)"
+    assert "visibleCount" in body, (
+        "renderViewDropdown must use visibleCount() for user view session counts "
+        "(Phase 1 refactor — raw .sessions.length is replaced by the canonical filter)"
     )
 
 
