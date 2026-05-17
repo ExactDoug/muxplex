@@ -840,3 +840,130 @@ def test_prune_does_not_touch_unrelated_keys():
     assert "dev1:live-hidden" in updated["hidden_sessions"]
     assert "dev1:live-work-1" in updated["views"][0]["sessions"]
     assert "dev1:live-work-2" in updated["views"][0]["sessions"]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: normalize → prune pipeline (wired into _run_poll_cycle)
+# Verifies that normalize_session_keys and prune_stale_keys compose correctly,
+# mirroring the logic added to _run_poll_cycle in main.py (step 13b + step 14).
+# ---------------------------------------------------------------------------
+
+
+def _make_sessions_for_normalize(device_id: str, names: list[str]) -> list[dict]:
+    """Build the same session-dict list that _run_poll_cycle constructs for normalization."""
+    return [{"name": n, "sessionKey": f"{device_id}:{n}"} for n in names]
+
+
+def test_normalize_then_prune_upgrades_bare_names_and_keeps_live_keys():
+    """Bare-name entries are upgraded to canonical form; the prune step then sees
+    the canonical key in live_keys and does NOT start the stale clock."""
+    device_id = "myhost"
+    names = ["alpha", "beta"]
+
+    settings = {
+        "hidden_sessions": ["alpha"],  # bare name, pre-v2 style
+        "views": [{"name": "Work", "sessions": ["alpha", "beta"]}],  # bare names
+    }
+
+    # --- step 13b: normalize ---
+    sessions_for_normalize = _make_sessions_for_normalize(device_id, names)
+    normalize_session_keys(settings, sessions_for_normalize)
+
+    # After normalize, entries should be in canonical form.
+    assert settings["hidden_sessions"] == ["myhost:alpha"]
+    assert settings["views"][0]["sessions"] == ["myhost:alpha", "myhost:beta"]
+
+    # --- step 14: prune ---
+    live_keys: set[str] = set()
+    for n in names:
+        live_keys.add(n)
+        live_keys.add(f"{device_id}:{n}")
+
+    updated, pruning_state, changed = prune_stale_keys(
+        settings,
+        live_keys,
+        pruning_state={"first_missed_at": {}},
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+
+    # No keys pruned — both canonical keys are in live_keys.
+    assert changed is False
+    assert "myhost:alpha" in updated["hidden_sessions"]
+    assert "myhost:alpha" in updated["views"][0]["sessions"]
+    assert "myhost:beta" in updated["views"][0]["sessions"]
+
+
+def test_normalize_then_prune_already_canonical_is_idempotent():
+    """Settings already in canonical device_id:name form pass through unchanged."""
+    device_id = "myhost"
+    names = ["alpha"]
+
+    settings = {
+        "hidden_sessions": ["myhost:alpha"],
+        "views": [{"name": "Work", "sessions": ["myhost:alpha"]}],
+    }
+
+    import copy
+
+    original = copy.deepcopy(settings)
+
+    # --- step 13b: normalize (should be a no-op) ---
+    sessions_for_normalize = _make_sessions_for_normalize(device_id, names)
+    normalize_session_keys(settings, sessions_for_normalize)
+
+    assert settings == original, "normalize must not mutate already-canonical settings"
+
+    # --- step 14: prune (should also be a no-op) ---
+    live_keys = {n for n in names} | {f"{device_id}:{n}" for n in names}
+    _, _, changed = prune_stale_keys(
+        settings,
+        live_keys,
+        pruning_state={"first_missed_at": {}},
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+    assert changed is False
+
+
+def test_normalize_then_prune_stale_canonical_key_is_pruned_after_grace():
+    """After normalization upgrades a bare name to canonical form, the prune step
+    correctly starts the stale clock and eventually prunes the key once the grace
+    period expires — verifying the full pipeline."""
+    device_id = "myhost"
+    names_live: list[str] = []  # session is gone
+
+    settings = {
+        "hidden_sessions": ["gone"],  # bare name for a session that no longer exists
+        "views": [],
+    }
+
+    # --- step 13b: normalize — no live sessions, so bare name stays put ---
+    sessions_for_normalize = _make_sessions_for_normalize(device_id, names_live)
+    normalize_session_keys(settings, sessions_for_normalize)
+
+    # The entry is not upgraded (no live session to match against).
+    assert settings["hidden_sessions"] == ["gone"]
+
+    # --- step 14, first poll: key is missing, start the clock ---
+    live_keys: set[str] = set()  # nothing live
+    _, pruning_state, changed = prune_stale_keys(
+        settings,
+        live_keys,
+        pruning_state={"first_missed_at": {}},
+        grace_seconds=_GRACE,
+        now=_T0,
+    )
+    assert changed is False
+    assert pruning_state["first_missed_at"]["gone"] == _T0
+
+    # --- step 14, second poll (grace expired): key is removed ---
+    _, pruning_state, changed = prune_stale_keys(
+        settings,
+        live_keys,
+        pruning_state=pruning_state,
+        grace_seconds=_GRACE,
+        now=_T0 + _GRACE + 1.0,
+    )
+    assert changed is True
+    assert "gone" not in settings["hidden_sessions"]

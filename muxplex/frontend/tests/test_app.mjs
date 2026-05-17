@@ -1622,7 +1622,9 @@ test('renderSheetList uses null check for remoteId (not falsy)', () => {
   // Must use != null check, not truthy check
   assert.ok(fnBody.includes('remoteId != null') || fnBody.includes('remoteId !== null'),
     'renderSheetList must use null check for remoteId (0 is valid)');
-  assert.ok(!fnBody.match(/s\.remoteId\s*\?[^=]/),
+  // Updated in v0.6.0: regex now excludes ?? (nullish coalescing operator) which is
+  // not a truthy check — [^?=] rejects both ?? and != forms.
+  assert.ok(!fnBody.match(/s\.remoteId\s*\?[^?=]/),
     'renderSheetList must NOT use truthy check for remoteId (0 is falsy)');
 });
 
@@ -2476,8 +2478,9 @@ test('createNewSession polls for session before auto-opening (not immediate setT
   // Extract the createNewSession function body
   const start = source.indexOf('async function createNewSession(');
   assert.ok(start !== -1, 'createNewSession function must exist');
-  // Find the end of the function (next function declaration at same indent level)
-  const snippet = source.slice(start, start + 2000);
+  // Updated in v0.6.0: snippet size increased from 2000 to 3500 — function grew with
+  // loading tile injection and auto-add-to-view logic; setInterval is now ~2800 chars in.
+  const snippet = source.slice(start, start + 3500);
   // Must NOT contain the old immediate-open pattern inside createNewSession
   assert.ok(
     !snippet.includes("setTimeout(() => openSession"),
@@ -2736,6 +2739,9 @@ test('_setGridViewMode and renderGroupedGrid are exported', () => {
 // --- renderFilterBar (task-12) ---
 
 test('renderFilterBar produces pill buttons for each device plus All', () => {
+  // Updated in v0.6.0: renderFilterBar replaced by Views feature — function is now a no-op
+  // stub kept for export compatibility. The device filtering UI moved to the view dropdown.
+  // Test now verifies the stub contract: callable without throwing, does not write to container.
   const collectedHTML = [];
   const mockContainer = {
     get innerHTML() { return collectedHTML[0] || ''; },
@@ -2745,23 +2751,19 @@ test('renderFilterBar produces pill buttons for each device plus All', () => {
   const sessions = [
     { name: 'alpha', deviceName: 'Laptop', sessionKey: 'http://local::alpha', snapshot: '' },
     { name: 'beta', deviceName: 'Server', sessionKey: 'http://remote::beta', snapshot: '' },
-    { name: 'gamma', deviceName: 'Laptop', sessionKey: 'http://local::gamma', snapshot: '' },
   ];
 
   app._setActiveFilterDevice('all');
-  app.renderFilterBar(mockContainer, sessions);
-
-  const html = mockContainer.innerHTML;
-  assert.ok(html.includes('All'), 'filter bar should include an "All" button');
-  assert.ok(html.includes('Laptop'), 'filter bar should include a pill for "Laptop"');
-  assert.ok(html.includes('Server'), 'filter bar should include a pill for "Server"');
-
-  // Should have exactly 3 buttons: All, Laptop, Server (Laptop appears only once despite two sessions)
-  const pillCount = (html.match(/<button/g) || []).length;
-  assert.ok(pillCount >= 3, 'filter bar should have at least 3 filter-pill buttons (All + 2 devices)');
+  assert.doesNotThrow(() => app.renderFilterBar(mockContainer, sessions),
+    'renderFilterBar stub must not throw');
+  // The stub is a no-op — it does not write to the container.
+  assert.strictEqual(collectedHTML.length, 0, 'renderFilterBar stub must not write to container');
 });
 
 test('renderFilterBar marks active device pill with filter-pill--active class', () => {
+  // Updated in v0.6.0: renderFilterBar replaced by Views feature — function is now a no-op
+  // stub kept for export compatibility. Active-device pill logic moved to the view dropdown.
+  // Test now verifies the stub contract: callable with device set, no crash, no output.
   const collectedHTML = [];
   const mockContainer = {
     get innerHTML() { return collectedHTML[0] || ''; },
@@ -2773,18 +2775,11 @@ test('renderFilterBar marks active device pill with filter-pill--active class', 
     { name: 'beta', deviceName: 'Server', sessionKey: 'http://remote::beta', snapshot: '' },
   ];
 
-  // Set active filter to 'Laptop' and render
   app._setActiveFilterDevice('Laptop');
-  app.renderFilterBar(mockContainer, sessions);
-
-  const html = mockContainer.innerHTML;
-  // The 'Laptop' pill should have the active class
-  assert.ok(html.includes('filter-pill--active'), 'filter bar should mark active device with filter-pill--active class');
-  // Verify the active pill corresponds to 'Laptop' specifically
-  assert.ok(
-    html.match(/filter-pill--active[^>]*>Laptop|Laptop[^<]*filter-pill--active/),
-    'filter-pill--active should be on the Laptop pill specifically'
-  );
+  assert.doesNotThrow(() => app.renderFilterBar(mockContainer, sessions),
+    'renderFilterBar stub must not throw even with an active device set');
+  // The stub is a no-op — no output written.
+  assert.strictEqual(collectedHTML.length, 0, 'renderFilterBar stub must not write to container');
 
   // Reset
   app._setActiveFilterDevice('all');
@@ -2819,13 +2814,15 @@ test('loadGridViewMode reads gridViewMode from _serverSettings', () => {
 });
 
 test('loadGridViewMode reads gridViewMode from _serverSettings (not localStorage)', () => {
-  // viewPreferenceScope is removed — loadGridViewMode reads from _serverSettings via getDisplaySettings()
+  // Updated in v0.6.0: 'filtered' mode was removed when the Views feature replaced
+  // the filter bar. loadGridViewMode now converts 'filtered' → 'flat'. Use 'grouped'
+  // as the test value since it is still a valid mode.
   _localStorageStore = {};
-  app._setServerSettings({ gridViewMode: 'filtered' });
+  app._setServerSettings({ gridViewMode: 'grouped' });
 
   const mode = app.loadGridViewMode();
-  // Must return _serverSettings value ('filtered')
-  assert.strictEqual(mode, 'filtered', 'loadGridViewMode should return gridViewMode from _serverSettings');
+  // Must return _serverSettings value ('grouped')
+  assert.strictEqual(mode, 'grouped', 'loadGridViewMode should return gridViewMode from _serverSettings');
 
   // Cleanup
   _localStorageStore = {};
@@ -3352,7 +3349,10 @@ test('DOMContentLoaded sets page title via updatePageTitle after loadServerSetti
   // Find the DOMContentLoaded block
   const domIdx = source.indexOf("document.addEventListener('DOMContentLoaded'");
   assert.ok(domIdx !== -1, 'DOMContentLoaded handler must exist');
-  const domBlock = source.substring(domIdx, domIdx + 800);
+  // Updated in v0.6.0: window increased from 800 to 2000 — DOMContentLoaded handler grew
+  // with federation init, view-mode setup, and restoreState().then() scaffolding;
+  // updatePageTitle() is now inside .then() ~1300 chars into the handler.
+  const domBlock = source.substring(domIdx, domIdx + 2000);
   // The old direct assignment is replaced by updatePageTitle()
   assert.ok(
     !domBlock.includes("document.title = _serverSettings.device_name || 'muxplex'"),
@@ -3430,7 +3430,9 @@ test('applyFitLayout does NOT measure DOM dimensions (pure arithmetic)', () => {
 test('HTML settings dialog has exactly 4 tab buttons', () => {
   const source = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   const tabMatches = source.match(/class="settings-tab[^"]*"\s+data-tab=/g) || [];
-  assert.strictEqual(tabMatches.length, 4, 'settings dialog must have exactly 4 tab buttons (not 5)');
+  // Updated in v0.6.0: Views tab added to settings dialog — now has 5 tabs:
+  // Display, Sessions, Views, Commands, Multi-Device.
+  assert.strictEqual(tabMatches.length, 5, 'settings dialog must have exactly 5 tab buttons (Views tab added in v0.6.0)');
 });
 
 test('HTML index.html has no Notifications tab button', () => {
@@ -3762,16 +3764,18 @@ test('HTML Display panel device name field appears before font size field', () =
 });
 
 test('HTML Sessions panel hidden sessions field appears after bell sound', () => {
+  // Updated in v0.6.0: setting-hidden-sessions was removed from the sessions panel —
+  // hidden session management moved to the Views system (view dropdown + views settings tab).
+  // Test now verifies that the sessions panel still contains the key session settings
+  // that remain: sort order, auto-open, and bell sound.
   const source = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   const sessionsPanelStart = source.indexOf('<div class="settings-panel hidden" data-tab="sessions"');
   assert.ok(sessionsPanelStart !== -1, 'sessions panel must exist');
   const nextPanel = source.indexOf('<div class="settings-panel', sessionsPanelStart + 1);
   const sessionsPanelContent = source.substring(sessionsPanelStart, nextPanel !== -1 ? nextPanel : sessionsPanelStart + 4000);
-  const hiddenIdx = sessionsPanelContent.indexOf('setting-hidden-sessions');
-  const bellSoundIdx = sessionsPanelContent.indexOf('setting-bell-sound');
-  assert.ok(hiddenIdx !== -1, 'hidden sessions must be in sessions panel');
-  assert.ok(bellSoundIdx !== -1, 'bell sound must be in sessions panel');
-  assert.ok(hiddenIdx > bellSoundIdx, 'hidden sessions must appear after bell sound (i.e., near the end)');
+  assert.ok(sessionsPanelContent.includes('setting-bell-sound'), 'bell-sound setting must still be in sessions panel');
+  assert.ok(sessionsPanelContent.includes('setting-sort-order'), 'sort-order setting must still be in sessions panel');
+  assert.ok(sessionsPanelContent.includes('setting-auto-open'), 'auto-open setting must still be in sessions panel');
 });
 
 // --- Verification: cross-origin code removed ---
@@ -4428,8 +4432,9 @@ test('createNewSession passes remoteId through to openSession for auto-open', ()
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const fnStart = source.indexOf('async function createNewSession(');
   assert.ok(fnStart !== -1, 'createNewSession function must exist');
-  // Use 3000 chars to cover the full function including the polling interval callback
-  const fnBody = source.substring(fnStart, fnStart + 3000);
+  // Updated in v0.6.0: window increased from 3000 to 4000 — function grew with loading
+  // tile injection and auto-add-to-view logic; openSession call is now ~3200 chars in.
+  const fnBody = source.substring(fnStart, fnStart + 4000);
   // Must call openSession with remoteId option
   assert.ok(
     fnBody.includes('openSession') && fnBody.includes('remoteId'),
@@ -4446,7 +4451,9 @@ test('createNewSession matches remote sessions by sessionKey in poll loop', () =
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const fnStart = source.indexOf('async function createNewSession(');
   assert.ok(fnStart !== -1, 'createNewSession function must exist');
-  const fnBody = source.substring(fnStart, fnStart + 2000);
+  // Updated in v0.6.0: window increased from 2000 to 3500 — expectedKey and sessionKey
+  // are now ~2500 chars into the function due to loading tile and view auto-add logic.
+  const fnBody = source.substring(fnStart, fnStart + 3500);
   // Must use sessionKey in the match logic (with fallback to name)
   assert.ok(
     fnBody.includes('sessionKey'),

@@ -73,7 +73,7 @@ from muxplex.settings import (
     save_settings,
 )
 from muxplex.pruning import load_pruning_state, save_pruning_state
-from muxplex.views import prune_stale_keys
+from muxplex.views import normalize_session_keys, prune_stale_keys
 from muxplex.identity import load_device_id
 from muxplex.ttyd import kill_orphan_ttyd, kill_ttyd, spawn_ttyd, TTYD_PORT
 
@@ -271,6 +271,27 @@ async def _run_poll_cycle() -> None:
                 await _sync_settings_with_remotes(settings, _federation_client)
             except Exception:
                 _log.exception("settings sync cycle error")
+
+    # 13b. Normalize bare session-key entries to the canonical device_id:name form.
+    #
+    #      Phase 1 added normalize_session_keys() in views.py but it was never
+    #      wired into the runtime.  Running normalization here (before pruning)
+    #      ensures that legacy bare-name entries stored in hidden_sessions or
+    #      view.sessions are upgraded to canonical form so the prune step below
+    #      can compare them cleanly against the live_keys set.
+    try:
+        _norm_settings = load_settings()
+        _norm_device_id = load_device_id()
+        _sessions_for_normalize = [
+            {"name": _n, "sessionKey": f"{_norm_device_id}:{_n}"} for _n in names
+        ]
+        _norm_before = json.dumps(_norm_settings, sort_keys=True)
+        normalize_session_keys(_norm_settings, _sessions_for_normalize)
+        _norm_after = json.dumps(_norm_settings, sort_keys=True)
+        if _norm_before != _norm_after:
+            save_settings(_norm_settings)
+    except Exception:
+        _log.exception("session-key normalize cycle error")
 
     # 14. Prune stale session keys from views and hidden_sessions.
     #
