@@ -1013,8 +1013,12 @@ function renderGroupedGrid(sessions, mobile) {
   var html = '';
   for (var g = 0; g < groupOrder.length; g++) {
     var name = groupOrder[g];
-    html += '<h3 class="device-group-header">' + escapeHtml(name) + '</h3>';
     var groupSessions = groups[name];
+    // Skip device entirely when it has no visible sessions to render.
+    // This prevents empty device headers from appearing in the grouped grid
+    // (e.g. when all of a device's sessions are hidden in the current view).
+    if (groupSessions.length === 0) continue;
+    html += '<h3 class="device-group-header">' + escapeHtml(name) + '</h3>';
     for (var j = 0; j < groupSessions.length; j++) {
       html += buildTileHTML(groupSessions[j], j, mobile);
     }

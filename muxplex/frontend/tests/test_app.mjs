@@ -5494,3 +5494,132 @@ test('Phase 5: isHidden() helper (not inline check) drives the dim class', () =>
   assert.strictEqual(app.isHidden('dev1:sess-a', null), false,
     'isHidden must return false when settings is null');
 });
+
+// ─── v0.6.3 empty-device suppression ────────────────────────────────────────
+
+test('v0.6.3: grouped view skips device header when device has only hidden sessions', () => {
+  // 3 devices: DeviceA and DeviceC have visible sessions; DeviceB has only a
+  // hidden session.  In the "all" view DeviceB's session is filtered out by
+  // filterVisible(), so renderGroupedGrid() receives an ordered list with no
+  // DeviceB entries — meaning no DeviceB header should appear in the HTML.
+  const sessions = [
+    { name: 'alpha', deviceName: 'DeviceA', snapshot: '', sessionKey: 'DeviceA:alpha' },
+    { name: 'beta',  deviceName: 'DeviceB', snapshot: '', sessionKey: 'DeviceB:beta'  },
+    { name: 'gamma', deviceName: 'DeviceC', snapshot: '', sessionKey: 'DeviceC:gamma' },
+  ];
+  app._setServerSettings({ hidden_sessions: ['DeviceB:beta'] });
+  app._setGridViewMode('grouped');
+  app._setActiveView('all');
+
+  let capturedHTML = '';
+  const mockGrid = {
+    get innerHTML() { return capturedHTML; },
+    set innerHTML(v) { capturedHTML = v; },
+  };
+  const mockEmpty = { classList: { add: () => {}, remove: () => {} } };
+  const origGetById = globalThis.document.getElementById;
+  const origQSA    = globalThis.document.querySelectorAll;
+  globalThis.document.getElementById = (id) => {
+    if (id === 'session-grid') return mockGrid;
+    if (id === 'empty-state')  return mockEmpty;
+    return null;
+  };
+  globalThis.document.querySelectorAll = () => [];
+
+  app.renderGrid(sessions);
+
+  assert.ok(!capturedHTML.includes('DeviceB'),
+    'DeviceB header must NOT appear when all its sessions are hidden');
+  assert.ok(capturedHTML.includes('DeviceA'),
+    'DeviceA header must appear (has at least one visible session)');
+  assert.ok(capturedHTML.includes('DeviceC'),
+    'DeviceC header must appear (has at least one visible session)');
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelectorAll = origQSA;
+  app._setGridViewMode('flat');
+  app._setServerSettings(null);
+  app._setActiveView('all');
+});
+
+test('v0.6.3: grouped view still shows device header when device has at least one visible session', () => {
+  // Sanity-check the positive case: DeviceA has two sessions, one of which is
+  // hidden.  Because one session (alpha) remains visible, DeviceA's block must
+  // appear in the rendered HTML.
+  const sessions = [
+    { name: 'alpha', deviceName: 'DeviceA', snapshot: '', sessionKey: 'DeviceA:alpha' },
+    { name: 'beta',  deviceName: 'DeviceA', snapshot: '', sessionKey: 'DeviceA:beta'  },
+    { name: 'gamma', deviceName: 'DeviceB', snapshot: '', sessionKey: 'DeviceB:gamma' },
+  ];
+  app._setServerSettings({ hidden_sessions: ['DeviceA:beta'] }); // only beta hidden
+  app._setGridViewMode('grouped');
+  app._setActiveView('all');
+
+  let capturedHTML = '';
+  const mockGrid = {
+    get innerHTML() { return capturedHTML; },
+    set innerHTML(v) { capturedHTML = v; },
+  };
+  const mockEmpty = { classList: { add: () => {}, remove: () => {} } };
+  const origGetById = globalThis.document.getElementById;
+  const origQSA    = globalThis.document.querySelectorAll;
+  globalThis.document.getElementById = (id) => {
+    if (id === 'session-grid') return mockGrid;
+    if (id === 'empty-state')  return mockEmpty;
+    return null;
+  };
+  globalThis.document.querySelectorAll = () => [];
+
+  app.renderGrid(sessions);
+
+  assert.ok(capturedHTML.includes('DeviceA'),
+    'DeviceA header must appear — alpha is still visible even though beta is hidden');
+  assert.ok(capturedHTML.includes('DeviceB'),
+    'DeviceB header must appear — gamma is visible');
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelectorAll = origQSA;
+  app._setGridViewMode('flat');
+  app._setServerSettings(null);
+  app._setActiveView('all');
+});
+
+test('v0.6.3: empty-state still appears when every device has zero visible sessions', () => {
+  // When ALL sessions across ALL devices are hidden, visible.length === 0.
+  // renderGrid() must still reach its early-return branch and show empty-state,
+  // NOT fall through to grouped rendering and produce a blank grid.
+  const sessions = [
+    { name: 'alpha', deviceName: 'DeviceA', snapshot: '', sessionKey: 'DeviceA:alpha' },
+    { name: 'beta',  deviceName: 'DeviceB', snapshot: '', sessionKey: 'DeviceB:beta'  },
+  ];
+  app._setServerSettings({ hidden_sessions: ['DeviceA:alpha', 'DeviceB:beta'] });
+  app._setGridViewMode('grouped');
+  app._setActiveView('all');
+
+  const removedFromEmpty = [];
+  const mockGrid  = { innerHTML: '' };
+  const mockEmpty = {
+    classList: {
+      add:    () => {},
+      remove: (c) => removedFromEmpty.push(c),
+    },
+  };
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => {
+    if (id === 'session-grid') return mockGrid;
+    if (id === 'empty-state')  return mockEmpty;
+    return null;
+  };
+
+  app.renderGrid(sessions);
+
+  assert.ok(removedFromEmpty.includes('hidden'),
+    'empty-state must have its "hidden" class removed (i.e. become visible) when all sessions are hidden');
+  assert.ok(!mockGrid.innerHTML.includes('device-group-header'),
+    'no device-group-header elements must appear when all sessions are hidden');
+
+  globalThis.document.getElementById = origGetById;
+  app._setGridViewMode('flat');
+  app._setServerSettings(null);
+  app._setActiveView('all');
+});
