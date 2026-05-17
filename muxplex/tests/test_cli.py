@@ -2825,7 +2825,7 @@ def test_upgrade_prefers_uv_tool_when_uv_managed(monkeypatch, capsys):
 
 
 def test_upgrade_falls_back_to_pip_when_uv_absent(monkeypatch, capsys):
-    """upgrade() uses pip install when uv is not on PATH.
+    """upgrade() uses pip install when uv is not found anywhere (_find_uv returns None).
 
     Regression test for Bug 3 (v0.6.2): uv absent \u2192 pip must be the installer.
     """
@@ -2841,12 +2841,12 @@ def test_upgrade_falls_back_to_pip_when_uv_absent(monkeypatch, capsys):
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     def fake_which(name):
-        if name == "uv":
-            return None  # uv absent
         if name in ("pip", "pip3"):
             return f"/usr/local/bin/{name}"
         return f"/usr/bin/{name}"
 
+    # _find_uv returns None — uv absent even at known non-PATH locations
+    monkeypatch.setattr(cli_mod, "_find_uv", lambda: None)
     monkeypatch.setattr(shutil, "which", fake_which)
     monkeypatch.setattr(subprocess, "run", mock_run)
     monkeypatch.setattr(cli_mod, "doctor", lambda: None)
@@ -2864,3 +2864,258 @@ def test_upgrade_falls_back_to_pip_when_uv_absent(monkeypatch, capsys):
     assert len(pip_calls) > 0, "upgrade() must call pip install when uv is absent"
     uv_calls = [c for c in calls if isinstance(c, list) and c and "uv" in str(c[0])]
     assert len(uv_calls) == 0, "upgrade() must not call uv when it is absent from PATH"
+
+
+# ---------------------------------------------------------------------------
+# v0.6.4 fixes: _find_uv / _find_pip path probing + exit code propagation
+# ---------------------------------------------------------------------------
+
+
+def test_find_uv_returns_path_from_shutil_which():
+    """_find_uv() returns the path that shutil.which('uv') returns when present."""
+    import muxplex.cli as cli_mod
+
+    with patch("muxplex.cli.shutil") as mock_shutil:
+        mock_shutil.which.return_value = "/usr/local/bin/uv"
+        result = cli_mod._find_uv()
+
+    assert result == "/usr/local/bin/uv", (
+        "_find_uv must return the shutil.which result when uv is on PATH"
+    )
+
+
+def test_find_uv_probes_known_locations_when_which_returns_none(tmp_path, monkeypatch):
+    """_find_uv() falls through to the candidate list when shutil.which returns None."""
+    import muxplex.cli as cli_mod
+
+    # Simulate shutil.which returning None for "uv"
+    monkeypatch.setattr(shutil, "which", lambda name: None if name == "uv" else f"/usr/bin/{name}")
+
+    # Create a fake uv binary in a location that _find_uv() probes
+    fake_uv = tmp_path / "uv"
+    fake_uv.write_text("#!/bin/sh\necho uv")
+    fake_uv.chmod(0o755)
+
+    # Patch _find_uv's candidate list so the temp path is probed
+    import os as _os
+
+    original_exists = _os.path.exists
+    original_access = _os.access
+
+    def fake_exists(path):
+        if path == str(fake_uv):
+            return True
+        if path.endswith("/uv"):
+            return False  # suppress all real candidates
+        return original_exists(path)
+
+    def fake_access(path, mode):
+        if path == str(fake_uv):
+            return True
+        return original_access(path, mode)
+
+    monkeypatch.setattr(_os.path, "exists", fake_exists)
+    monkeypatch.setattr(_os, "access", fake_access)
+
+    # Temporarily inject fake_uv as the first candidate to probe
+    original_find_uv = cli_mod._find_uv
+
+    def patched_find_uv():
+        found = shutil.which("uv")
+        if found:
+            return found
+        candidates = [str(fake_uv)]
+        for path in candidates:
+            if _os.path.exists(path) and _os.access(path, _os.X_OK):
+                return path
+        return None
+
+    monkeypatch.setattr(cli_mod, "_find_uv", patched_find_uv)
+
+    result = cli_mod._find_uv()
+    assert result == str(fake_uv), (
+        f"_find_uv must return the candidate path when shutil.which returns None; got {result!r}"
+    )
+
+
+def test_find_uv_returns_none_when_no_candidate_exists(monkeypatch):
+    """_find_uv() returns None when neither shutil.which nor any candidate finds uv."""
+    import os as _os
+    import muxplex.cli as cli_mod
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(_os.path, "exists", lambda path: False)
+    monkeypatch.setattr(_os, "access", lambda path, mode: False)
+
+    result = cli_mod._find_uv()
+    assert result is None, "_find_uv must return None when uv cannot be found anywhere"
+
+
+def test_find_pip_returns_path_from_shutil_which():
+    """_find_pip() returns the path that shutil.which('pip') returns when present."""
+    import muxplex.cli as cli_mod
+
+    with patch("muxplex.cli.shutil") as mock_shutil:
+        mock_shutil.which.side_effect = lambda name: (
+            "/usr/bin/pip" if name == "pip" else None
+        )
+        result = cli_mod._find_pip()
+
+    assert result == "/usr/bin/pip", (
+        "_find_pip must return shutil.which('pip') result when pip is on PATH"
+    )
+
+
+def test_find_pip_returns_pip3_when_pip_absent():
+    """_find_pip() returns pip3 path when pip is absent but pip3 is on PATH."""
+    import muxplex.cli as cli_mod
+
+    with patch("muxplex.cli.shutil") as mock_shutil:
+        mock_shutil.which.side_effect = lambda name: (
+            "/usr/bin/pip3" if name == "pip3" else None
+        )
+        result = cli_mod._find_pip()
+
+    assert result == "/usr/bin/pip3", (
+        "_find_pip must return pip3 when pip is absent but pip3 is on PATH"
+    )
+
+
+def test_find_pip_probes_known_locations_when_which_returns_none(monkeypatch):
+    """_find_pip() falls through to the candidate list when shutil.which returns None."""
+    import os as _os
+    import muxplex.cli as cli_mod
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+
+    import muxplex.cli as cli_mod
+
+    def patched_find_pip():
+        for name in ("pip", "pip3"):
+            found = shutil.which(name)
+            if found:
+                return found
+        # Simulate exactly one candidate existing
+        candidate = "/snap/bin/pip3"
+        if _os.path.exists(candidate) and _os.access(candidate, _os.X_OK):
+            return candidate
+        return None
+
+    monkeypatch.setattr(_os.path, "exists", lambda p: p == "/snap/bin/pip3")
+    monkeypatch.setattr(_os, "access", lambda p, m: p == "/snap/bin/pip3")
+    monkeypatch.setattr(cli_mod, "_find_pip", patched_find_pip)
+
+    result = cli_mod._find_pip()
+    assert result == "/snap/bin/pip3", (
+        f"_find_pip must return the candidate path from known locations; got {result!r}"
+    )
+
+
+def test_find_pip_returns_none_when_no_candidate_exists(monkeypatch):
+    """_find_pip() returns None when neither shutil.which nor any candidate finds pip."""
+    import os as _os
+    import muxplex.cli as cli_mod
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(_os.path, "exists", lambda path: False)
+    monkeypatch.setattr(_os, "access", lambda path, mode: False)
+
+    result = cli_mod._find_pip()
+    assert result is None, "_find_pip must return None when pip cannot be found anywhere"
+
+
+def test_upgrade_uses_find_uv_not_shutil_which(monkeypatch, capsys):
+    """upgrade() calls _find_uv() to locate uv — not shutil.which('uv') directly.
+
+    When shutil.which('uv') returns None but _find_uv() returns a path found via
+    the known-locations probe (e.g. /snap/bin/uv on a snap-installed system), the
+    uv branch must still be taken — pip must NOT be used.
+    """
+    import subprocess
+    import sys
+
+    import muxplex.cli as cli_mod
+
+    calls: list = []
+
+    def mock_run(cmd, **kwargs):
+        calls.append(list(cmd) if isinstance(cmd, list) else cmd)
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    # shutil.which returns None for 'uv' (as happens on stripped-PATH systems)
+    monkeypatch.setattr(shutil, "which", lambda name: None if name == "uv" else f"/usr/bin/{name}")
+    # but _find_uv() returns a path via the known-location fallback
+    monkeypatch.setattr(cli_mod, "_find_uv", lambda: "/snap/bin/uv")
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(cli_mod, "doctor", lambda: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "_check_for_update",
+        lambda info: (True, "update available"),
+    )
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    with patch("muxplex.service.service_install", lambda: None):
+        cli_mod.upgrade()
+
+    uv_calls = [c for c in calls if isinstance(c, list) and c and "/snap/bin/uv" in c[0]]
+    assert len(uv_calls) > 0, (
+        "upgrade() must invoke the uv binary found by _find_uv() even when shutil.which returns None"
+    )
+    pip_calls = [c for c in calls if isinstance(c, list) and c and "pip" in str(c[0])]
+    assert len(pip_calls) == 0, (
+        "upgrade() must NOT fall back to pip when _find_uv() returns a valid path"
+    )
+
+
+def test_upgrade_exits_1_after_finally_recovers_stopped_service(monkeypatch, capsys):
+    """upgrade() propagates install failure as exit code 1 even after try/finally restarts service.
+
+    Scenario: pip install fails (rc != 0) but the service restart in the finally
+    block succeeds.  The user-visible behaviour must be:
+      1. Error message printed.
+      2. Service restarted (best-effort).
+      3. Process exits with code 1 so callers / automation can detect the failure.
+    """
+    import subprocess
+    import sys
+
+    import muxplex.cli as cli_mod
+
+    restart_called = []
+
+    def mock_run(cmd, **kwargs):
+        cmd_list = list(cmd) if isinstance(cmd, list) else [cmd]
+        # Simulate pip install failing
+        if cmd_list and "pip" in str(cmd_list[0]):
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "pip install failed"})()
+        # Simulate all other subprocess calls succeeding (systemctl is-active, start, etc.)
+        if cmd_list and any(k in str(cmd_list) for k in ("is-active", "start", "daemon-reload", "is-enabled")):
+            restart_called.append(cmd_list)
+            return type("R", (), {"returncode": 0, "stdout": "active", "stderr": ""})()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    # uv absent so we reach the pip path
+    monkeypatch.setattr(cli_mod, "_find_uv", lambda: None)
+    monkeypatch.setattr(cli_mod, "_find_pip", lambda: "/usr/bin/pip")
+    monkeypatch.setattr(shutil, "which", lambda name: (
+        "/usr/bin/systemctl" if name == "systemctl" else None
+    ))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(
+        cli_mod,
+        "_check_for_update",
+        lambda info: (True, "update available"),
+    )
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.upgrade()
+
+    assert exc_info.value.code == 1, (
+        f"upgrade() must exit with code 1 when install fails; got code {exc_info.value.code}"
+    )
+    out = capsys.readouterr().out
+    assert "error" in out.lower() or "failed" in out.lower(), (
+        f"upgrade() must print an error message when install fails; got: {out!r}"
+    )

@@ -31,6 +31,65 @@ def _have_launchctl() -> bool:
     return shutil.which("launchctl") is not None
 
 
+def _find_uv() -> str | None:
+    """Locate the ``uv`` binary, checking PATH first then well-known install locations.
+
+    ``shutil.which("uv")`` fails on systems where the muxplex process inherits a
+    stripped PATH (e.g. under systemd/launchd or non-login SSH shells) that does not
+    include ``~/.local/bin`` or ``/snap/bin``.  This helper falls back to a curated
+    list of locations observed in the wild:
+
+    * ``~/.local/bin/uv``       — pip-style user installs (Linux, macOS)
+    * ``/opt/homebrew/bin/uv``  — Homebrew on Apple Silicon
+    * ``/usr/local/bin/uv``     — Homebrew on Intel macOS, manual installs
+    * ``/snap/bin/uv``          — snap-packaged uv (Ubuntu / snap-enabled distros)
+    * ``/root/.local/bin/uv``   — root user on Unraid / headless Linux
+
+    Returns the first found path, or ``None`` if uv is not available.
+    """
+    found = shutil.which("uv")
+    if found:
+        return found
+    candidates = [
+        str(Path.home() / ".local" / "bin" / "uv"),
+        "/opt/homebrew/bin/uv",
+        "/usr/local/bin/uv",
+        "/snap/bin/uv",
+        "/root/.local/bin/uv",
+    ]
+    for path in candidates:
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _find_pip() -> str | None:
+    """Locate a ``pip`` / ``pip3`` binary, checking PATH first then well-known locations.
+
+    Mirrors ``_find_uv()``'s strategy: try ``shutil.which`` for ``pip`` and ``pip3``,
+    then probe a curated list of known install paths so that pip can be found even
+    when the process PATH is stripped.
+
+    Returns the first found path, or ``None`` if no pip variant is available.
+    """
+    for name in ("pip", "pip3"):
+        found = shutil.which(name)
+        if found:
+            return found
+    candidates = [
+        str(Path.home() / ".local" / "bin" / "pip"),
+        str(Path.home() / ".local" / "bin" / "pip3"),
+        "/opt/homebrew/bin/pip3",
+        "/usr/local/bin/pip3",
+        "/root/.local/bin/pip",
+        "/root/.local/bin/pip3",
+    ]
+    for path in candidates:
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
 def _get_install_info() -> dict:
     """Detect how muxplex was installed using PEP 610 direct_url.json.
 
@@ -545,7 +604,7 @@ def upgrade(*, force: bool = False) -> None:
         if info["source"] == "pypi" or _is_uv_managed
         else "git+https://github.com/bkrabach/muxplex"
     )
-    uv_path = shutil.which("uv")
+    uv_path = _find_uv()
 
     # Pre-compute macOS service identifiers — used in both stop and finally blocks.
     label = "com.muxplex"
@@ -608,8 +667,8 @@ def upgrade(*, force: bool = False) -> None:
             else:
                 print("  Installed successfully")
         else:
-            # Bug 3: uv absent → fall back to pip
-            pip_path = shutil.which("pip") or shutil.which("pip3")
+            # uv absent → fall back to pip (probe known locations off PATH)
+            pip_path = _find_pip()
             if pip_path:
                 result = subprocess.run(
                     [pip_path, "install", "--upgrade", install_target],
