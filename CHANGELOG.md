@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.4 (2026-05-17)
+
+### Bug Fixes
+
+- **Empty device block still showing in grouped grid view** — Remote federation devices with
+  zero tmux sessions were producing a visible "No sessions" block in the grouped grid view.
+  The v0.6.3 fix targeted `renderGroupedGrid` but missed the unconditional `status:empty`
+  status-tile append in `renderGrid` itself.  In grouped mode, `status:empty` tiles are now
+  suppressed (`auth_failed` and `unreachable` tiles still appear in all modes).
+
+- **`muxplex update` fails when uv/pip is installed outside PATH** — On Unraid (root user),
+  macOS (user installs), and snap-packaged systems, `shutil.which("uv")` returned None even
+  though uv was present at `~/.local/bin/uv`, `/snap/bin/uv`, or `/root/.local/bin/uv`.
+  New helpers `_find_uv()` / `_find_pip()` probe a curated list of known install locations
+  after PATH lookup fails, so the upgrade flow works on stripped-PATH environments
+  (systemd, launchd, non-login SSH shells).
+
+- **`muxplex update` exit code propagation** — Tests added to confirm that a failed install
+  exits with code 1 after the `try/finally` service-recovery block runs (behaviour was
+  implemented in v0.6.2; regression test coverage added here).
+
 ## v0.5.0 (2026-05-06)
 
 ### Features
