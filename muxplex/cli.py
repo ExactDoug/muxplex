@@ -31,6 +31,77 @@ def _have_launchctl() -> bool:
     return shutil.which("launchctl") is not None
 
 
+def _probe_service_port(port: int) -> bool:
+    """Return True if a muxplex server is responding on localhost:port.
+
+    Tries HTTPS first (self-signed cert tolerated), then HTTP.  Any HTTP
+    response code (including 4xx/5xx) confirms the server is listening.
+    A connection error, timeout, or SSL failure means the server is not up.
+    """
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    for scheme in ("https", "http"):
+        try:
+            url = f"{scheme}://localhost:{port}/login"
+            if scheme == "https":
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(url, timeout=5, context=ctx) as _resp:
+                    return True
+            else:
+                with urllib.request.urlopen(url, timeout=5) as _resp:
+                    return True
+        except urllib.error.HTTPError:
+            # Server returned an HTTP error — it IS running
+            return True
+        except Exception:
+            pass  # Connection refused, timeout, SSL issue — try next scheme
+    return False
+
+
+def _verify_service_started(timeout_s: int = 10) -> bool:
+    """Verify the muxplex service is actually serving after a start command.
+
+    For systemctl: calls ``systemctl --user is-active muxplex`` once and
+    returns ``True`` only when the unit is ``active`` (exit code 0).
+    ``systemctl start`` is synchronous so a single check is sufficient.
+
+    For launchctl: polls ``_probe_service_port()`` until a successful HTTP
+    response is received or ``timeout_s`` seconds have elapsed.  launchd
+    starts processes asynchronously, so polling is necessary.
+
+    Returns ``False`` if the service is not active / not responding.
+    """
+    import time
+
+    if _have_systemctl():
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "muxplex"],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
+    if _have_launchctl():
+        from muxplex.settings import load_settings  # noqa: PLC0415
+
+        cfg = load_settings()
+        port = cfg.get("port", 8088)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if _probe_service_port(port):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(1.0, remaining))
+
+    return False
+
+
 def _find_uv() -> str | None:
     """Locate the ``uv`` binary, checking PATH first then well-known install locations.
 
@@ -503,7 +574,18 @@ def doctor() -> None:
                     text=True,
                 )
                 if result.returncode == 0:
-                    print(f"  {ok_mark} Service: launchd agent running")
+                    # Agent is registered — verify it is actually serving
+                    from muxplex.settings import load_settings  # noqa: PLC0415
+
+                    _cfg = load_settings()
+                    _port = _cfg.get("port", 8088)
+                    if _probe_service_port(_port):
+                        print(f"  {ok_mark} Service: launchd agent running")
+                    else:
+                        print(
+                            f"  {warn_mark} Service: launchd agent registered but"
+                            f" not serving on port {_port}"
+                        )
                 else:
                     print(
                         f"  {warn_mark} Service: launchd agent installed but not running ({plist})"
@@ -524,9 +606,21 @@ def doctor() -> None:
                 Path.home() / ".config" / "systemd" / "user" / "muxplex.service"
             )
             if systemd_user.exists():
-                print(
-                    f"  {ok_mark} Service: systemd user unit installed ({systemd_user})"
+                _active = subprocess.run(
+                    ["systemctl", "--user", "is-active", "muxplex"],
+                    capture_output=True,
+                    text=True,
                 )
+                if _active.returncode == 0:
+                    print(
+                        f"  {ok_mark} Service: systemd user unit installed ({systemd_user})"
+                    )
+                else:
+                    _state = _active.stdout.strip() or "unknown"
+                    print(
+                        f"  {warn_mark} Service: systemd user unit installed but"
+                        f" not active — state: {_state} ({systemd_user})"
+                    )
             elif _system_service_path.exists():
                 print(
                     f"  {ok_mark} Service: systemd system unit installed ({_system_service_path})"
@@ -644,6 +738,7 @@ def upgrade(*, force: bool = False) -> None:
     # 2+4. Install (try) with guaranteed service restart in finally.
     # Bug 1+2b: try/finally ensures the start step always runs — success OR failure.
     _install_failed = False
+    _service_restart_failed = False
     print("  Installing latest version...")
     try:
         # Bug 3: dispatch — uv-tool-managed gets --reinstall; plain uv/pip otherwise
@@ -705,14 +800,21 @@ def upgrade(*, force: bool = False) -> None:
                         capture_output=True,
                         text=True,
                     )
-                    if result.returncode == 0:
-                        print("  Service started")
-                    else:
+                    if result.returncode != 0:
                         # Fallback to legacy load for older macOS
                         subprocess.run(
                             ["launchctl", "load", str(plist)], capture_output=True
                         )
-                        print("  Service started (legacy)")
+                    # Verify the agent is actually serving (not just registered)
+                    if _verify_service_started():
+                        print("  Service started")
+                    else:
+                        print(
+                            "  ERROR: launchd agent registered but the service is"
+                            " not responding after upgrade.\n"
+                            "  Check /tmp/muxplex.err for details."
+                        )
+                        _service_restart_failed = True
                 else:
                     print("  Service file not found — run: muxplex service install")
         elif _have_systemctl():
@@ -723,13 +825,35 @@ def upgrade(*, force: bool = False) -> None:
             )
             if result.returncode == 0:
                 print("  Restarting systemd service...")
+                # daemon-reload FIRST: picks up any regenerated unit file so
+                # the start command sees the correct ExecStart (spark-1 fix).
                 subprocess.run(
                     ["systemctl", "--user", "daemon-reload"], capture_output=True
                 )
                 subprocess.run(
                     ["systemctl", "--user", "start", "muxplex"], capture_output=True
                 )
-                print("  Service started")
+                if not _verify_service_started():
+                    # Unit may have landed in 'failed' state (e.g. port race
+                    # on first start).  Reset the failure counter and retry once.
+                    subprocess.run(
+                        ["systemctl", "--user", "reset-failed", "muxplex"],
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        ["systemctl", "--user", "start", "muxplex"],
+                        capture_output=True,
+                    )
+                    if _verify_service_started():
+                        print("  Service started")
+                    else:
+                        print(
+                            "  ERROR: muxplex service is not active after upgrade.\n"
+                            "  Run: systemctl --user status muxplex"
+                        )
+                        _service_restart_failed = True
+                else:
+                    print("  Service started")
             else:
                 print("  Service not enabled — run: muxplex service install")
         else:
@@ -756,6 +880,14 @@ def upgrade(*, force: bool = False) -> None:
     if _install_failed:
         print(
             "\n  ERROR: upgrade failed — muxplex service has been restarted (best-effort).\n"
+        )
+        sys.exit(1)
+
+    if _service_restart_failed:
+        print(
+            "\n  ERROR: upgrade installed successfully but the service failed to restart.\n"
+            "  The new version is installed but the service is NOT running.\n"
+            "  Run: muxplex service start\n"
         )
         sys.exit(1)
 

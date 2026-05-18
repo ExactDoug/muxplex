@@ -3119,3 +3119,174 @@ def test_upgrade_exits_1_after_finally_recovers_stopped_service(monkeypatch, cap
     assert "error" in out.lower() or "failed" in out.lower(), (
         f"upgrade() must print an error message when install fails; got: {out!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.6.7 fixes — service-restart verification (Fix 1)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_service_started_returns_true_when_active(monkeypatch):
+    """_verify_service_started returns True when systemctl is-active exits 0 (active)."""
+    import subprocess
+
+    import muxplex.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_have_systemctl", lambda: True)
+    monkeypatch.setattr(cli_mod, "_have_launchctl", lambda: False)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **kw: type(
+            "R", (), {"returncode": 0, "stdout": "active\n", "stderr": ""}
+        )(),
+    )
+
+    assert cli_mod._verify_service_started() is True
+
+
+def test_verify_service_started_returns_false_when_inactive(monkeypatch):
+    """_verify_service_started returns False when systemctl is-active exits 3 (inactive)."""
+    import subprocess
+
+    import muxplex.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_have_systemctl", lambda: True)
+    monkeypatch.setattr(cli_mod, "_have_launchctl", lambda: False)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **kw: type(
+            "R", (), {"returncode": 3, "stdout": "inactive\n", "stderr": ""}
+        )(),
+    )
+
+    assert cli_mod._verify_service_started() is False
+
+
+def test_upgrade_exits_1_if_service_fails_to_restart(monkeypatch, capsys):
+    """upgrade() exits 1 when install succeeds but the service never becomes active."""
+    import subprocess
+
+    import muxplex.cli as cli_mod
+
+    calls = []
+
+    def mock_run(cmd, **kwargs):
+        calls.append(list(cmd) if isinstance(cmd, list) else cmd)
+        return type("R", (), {"returncode": 0, "stdout": "enabled\n", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli_mod, "_check_for_update", lambda info: (True, "update available"))
+    monkeypatch.setattr(cli_mod, "_have_systemctl", lambda: True)
+    monkeypatch.setattr(cli_mod, "_have_launchctl", lambda: False)
+    # Service never becomes active (simulates the spark-1 dead-service scenario)
+    monkeypatch.setattr(cli_mod, "_verify_service_started", lambda timeout_s=10: False)
+
+    with patch("muxplex.service.service_install", lambda: None):
+        with pytest.raises(SystemExit) as exc_info:
+            cli_mod.upgrade()
+
+    assert exc_info.value.code == 1, (
+        f"upgrade() must exit 1 when service fails to restart; got {exc_info.value.code}"
+    )
+    out = capsys.readouterr().out
+    assert "error" in out.lower() or "not running" in out.lower(), (
+        f"upgrade() must print an error about the failed restart; got: {out!r}"
+    )
+
+
+def test_upgrade_calls_daemon_reload_before_start(monkeypatch, capsys):
+    """upgrade() calls systemctl daemon-reload before start (stale unit-file fix)."""
+    import subprocess
+
+    import muxplex.cli as cli_mod
+
+    calls: list = []
+
+    def mock_run(cmd, **kwargs):
+        calls.append(list(cmd) if isinstance(cmd, list) else cmd)
+        return type("R", (), {"returncode": 0, "stdout": "enabled\n", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli_mod, "_check_for_update", lambda info: (True, "update available"))
+    monkeypatch.setattr(cli_mod, "_have_systemctl", lambda: True)
+    monkeypatch.setattr(cli_mod, "_have_launchctl", lambda: False)
+    monkeypatch.setattr(cli_mod, "_verify_service_started", lambda timeout_s=10: True)
+    monkeypatch.setattr(cli_mod, "doctor", lambda: None)
+
+    with patch("muxplex.service.service_install", lambda: None):
+        cli_mod.upgrade()
+
+    systemctl_calls = [c for c in calls if isinstance(c, list) and "systemctl" in c]
+    reload_idx = next(
+        (i for i, c in enumerate(systemctl_calls) if "daemon-reload" in c), None
+    )
+    start_idx = next(
+        (i for i, c in enumerate(systemctl_calls) if "start" in c and "muxplex" in c),
+        None,
+    )
+
+    assert reload_idx is not None, (
+        "systemctl daemon-reload must be called during upgrade"
+    )
+    assert start_idx is not None, (
+        "systemctl start muxplex must be called during upgrade"
+    )
+    assert reload_idx < start_idx, (
+        "daemon-reload must be called BEFORE start to pick up the regenerated unit file"
+    )
+
+
+# ---------------------------------------------------------------------------
+# v0.6.7 fixes — doctor launchd port-probe (Fix 2 / doctor enhancement)
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_reports_launchd_registered_but_not_serving(
+    monkeypatch, tmp_path, capsys
+):
+    """doctor() warns when launchd agent is registered but the service port is not responding."""
+    import subprocess
+    import sys
+
+    import muxplex.cli as cli_mod
+    import muxplex.settings as settings_mod
+
+    # Create plist file so plist.exists() passes
+    fake_home = tmp_path
+    plist = fake_home / "Library" / "LaunchAgents" / "com.muxplex.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_text("<plist/>")
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text("{}")
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_file)
+
+    # Simulate macOS
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli_mod, "_have_launchctl", lambda: True)
+
+    # launchctl print succeeds (agent is registered)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: type(
+            "R", (), {"returncode": 0, "stdout": "", "stderr": ""}
+        )(),
+    )
+
+    # Port is NOT responding
+    monkeypatch.setattr(cli_mod, "_probe_service_port", lambda port: False)
+
+    cli_mod.doctor()
+
+    out = capsys.readouterr().out
+    assert "not serving" in out.lower(), (
+        f"doctor() must warn 'not serving' when launchd is registered but port is down;"
+        f" got: {out!r}"
+    )
