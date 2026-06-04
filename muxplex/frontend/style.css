@@ -1612,11 +1612,89 @@ body {
    View dropdown — header view selector
    ============================================================ */
 
+/* Header views group — pills + Views dropdown, between wordmark and actions */
+.header-views {
+  flex: 1;
+  min-width: 0; /* allow shrinking inside the flex header */
+  display: flex;
+  align-items: center;
+  margin: 0 12px;
+}
+
+/* View pills — one per view, single click activates. Collapses < 600px. */
+.view-pills {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none; /* Firefox — hide scrollbar, row still scrolls */
+}
+
+.view-pills::-webkit-scrollbar {
+  display: none; /* Chrome/Safari — hide scrollbar */
+}
+
+.view-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  max-width: 180px;
+  overflow: hidden;
+  white-space: nowrap;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  font-family: var(--font-ui);
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 3px 12px;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+
+.view-pill:hover {
+  border-color: var(--accent);
+  color: var(--text);
+  background: var(--bg-surface);
+}
+
+.view-pill--active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.view-pill__count {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.view-pill--active .view-pill__count {
+  color: var(--accent);
+}
+
 .view-dropdown {
   position: relative;
   display: flex;
   align-items: center;
   margin-left: 12px;
+}
+
+/* Trigger label: mobile shows the active view name (pills are hidden, the
+   dropdown is the switcher); desktop shows a fixed "Views" label (pills
+   indicate the active view, dropdown is for switching + management). */
+.view-dropdown__static-label { display: none; }
+
+@media (min-width: 600px) {
+  .view-dropdown__static-label { display: inline; }
+  .view-dropdown__dynamic-label { display: none; }
+}
+
+@media (max-width: 599px) {
+  .view-pills { display: none; }
+  .view-dropdown { margin-left: 0; }
 }
 
 .view-dropdown__trigger {

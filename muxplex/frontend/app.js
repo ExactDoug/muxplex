@@ -354,6 +354,7 @@ async function pollSessions() {
     _pollFailCount = 0;
     setConnectionStatus('ok');
     renderGrid(sessions);
+    renderViewPills();
     renderSidebar(sessions, _viewingSession, _viewingRemoteId);
     handleBellTransitions(prev, sessions);
     updateSessionPill(sessions);
@@ -1042,6 +1043,46 @@ function renderFilterBar(container, allSessions) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Render the header view pills — one pill per view (All Sessions, user views,
+ * and Hidden when non-empty). Single click on a pill activates that view.
+ * Hidden on narrow screens via CSS (.view-pills collapses < 600px); the
+ * "Views" dropdown trigger remains as the mobile switcher + management menu.
+ */
+function renderViewPills() {
+  var pills = $('view-pills');
+  if (!pills) return;
+
+  var views = (_serverSettings && _serverSettings.views) || [];
+  var html = '';
+
+  // — All Sessions (always first)
+  var allCount = visibleCount(_currentSessions, _serverSettings, 'all');
+  var allActive = _activeView === 'all' ? ' view-pill--active' : '';
+  html += '<button class="view-pill' + allActive + '" data-view="all" title="All Sessions">All Sessions <span class="view-pill__count">' + allCount + '</span></button>';
+
+  // — User views (same 7-view cap as the dropdown)
+  for (var i = 0; i < views.length && i < 7; i++) {
+    var v = views[i];
+    var vActive = _activeView === v.name ? ' view-pill--active' : '';
+    html += '<button class="view-pill' + vActive + '" data-view="' + escapeHtml(v.name) + '" title="' + escapeHtml(v.name) + '">' + escapeHtml(v.name) + ' <span class="view-pill__count">' + visibleCount(_currentSessions, _serverSettings, v.name) + '</span></button>';
+  }
+
+  // — Hidden: only when it has sessions (or is currently active)
+  var hiddenCount = visibleCount(_currentSessions, _serverSettings, 'hidden');
+  if (hiddenCount > 0 || _activeView === 'hidden') {
+    var hiddenActive = _activeView === 'hidden' ? ' view-pill--active' : '';
+    html += '<button class="view-pill' + hiddenActive + '" data-view="hidden" title="Hidden">Hidden <span class="view-pill__count">' + hiddenCount + '</span></button>';
+  }
+
+  // Skip the DOM write when nothing changed — this runs every poll cycle and
+  // replacing innerHTML each time would reset :hover/:active button state.
+  if (pills._lastHtml !== html) {
+    pills.innerHTML = html;
+    pills._lastHtml = html;
+  }
+}
+
+/**
  * Populate #view-dropdown-menu with the full view list and update the label.
  * Called on open and after a view switch.
  */
@@ -1086,7 +1127,8 @@ function renderViewDropdown() {
 
   menu.innerHTML = html;
 
-  // Update the label
+  // Update the (mobile) dynamic label — on desktop the trigger shows the
+  // static "Views" label and the pills indicate the active view instead.
   var label = $('view-dropdown-label');
   if (label) {
     if (_activeView === 'all') {
@@ -1097,6 +1139,9 @@ function renderViewDropdown() {
       label.textContent = _activeView;
     }
   }
+
+  // Keep the header pills in sync with the dropdown state
+  renderViewPills();
 }
 
 /**
@@ -4077,6 +4122,15 @@ function bindStaticEventListeners() {
 
   on($('back-btn'), 'click', closeSession);
 
+  // View pills — single click activates that view (delegated; pills re-render)
+  var viewPills = $('view-pills');
+  if (viewPills) {
+    viewPills.addEventListener('click', function(e) {
+      var pill = e.target.closest && e.target.closest('[data-view]');
+      if (pill) switchView(pill.dataset.view);
+    });
+  }
+
   // View dropdown — trigger opens/closes, delegated item clicks switch view
   var viewDropdownTrigger = $('view-dropdown-trigger');
   if (viewDropdownTrigger) on(viewDropdownTrigger, 'click', toggleViewDropdown);
@@ -4577,7 +4631,8 @@ if (typeof module !== 'undefined' && module.exports) {
     closeFlyoutMenu,
     // Filter bar
     renderFilterBar,
-    // View dropdown
+    // View pills + dropdown
+    renderViewPills,
     renderViewDropdown,
     toggleViewDropdown,
     closeViewDropdown,
