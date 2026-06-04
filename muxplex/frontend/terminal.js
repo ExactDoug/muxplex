@@ -11,6 +11,7 @@ let _vpHandler = null;
 let _reconnectAttempts = 0; // tracks consecutive failed reconnect attempts for backoff + ttyd respawn
 let _searchAddon = null;
 let _resizeObserver = null;
+let _ctxMenuHandler = null; // contextmenu listener — stored so reopen doesn't stack handlers
 
 // ─── Module-level encoding helpers ──────────────────────────────────────────
 // Hoisted here so the clipboard key handler (in openTerminal) can also use them.
@@ -532,16 +533,37 @@ function openTerminal(sessionName, remoteId, fontSize) {
     newPrev.addEventListener('click', _searchPrev);
   }
 
-  // --- Right-click → paste ---
-  // Plain right-click pastes the browser clipboard (Windows terminal convention:
-  // PuTTY, Windows Terminal). The browser context menu is suppressed so it
-  // doesn't cover the terminal; Shift+RMB and Ctrl+RMB still open the browser
-  // context menu as escape hatches.
-  container.addEventListener('contextmenu', function(e) {
+  // --- Right-click → copy-or-paste ---
+  // Selection-aware (Windows terminal convention, e.g. Windows Terminal
+  // copyOnSelect): right-click WITH an active selection completes the copy —
+  // it must NOT paste, otherwise the select-then-right-click copy gesture
+  // would also type the copied text back into the session. Right-click with
+  // NO selection pastes the browser clipboard.
+  //
+  // _term.hasSelection() is buffer-based, not viewport-based — it stays
+  // accurate even when the user scroll-wheels the selected text out of view,
+  // so no selection tracking of our own is needed. The selection is cleared
+  // after the copy so it both signals "copied" and arms the next right-click
+  // to paste.
+  //
+  // The browser context menu is suppressed so it doesn't cover the terminal;
+  // Shift+RMB and Ctrl+RMB still open the browser context menu as escape hatches.
+  //
+  // The container is static and openTerminal() re-runs on every session
+  // switch, so the previous listener is removed first — otherwise handlers
+  // stack and one right-click would paste once per session ever opened.
+  if (_ctxMenuHandler) container.removeEventListener('contextmenu', _ctxMenuHandler);
+  _ctxMenuHandler = function(e) {
     if (e.shiftKey || e.ctrlKey || e.metaKey) return; // let modified clicks through
     e.preventDefault();
+    if (_term && _term.hasSelection()) {
+      _copyToClipboard(_term.getSelection()); // idempotent — auto-copy already ran on select
+      _term.clearSelection();
+      return;
+    }
     _pasteFromClipboard();
-  });
+  };
+  container.addEventListener('contextmenu', _ctxMenuHandler);
 
   connectWebSocket(sessionName, remoteId);
   initVisualViewport(); /* defined in Task 14 */
@@ -567,6 +589,12 @@ function closeTerminal() {
   }
 
   if (_resizeObserver) { _resizeObserver.disconnect(); _resizeObserver = null; }
+
+  if (_ctxMenuHandler) {
+    var ctxContainer = document.getElementById('terminal-container');
+    if (ctxContainer) ctxContainer.removeEventListener('contextmenu', _ctxMenuHandler);
+    _ctxMenuHandler = null;
+  }
 
   if (_term) {
     _term.dispose();
