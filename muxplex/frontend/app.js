@@ -353,6 +353,13 @@ async function pollSessions() {
     _currentSessions = sessions;
     _pollFailCount = 0;
     setConnectionStatus('ok');
+    // Recompute auto-views from fresh poll data, then re-validate the active
+    // view against BOTH lists — a vanished view (deleted user view, or an
+    // auto-view whose members died/got hidden) falls back to 'all' instead of
+    // leaving a stale empty grid. switchView() persists the fallback.
+    _autoViews = buildAutoViews(sessions, _serverSettings);
+    var _resolved = _resolveActiveView(_activeView, (_serverSettings && _serverSettings.views) || [], _autoViews);
+    if (_resolved !== _activeView) switchView(_resolved);
     renderGrid(sessions);
     renderViewPills();
     renderSidebar(sessions, _viewingSession, _viewingRemoteId);
@@ -662,6 +669,16 @@ function filterVisible(sessions, settings, view, options) {
     return live.filter(function (s) { return !isSessionHidden(s); });
   }
 
+  // Auto-view ('dir:<key>'): membership is computed from live directory
+  // metadata, never stored. Hidden sessions are always excluded (A6) —
+  // includeHidden does not apply to auto-views.
+  if (isAutoViewId(view)) {
+    var groupKey = autoViewKey(view);
+    return live.filter(function (s) {
+      return sessionGroupKey(s) === groupKey && !isSessionHidden(s);
+    });
+  }
+
   var views = (settings && settings.views) || [];
   var userView = null;
   for (var i = 0; i < views.length; i++) {
@@ -682,6 +699,85 @@ function filterVisible(sessions, settings, view, options) {
 function visibleCount(sessions, settings, view, options) {
   return filterVisible(sessions, settings, view, options).length;
 }
+
+// ---------------------------------------------------------------------------
+// Auto-views — virtual views synthesized from session directory metadata.
+// Never persisted, never synced, never pruned; recomputed from poll data.
+// Identity is namespaced ('dir:<key>') so a user view can never collide;
+// display shows the bare key. Design:
+// docs/plans/2026-06-05-cwd-auto-grouping-plan.md
+// ---------------------------------------------------------------------------
+
+var AUTO_VIEW_PREFIX = 'dir:';
+
+/** True when *view* is a namespaced auto-view id ('dir:<key>'). */
+function isAutoViewId(view) {
+  return typeof view === 'string' && view.indexOf(AUTO_VIEW_PREFIX) === 0;
+}
+
+/** Bare group key of an auto-view id ('dir:qw-bridge' → 'qw-bridge'). */
+function autoViewKey(viewId) {
+  return isAutoViewId(viewId) ? viewId.slice(AUTO_VIEW_PREFIX.length) : viewId;
+}
+
+/**
+ * Directory grouping key for a session: git repo name, falling back to the
+ * cwd leaf directory (A13). Worktrees resolve identically under both. Returns
+ * null when the session carries no path metadata (old federation remotes,
+ * tmux race on a just-created session).
+ */
+function sessionGroupKey(s) {
+  return (s && (s.gitRepo || s.cwdLeaf)) || null;
+}
+
+/**
+ * Synthesize the auto-view list from live sessions. Pure — no DOM, no state.
+ *
+ * Rules:
+ * - one auto-view per distinct sessionGroupKey() among live sessions (A1);
+ * - hidden sessions and status sentinels are excluded from membership and
+ *   counts (A6);
+ * - groups need >= 2 member sessions (A8) — singletons are noise;
+ * - disabled entirely when settings.autoViewsEnabled === false (A11);
+ * - sorted alphabetically (case-insensitive) by key.
+ *
+ * @returns {Array<{id: string, name: string, sessions: string[]}>} id is the
+ *   namespaced 'dir:<key>' identity; name is the bare key for display;
+ *   sessions holds member session keys (sessionKey || name).
+ */
+function buildAutoViews(sessions, settings) {
+  if (settings && settings.autoViewsEnabled === false) return [];
+
+  var hiddenList = (settings && settings.hidden_sessions) || [];
+  function keyOf(s) { return s.sessionKey || s.name; }
+  function isSessionHidden(s) {
+    return hiddenList.indexOf(keyOf(s)) !== -1 || hiddenList.indexOf(s.name) !== -1;
+  }
+
+  var groups = {};
+  var pool = (sessions || []).filter(function (s) { return !s.status && !isSessionHidden(s); });
+  for (var i = 0; i < pool.length; i++) {
+    var key = sessionGroupKey(pool[i]);
+    if (!key) continue;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(keyOf(pool[i]));
+  }
+
+  var out = [];
+  for (var k in groups) {
+    if (!Object.prototype.hasOwnProperty.call(groups, k)) continue;
+    if (groups[k].length < 2) continue;
+    out.push({ id: AUTO_VIEW_PREFIX + k, name: k, sessions: groups[k] });
+  }
+  out.sort(function (a, b) {
+    var an = a.name.toLowerCase(), bn = b.name.toLowerCase();
+    return an < bn ? -1 : an > bn ? 1 : 0;
+  });
+  return out;
+}
+
+// Auto-views recomputed each poll cycle (derived state — see buildAutoViews)
+var _autoViews = [];
 
 /**
  * Returns sessions filtered by the active view.
@@ -834,16 +930,31 @@ function removeSessionFromViewOp(settings, viewName, key) {
  * Resolve the active view name against the known views list.
  *
  * If active_view is "all" or "hidden" it is always valid and returned as-is.
+ * If active_view is an auto-view id ('dir:<key>') it is valid only while that
+ * auto-view exists in the synthesized list — auto-views vanish when their
+ * member sessions die, get hidden, or drop below the 2-session minimum.
  * If active_view matches a view name in the views list it is returned as-is.
  * Otherwise (e.g. the view was deleted while this device was offline) fall back
  * to "all" so the user always sees sessions rather than an empty/broken state.
  *
+ * Called every poll cycle (after _autoViews recompute), so a vanished view —
+ * user or auto — falls back cleanly instead of leaving a stale empty grid.
+ *
  * @param {string} activeView - The stored active_view value from state.
  * @param {object[]} views - The views array from settings (each has a .name field).
- * @returns {string} Resolved view name — always "all", "hidden", or a known view name.
+ * @param {object[]} [autoViews] - Synthesized auto-views (each has an .id field).
+ * @returns {string} Resolved view name — always "all", "hidden", a known view
+ *   name, or a live auto-view id.
  */
-function _resolveActiveView(activeView, views) {
+function _resolveActiveView(activeView, views, autoViews) {
   if (activeView === 'all' || activeView === 'hidden') return activeView;
+  if (isAutoViewId(activeView)) {
+    var autos = autoViews || [];
+    for (var ai = 0; ai < autos.length; ai++) {
+      if (autos[ai].id === activeView) return activeView;
+    }
+    return 'all';
+  }
   var list = views || [];
   for (var i = 0; i < list.length; i++) {
     if (list[i].name === activeView) return activeView;
@@ -1030,6 +1141,55 @@ function renderGroupedGrid(sessions, mobile) {
 }
 
 /**
+ * Render sessions grouped by directory (B1). Returns HTML string.
+ *
+ * Group key is sessionGroupKey() — git repo name falling back to cwd leaf.
+ * Unlike the device-grouped mode (insertion order), directory headers are
+ * sorted alphabetically (B4); sessions with no path metadata (old federation
+ * remotes, tmux race) cluster under a final "Other" bucket (B3). Within a
+ * group, the incoming (already-sorted) order is preserved. Grouping has no
+ * minimum size — unlike auto-views, singleton directories still get a header.
+ *
+ * @param {object[]} sessions - sorted, visible sessions
+ * @param {boolean} mobile
+ * @returns {string}
+ */
+function renderCwdGroupedGrid(sessions, mobile) {
+  var groups = {};
+  var ungrouped = [];
+  for (var i = 0; i < sessions.length; i++) {
+    var key = sessionGroupKey(sessions[i]);
+    if (!key) {
+      ungrouped.push(sessions[i]);
+      continue;
+    }
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(sessions[i]);
+  }
+
+  var names = Object.keys(groups).sort(function (a, b) {
+    var an = a.toLowerCase(), bn = b.toLowerCase();
+    return an < bn ? -1 : an > bn ? 1 : 0;
+  });
+
+  var html = '';
+  for (var g = 0; g < names.length; g++) {
+    var groupSessions = groups[names[g]];
+    html += '<h3 class="device-group-header dir-group-header"><span class="view-pill__glyph" aria-hidden="true">📁</span>' + escapeHtml(names[g]) + '</h3>';
+    for (var j = 0; j < groupSessions.length; j++) {
+      html += buildTileHTML(groupSessions[j], j, mobile);
+    }
+  }
+  if (ungrouped.length > 0) {
+    html += '<h3 class="device-group-header dir-group-header">Other</h3>';
+    for (var u = 0; u < ungrouped.length; u++) {
+      html += buildTileHTML(ungrouped[u], u, mobile);
+    }
+  }
+  return html;
+}
+
+/**
  * Render the filter pill bar into the given container element.
  * Generates one 'All' pill plus one pill per unique device name found in allSessions.
  * The currently active device pill is marked with the `filter-pill--active` class.
@@ -1055,25 +1215,52 @@ function renderViewPills() {
   if (!pills) return;
 
   var views = (_serverSettings && _serverSettings.views) || [];
-  var html = '';
+  var fixedHtmls = [];
 
   // — All Sessions (always first)
   var allCount = visibleCount(_currentSessions, _serverSettings, 'all');
   var allActive = _activeView === 'all' ? ' view-pill--active' : '';
-  html += '<button class="view-pill' + allActive + '" data-view="all" title="All Sessions">All Sessions <span class="view-pill__count">' + allCount + '</span></button>';
+  fixedHtmls.push('<button class="view-pill' + allActive + '" data-view="all" title="All Sessions">All Sessions <span class="view-pill__count">' + allCount + '</span></button>');
 
   // — User views (same 7-view cap as the dropdown)
   for (var i = 0; i < views.length && i < 7; i++) {
     var v = views[i];
     var vActive = _activeView === v.name ? ' view-pill--active' : '';
-    html += '<button class="view-pill' + vActive + '" data-view="' + escapeHtml(v.name) + '" title="' + escapeHtml(v.name) + '">' + escapeHtml(v.name) + ' <span class="view-pill__count">' + visibleCount(_currentSessions, _serverSettings, v.name) + '</span></button>';
+    fixedHtmls.push('<button class="view-pill' + vActive + '" data-view="' + escapeHtml(v.name) + '" title="' + escapeHtml(v.name) + '">' + escapeHtml(v.name) + ' <span class="view-pill__count">' + visibleCount(_currentSessions, _serverSettings, v.name) + '</span></button>');
   }
 
   // — Hidden: only when it has sessions (or is currently active)
   var hiddenCount = visibleCount(_currentSessions, _serverSettings, 'hidden');
   if (hiddenCount > 0 || _activeView === 'hidden') {
     var hiddenActive = _activeView === 'hidden' ? ' view-pill--active' : '';
-    html += '<button class="view-pill' + hiddenActive + '" data-view="hidden" title="Hidden">Hidden <span class="view-pill__count">' + hiddenCount + '</span></button>';
+    fixedHtmls.push('<button class="view-pill' + hiddenActive + '" data-view="hidden" title="Hidden">Hidden <span class="view-pill__count">' + hiddenCount + '</span></button>');
+  }
+
+  var html = fixedHtmls.join('');
+
+  // — Auto-view pills (A3), appended after user pills so user views always
+  //   win the horizontal real estate (A7): as the viewport narrows, auto
+  //   pills are dropped FIRST (they stay reachable via the dropdown); user
+  //   pills keep the existing behaviour (the <600px end state hides the row).
+  var autoPillHtmls = _autoViews.map(_autoViewPillHTML);
+  if (autoPillHtmls.length > 0) {
+    var activeAutoIdx = -1;
+    for (var avi = 0; avi < _autoViews.length; avi++) {
+      if (_autoViews[avi].id === _activeView) { activeAutoIdx = avi; break; }
+    }
+    var available = pills.clientWidth || 0;
+    var shown;
+    if (available > 0) {
+      var fixedW = 0;
+      for (var fi = 0; fi < fixedHtmls.length; fi++) fixedW += _epMeasureWidth(fixedHtmls[fi]) + EP_GAP;
+      shown = allocateViewPills(autoPillHtmls.map(_epMeasureWidth), available - fixedW, EP_GAP, activeAutoIdx);
+    } else {
+      // No real layout (test env / display:none) — render everything
+      shown = autoPillHtmls.map(function () { return true; });
+    }
+    for (var api_ = 0; api_ < autoPillHtmls.length; api_++) {
+      if (shown[api_]) html += autoPillHtmls[api_];
+    }
   }
 
   // Skip the DOM write when nothing changed — this runs every poll cycle and
@@ -1082,6 +1269,83 @@ function renderViewPills() {
     pills.innerHTML = html;
     pills._lastHtml = html;
   }
+}
+
+/** Pill HTML for one auto-view (folder glyph marks it as synthesized). */
+function _autoViewPillHTML(av) {
+  var active = _activeView === av.id ? ' view-pill--active' : '';
+  return '<button class="view-pill view-pill--auto' + active + '" data-view="' + escapeHtml(av.id) +
+    '" title="' + escapeHtml(av.name) + '"><span class="view-pill__glyph" aria-hidden="true">📁</span>' +
+    escapeHtml(av.name) + ' <span class="view-pill__count">' +
+    visibleCount(_currentSessions, _serverSettings, av.id) + '</span></button>';
+}
+
+/**
+ * Decide which auto-view pills fit in the width remaining after the fixed
+ * pills (All / user views / Hidden). Pure.
+ *
+ * Greedy in-order prefix: pills are taken left-to-right while they fit, and
+ * allocation stops at the first pill that doesn't (no gap-filling with later,
+ * narrower pills — stable, predictable layout). The active auto-view pill
+ * (mustIndex) is ALWAYS shown: its width is pre-reserved so the user never
+ * loses sight of the view they're in.
+ *
+ * @param {number[]} widths - measured pill widths, in render order
+ * @param {number} available - width left for auto pills (may be <= 0)
+ * @param {number} [gap] - horizontal gap between pills
+ * @param {number} [mustIndex] - index always shown (-1/null = none)
+ * @returns {boolean[]} per-pill shown flags
+ */
+function allocateViewPills(widths, available, gap, mustIndex) {
+  gap = gap != null ? gap : EP_GAP;
+  var shown = widths.map(function () { return false; });
+  var remaining = available;
+  if (mustIndex != null && mustIndex >= 0 && mustIndex < widths.length) {
+    shown[mustIndex] = true;
+    remaining -= widths[mustIndex] + gap;
+  }
+  for (var i = 0; i < widths.length; i++) {
+    if (shown[i]) continue;
+    if (widths[i] + gap <= remaining) {
+      shown[i] = true;
+      remaining -= widths[i] + gap;
+    } else {
+      break;
+    }
+  }
+  return shown;
+}
+
+/**
+ * Human-readable label for any view identity: 'all'/'hidden' map to their
+ * display names, auto-view ids show the bare directory key, user views show
+ * their name as-is.
+ */
+function _viewDisplayName(view) {
+  if (view === 'all') return 'All Sessions';
+  if (view === 'hidden') return 'Hidden';
+  if (isAutoViewId(view)) return autoViewKey(view);
+  return view;
+}
+
+/**
+ * Shared auto-view section for the header + sidebar view dropdowns (A3).
+ * One item per synthesized auto-view, visually distinguished by the folder
+ * glyph + --auto modifier; data-view carries the namespaced id while the
+ * label shows the bare key. Empty string when there are no auto-views.
+ */
+function _autoViewDropdownSectionHTML() {
+  if (_autoViews.length === 0) return '';
+  var html = '<div class="view-dropdown__separator"></div>';
+  for (var i = 0; i < _autoViews.length; i++) {
+    var av = _autoViews[i];
+    var active = _activeView === av.id ? ' view-dropdown__item--active' : '';
+    html += '<button class="view-dropdown__item view-dropdown__item--auto' + active +
+      '" role="menuitem" data-view="' + escapeHtml(av.id) +
+      '"><span class="view-pill__glyph" aria-hidden="true">📁</span>' + escapeHtml(av.name) +
+      ' <span class="view-dropdown__count">' + visibleCount(_currentSessions, _serverSettings, av.id) + '</span></button>';
+  }
+  return html;
 }
 
 /**
@@ -1112,6 +1376,9 @@ function renderViewDropdown() {
     }
   }
 
+  // — Auto-views (A3): synthesized directory views, visually distinguished
+  html += _autoViewDropdownSectionHTML();
+
   // — Hidden (N) (always last system view)
   html += '<div class="view-dropdown__separator"></div>';
   var hiddenActive = _activeView === 'hidden' ? ' view-dropdown__item--active' : '';
@@ -1119,8 +1386,9 @@ function renderViewDropdown() {
 
   // — Actions (stronger separator)
   html += '<div class="view-dropdown__separator view-dropdown__separator--strong"></div>';
-  // Only show "Manage [ViewName]\u2026" when a user view is active
-  if (_activeView !== 'all' && _activeView !== 'hidden') {
+  // Only show "Manage [ViewName]\u2026" when a user view is active \u2014
+  // auto-views are read-only and have no manage panel (A5)
+  if (_activeView !== 'all' && _activeView !== 'hidden' && !isAutoViewId(_activeView)) {
     var displayViewName = _activeView.length > 20 ? _activeView.substring(0, 20) + '\u2026' : _activeView;
     html += '<button class="view-dropdown__item view-dropdown__action" role="menuitem" data-action="manage-view">Manage \u201c' + escapeHtml(displayViewName) + '\u201d\u2026</button>';
   }
@@ -1133,13 +1401,7 @@ function renderViewDropdown() {
   // static "Views" label and the pills indicate the active view instead.
   var label = $('view-dropdown-label');
   if (label) {
-    if (_activeView === 'all') {
-      label.textContent = 'All Sessions';
-    } else if (_activeView === 'hidden') {
-      label.textContent = 'Hidden';
-    } else {
-      label.textContent = _activeView;
-    }
+    label.textContent = _viewDisplayName(_activeView);
   }
 
   // Keep the header pills in sync with the dropdown state
@@ -1208,6 +1470,9 @@ function renderSidebarViewDropdown() {
     }
   }
 
+  // — Auto-views (A3): synthesized directory views, visually distinguished
+  html += _autoViewDropdownSectionHTML();
+
   // — Hidden (N) (always last system view)
   html += '<div class="view-dropdown__separator"></div>';
   var hiddenActive = _activeView === 'hidden' ? ' view-dropdown__item--active' : '';
@@ -1215,8 +1480,9 @@ function renderSidebarViewDropdown() {
 
   // — Actions (stronger separator)
   html += '<div class="view-dropdown__separator view-dropdown__separator--strong"></div>';
-  // Only show "Manage [ViewName]…" when a user view is active
-  if (_activeView !== 'all' && _activeView !== 'hidden') {
+  // Only show "Manage [ViewName]…" when a user view is active —
+  // auto-views are read-only and have no manage panel (A5)
+  if (_activeView !== 'all' && _activeView !== 'hidden' && !isAutoViewId(_activeView)) {
     var sbDisplayViewName = _activeView.length > 20 ? _activeView.substring(0, 20) + '…' : _activeView;
     html += '<button class="view-dropdown__item view-dropdown__action" role="menuitem" data-action="manage-view">Manage “' + escapeHtml(sbDisplayViewName) + '”…</button>';
   }
@@ -1297,7 +1563,7 @@ function showNewViewInput() {
       if (!name) return;
 
       // Validate: not reserved (case-insensitive)
-      if (name.toLowerCase() === 'all' || name.toLowerCase() === 'hidden') {
+      if (name.toLowerCase() === 'all' || name.toLowerCase() === 'hidden' || isAutoViewId(name.toLowerCase())) {
         showToast('Cannot use reserved name \'' + name + '\'');
         return;
       }
@@ -1381,7 +1647,7 @@ function showSidebarNewViewInput() {
       if (!name) return;
 
       // Validate: not reserved (case-insensitive)
-      if (name.toLowerCase() === 'all' || name.toLowerCase() === 'hidden') {
+      if (name.toLowerCase() === 'all' || name.toLowerCase() === 'hidden' || isAutoViewId(name.toLowerCase())) {
         showToast('Cannot use reserved name \'' + name + '\'');
         return;
       }
@@ -1634,7 +1900,7 @@ function renderViewsSettingsTab() {
       var newName = prompt('View name:');
       if (!newName || !newName.trim()) return;
       newName = newName.trim();
-      if (newName.toLowerCase() === 'all' || newName.toLowerCase() === 'hidden') {
+      if (newName.toLowerCase() === 'all' || newName.toLowerCase() === 'hidden' || isAutoViewId(newName.toLowerCase())) {
         showToast('Cannot use reserved name \'' + newName + '\'');
         return;
       }
@@ -1675,13 +1941,7 @@ function switchView(viewName) {
   // Update sidebar view label to match the active view
   var sidebarLabel = $('sidebar-view-label');
   if (sidebarLabel) {
-    if (viewName === 'all') {
-      sidebarLabel.textContent = 'All Sessions';
-    } else if (viewName === 'hidden') {
-      sidebarLabel.textContent = 'Hidden';
-    } else {
-      sidebarLabel.textContent = viewName;
-    }
+    sidebarLabel.textContent = _viewDisplayName(viewName);
   }
   // Persist active view — fire and forget
   api('PATCH', '/api/state', { active_view: viewName }).catch(function() {});
@@ -1739,6 +1999,8 @@ function renderGrid(sessions) {
   var html;
   if (_gridViewMode === 'grouped') {
     html = renderGroupedGrid(ordered, mobile);
+  } else if (_gridViewMode === 'cwd') {
+    html = renderCwdGroupedGrid(ordered, mobile);
   } else {
     html = ordered.map(function(session, index) { return buildTileHTML(session, index, mobile); }).join('');
   }
@@ -2272,7 +2534,7 @@ function _openFlyoutSubmenu(triggerItem, unhideFirst) {
       var newName = prompt('View name:');
       if (!newName || !newName.trim()) return;
       newName = newName.trim();
-      if (newName.toLowerCase() === 'all' || newName.toLowerCase() === 'hidden') {
+      if (newName.toLowerCase() === 'all' || newName.toLowerCase() === 'hidden' || isAutoViewId(newName.toLowerCase())) {
         showToast('Cannot use reserved name \'' + newName + '\'');
         return;
       }
@@ -2520,7 +2782,9 @@ function openManageViewPanel(viewName) {
   // Manage *viewName* when given; otherwise keep the already-managed view
   // (re-renders during rename) or fall back to the active view.
   _manageViewTarget = viewName || _manageViewTarget || _activeView;
-  if (_manageViewTarget === 'all' || _manageViewTarget === 'hidden') {
+  // Auto-views ('dir:*') are read-only — no manage panel, no rename, no
+  // delete, no membership editing (A5).
+  if (_manageViewTarget === 'all' || _manageViewTarget === 'hidden' || isAutoViewId(_manageViewTarget)) {
     _manageViewTarget = null;
     return;
   }
@@ -2576,7 +2840,7 @@ function openManageViewPanel(viewName) {
         if (_committed) return;
         var newName = input.value.trim();
         if (!newName || newName === currentName) { revertRename(); return; }
-        if (newName.toLowerCase() === 'all' || newName.toLowerCase() === 'hidden') {
+        if (newName.toLowerCase() === 'all' || newName.toLowerCase() === 'hidden' || isAutoViewId(newName.toLowerCase())) {
           showToast('Cannot use reserved name \'' + newName + '\'');
           input.focus(); return;
         }
@@ -3341,10 +3605,45 @@ function buildExpandedPillsModel(sessions, settings, currentName, currentRemoteI
     }
   }
 
+  // Auto-views (directory groups) in the strip:
+  // - the current session's directory group becomes a "same directory" home
+  //   group after the view home groups (A9), siblings deduped like the rest;
+  // - other directory groups join otherViews as dropdown pills (A3),
+  //   visually distinguished via isAuto.
+  var autoViews = buildAutoViews(sessions, settings);
+  for (var ai = 0; ai < autoViews.length; ai++) {
+    var av = autoViews[ai];
+    var avMembers = pool.filter(function (s) {
+      return av.sessions.indexOf(keyOf(s)) !== -1;
+    }).sort(_epSessionSort);
+    var currentInAuto = currentSession
+      ? av.sessions.indexOf(keyOf(currentSession)) !== -1
+      : av.sessions.indexOf(currentName) !== -1;
+    if (currentInAuto) {
+      var dirSibs = [];
+      for (var di = 0; di < avMembers.length; di++) {
+        var ds = avMembers[di];
+        if (isCurrent(ds)) continue;
+        var dk = keyOf(ds);
+        if (seen[dk]) continue;
+        seen[dk] = true;
+        dirSibs.push(_epSlim(ds));
+      }
+      if (dirSibs.length > 0) homeGroups.push({ viewName: av.name, isAuto: true, sessions: dirSibs });
+    } else if (avMembers.length > 0) {
+      otherViews.push({ viewName: av.name, isAuto: true, sessions: avMembers.map(_epSlim) });
+    }
+  }
+
   var otherSessions = pool.filter(function (s) {
     if (isCurrent(s)) return false;
     for (var ki = 0; ki < views.length; ki++) {
       if (inView(views[ki], s)) return false;
+    }
+    // Sessions reachable via a directory group pill aren't "other" —
+    // without this they'd show in both that dropdown and Other Sessions
+    for (var aki = 0; aki < autoViews.length; aki++) {
+      if (autoViews[aki].sessions.indexOf(keyOf(s)) !== -1) return false;
     }
     return true;
   }).sort(_epSessionSort).map(_epSlim);
@@ -3436,6 +3735,12 @@ function _epSessionPillHTML(s, isCurrent) {
     escapeHtml(s.name) + _epBellHTML(s) + '</button>';
 }
 
+/** Display label for a strip group — auto (directory) groups get the folder
+ *  glyph that marks synthesized views everywhere else. */
+function _epGroupLabel(g) {
+  return (g.isAuto ? '📁 ' : '') + g.viewName;
+}
+
 /** Dropdown pill HTML (other view / group overflow / Other Sessions). */
 function _epMenuPillHTML(menuKey, label, countText, extraClass) {
   return '<button class="nav-pill nav-pill--menu' + (extraClass || '') +
@@ -3520,7 +3825,7 @@ function renderExpandedHeaderPills() {
     fixed += (model.homeGroups.length - 1) * (_epMeasureWidth(sepHtml) + EP_GAP);
   }
   var otherViewPills = model.otherViews.map(function (v, i) {
-    return _epMenuPillHTML('view:' + i, v.viewName, String(v.sessions.length), '');
+    return _epMenuPillHTML('view:' + i, _epGroupLabel(v), String(v.sessions.length), v.isAuto ? ' nav-pill--auto' : '');
   });
   for (var oi = 0; oi < otherViewPills.length; oi++) fixed += _epMeasureWidth(otherViewPills[oi]) + EP_GAP;
   var otherPillHtml = '';
@@ -3536,7 +3841,7 @@ function renderExpandedHeaderPills() {
       pillHtmls: pillHtmls,
       sessionWidths: pillHtmls.map(_epMeasureWidth),
       // Measured with the max overflow count — conservative for partial states
-      collapsedWidth: _epMeasureWidth(_epMenuPillHTML('overflow:' + i, g.viewName, '+' + g.sessions.length, '')),
+      collapsedWidth: _epMeasureWidth(_epMenuPillHTML('overflow:' + i, _epGroupLabel(g), '+' + g.sessions.length, g.isAuto ? ' nav-pill--auto' : '')),
     };
   });
   var counts = allocateExpandedPills(groups, fixed, width, EP_GAP);
@@ -3551,7 +3856,7 @@ function renderExpandedHeaderPills() {
     var g = model.homeGroups[gi];
     for (var si = 0; si < counts[gi]; si++) html += groups[gi].pillHtmls[si];
     if (counts[gi] < g.sessions.length) {
-      html += _epMenuPillHTML('overflow:' + gi, g.viewName, '+' + (g.sessions.length - counts[gi]), '');
+      html += _epMenuPillHTML('overflow:' + gi, _epGroupLabel(g), '+' + (g.sessions.length - counts[gi]), g.isAuto ? ' nav-pill--auto' : '');
     }
   }
   for (var pi = 0; pi < otherViewPills.length; pi++) html += otherViewPills[pi];
@@ -3692,6 +3997,13 @@ function searchSessions(query, sessions, settings) {
     return (v.name || '').toLowerCase().indexOf(q) !== -1;
   });
 
+  // Auto-views whose key matches participate in tag matching too (A10).
+  // Membership lists already exclude hidden sessions (A6), so a hidden
+  // session never gains an auto tag — it can still match on its own fields.
+  var matchingAutoViews = buildAutoViews(sessions, settings).filter(function (av) {
+    return av.name.toLowerCase().indexOf(q) !== -1;
+  });
+
   var out = [];
   var live = (sessions || []).filter(function (s) { return !s.status; });
   for (var i = 0; i < live.length; i++) {
@@ -3721,7 +4033,13 @@ function searchSessions(query, sessions, settings) {
     for (var vi = 0; vi < matchingViews.length; vi++) {
       if (inView(matchingViews[vi], s)) tags.push(matchingViews[vi].name);
     }
-    if (tags.length > 0) {
+    var autoTags = [];
+    for (var avi = 0; avi < matchingAutoViews.length; avi++) {
+      if (matchingAutoViews[avi].sessions.indexOf(keyOf(s)) !== -1) {
+        autoTags.push(matchingAutoViews[avi].name);
+      }
+    }
+    if (tags.length > 0 || autoTags.length > 0) {
       matchedFields.push('tag');
       rank = Math.min(rank, SEARCH_RANKS.tag);
     }
@@ -3739,6 +4057,7 @@ function searchSessions(query, sessions, settings) {
       },
       matchedFields: matchedFields,
       tags: tags,
+      autoTags: autoTags,
       hidden: isHiddenS(s),
       rank: rank,
     });
@@ -3771,6 +4090,10 @@ function _searchItemHTML(r, index) {
   }
   for (var t = 0; t < r.tags.length; t++) {
     badges += ' <span class="search-tag">' + escapeHtml(r.tags[t]) + '</span>';
+  }
+  var autoTagList = r.autoTags || [];
+  for (var at = 0; at < autoTagList.length; at++) {
+    badges += ' <span class="search-tag search-tag--auto">📁 ' + escapeHtml(autoTagList[at]) + '</span>';
   }
   if (r.hidden) badges += ' <span class="search-badge search-badge--hidden">hidden</span>';
 
@@ -4182,6 +4505,15 @@ function _updateMultiDeviceFieldsState(enabled) {
     ctrl.disabled = !enabled;
   });
   fieldsContainer.style.opacity = enabled ? '' : '0.5';
+
+  // The Grid Grouping select lives under Display (it works without
+  // multi-device — B2), but its "Group by device" option only makes sense
+  // with multiple devices; disable just that option when multi-device is off.
+  var viewModeEl = $('setting-view-mode');
+  if (viewModeEl && typeof viewModeEl.querySelector === 'function') {
+    var groupedOpt = viewModeEl.querySelector('option[value="grouped"]');
+    if (groupedOpt) groupedOpt.disabled = !enabled;
+  }
 }
 
 
@@ -4413,6 +4745,10 @@ function openSettings() {
   if (gridColumnsEl) gridColumnsEl.value = String(settings.gridColumns);
   const viewModeEl = $('setting-view-mode');
   if (viewModeEl) viewModeEl.value = loadGridViewMode();
+
+  // Directory auto-views toggle (default on — absent key means enabled)
+  const autoViewsEl = $('setting-auto-views-enabled');
+  if (autoViewsEl) autoViewsEl.checked = !(_serverSettings && _serverSettings.autoViewsEnabled === false);
 
   // Populate display toggle controls
   const showDeviceBadgesEl = $('setting-show-device-badges');
@@ -4804,7 +5140,8 @@ function _createViewPicker() {
   menu.className = 'new-session-view-picker__menu hidden';
 
   var selected = {};
-  if (_activeView !== 'all' && _activeView !== 'hidden') selected[_activeView] = true;
+  // Auto-views are not membership targets (A5) — never pre-select one
+  if (_activeView !== 'all' && _activeView !== 'hidden' && !isAutoViewId(_activeView)) selected[_activeView] = true;
 
   function selectedNames() {
     return Object.keys(selected).filter(function (n) { return selected[n]; });
@@ -5040,7 +5377,8 @@ async function createNewSession(name, remoteId, viewNames) {
     var targetViewNames;
     if (Array.isArray(viewNames)) {
       targetViewNames = viewNames;
-    } else if (_activeView !== 'all' && _activeView !== 'hidden') {
+    } else if (_activeView !== 'all' && _activeView !== 'hidden' && !isAutoViewId(_activeView)) {
+      // Auto-views have no persisted membership to add to (A5)
       targetViewNames = [_activeView];
     } else {
       targetViewNames = [];
@@ -5467,6 +5805,18 @@ function bindStaticEventListeners() {
       renderGrid(_currentSessions || []);
     }
   });
+  on($('setting-auto-views-enabled'), 'change', function() {
+    var el = $('setting-auto-views-enabled');
+    if (!el) return;
+    patchServerSetting('autoViewsEnabled', el.checked);
+    // Re-synthesize immediately so pills/dropdowns reflect the toggle without
+    // waiting for the next poll; a disabled active auto-view falls back to 'all'.
+    _autoViews = buildAutoViews(_currentSessions || [], Object.assign({}, _serverSettings, { autoViewsEnabled: el.checked }));
+    var resolved = _resolveActiveView(_activeView, (_serverSettings && _serverSettings.views) || [], _autoViews);
+    if (resolved !== _activeView) switchView(resolved);
+    renderViewPills();
+    renderExpandedHeaderPills();
+  });
 
 
   // Sessions settings — bind change events for server-side persistence
@@ -5652,6 +6002,12 @@ function _setActiveFilterDevice(device) {
   _activeFilterDevice = device;
 }
 
+/** Test-only: set _autoViews directly. */
+function _setAutoViews(autoViews) { _autoViews = autoViews || []; }
+
+/** Test-only: get _autoViews. */
+function _getAutoViews() { return _autoViews; }
+
 /** Test-only: get current _activeView value. */
 function _getActiveView() { return _activeView; }
 
@@ -5665,6 +6021,22 @@ window.addEventListener('resize', function() {
     var grid = document.getElementById('session-grid');
     if (grid) applyFitLayout(grid);
   }
+});
+
+// Re-allocate the main-header view pills on resize (rAF-debounced) — the
+// auto-view pill subset is width-dependent (A7); the _lastHtml guard makes
+// this a no-op when the subset doesn't change.
+var _vpResizePending = false;
+window.addEventListener('resize', function () {
+  if (_vpResizePending || _viewMode === 'fullscreen' || _autoViews.length === 0) return;
+  _vpResizePending = true;
+  var raf = (typeof requestAnimationFrame === 'function')
+    ? requestAnimationFrame
+    : function (fn) { return setTimeout(fn, 50); };
+  raf(function () {
+    _vpResizePending = false;
+    renderViewPills();
+  });
 });
 
 // Re-allocate the expanded-header pill strip on resize (rAF-debounced —
@@ -5716,11 +6088,7 @@ document.addEventListener('DOMContentLoaded', async function() {
       renderViewDropdown();
       // Update sidebar label after restoreState sets _activeView (Issue 7)
       var sidebarLabelEl = $('sidebar-view-label');
-      if (sidebarLabelEl) {
-        if (_activeView === 'all') sidebarLabelEl.textContent = 'All Sessions';
-        else if (_activeView === 'hidden') sidebarLabelEl.textContent = 'Hidden';
-        else sidebarLabelEl.textContent = _activeView;
-      }
+      if (sidebarLabelEl) sidebarLabelEl.textContent = _viewDisplayName(_activeView);
     })
     .catch(function(err) {
       console.error('[init] restoreState failed, retrying in 5s:', err);
@@ -5751,6 +6119,7 @@ if (typeof module !== 'undefined' && module.exports) {
     bindSidebarClickAway,
     renderGrid,
     renderGroupedGrid,
+    renderCwdGroupedGrid,
     requestNotificationPermission,
     handleBellTransitions,
     sendHeartbeat,
@@ -5845,6 +6214,17 @@ if (typeof module !== 'undefined' && module.exports) {
     isHidden,
     filterVisible,
     visibleCount,
+    // Auto-views (virtual directory views)
+    AUTO_VIEW_PREFIX,
+    isAutoViewId,
+    autoViewKey,
+    sessionGroupKey,
+    buildAutoViews,
+    allocateViewPills,
+    _resolveActiveView,
+    _viewDisplayName,
+    _setAutoViews,
+    _getAutoViews,
     // Operation layer (Phase 2) — pure data ops
     _opAddMembership,
     _opRemoveMembership,

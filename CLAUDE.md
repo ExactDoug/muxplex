@@ -5,7 +5,7 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.7.3**.
+improvements. Current version: **0.8.0**.
 
 ## Running locally (development)
 
@@ -27,8 +27,8 @@ uv run muxplex serve         # http://127.0.0.1:8088 — settings from ~/.config
 ## Tests
 
 ```bash
-uv run pytest -q -m "not integration"          # Python suite (~1315 tests)
-node muxplex/frontend/tests/test_app.mjs       # frontend app logic (~450 tests)
+uv run pytest -q -m "not integration"          # Python suite (~1320 tests)
+node muxplex/frontend/tests/test_app.mjs       # frontend app logic (~470 tests)
 node muxplex/frontend/tests/test_terminal.mjs  # terminal/xterm contracts
 ```
 
@@ -75,6 +75,14 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    single-click activates; collapse below 600px where the dropdown trigger swaps to
    the dynamic active-view label (static "Views" label on desktop). Pills re-render
    each poll cycle guarded by a string compare (no innerHTML churn).
+6. **Auto-views are a SEPARATE synthesized list** (v0.8.0) — never merged into
+   `_serverSettings.views`, never persisted/synced/pruned. Identity is namespaced
+   `dir:<key>` (key = gitRepo ‖ cwdLeaf); the `dir:` prefix is reserved in every
+   view-name validation site (frontend ×5 + `views.py`). Membership is computed
+   per poll (`buildAutoViews`): live, non-hidden, ≥2 sessions per group. Surfaces
+   that must exclude them (bulk ops, new-session picker, search chips, keyboard
+   digits, federation sync) are correct BECAUSE the list is separate — do not
+   "simplify" by merging it into the views array.
 
 ## Documentation map
 
@@ -93,6 +101,9 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
 - Bulk multi-select → Views (v0.7.3):
   `docs/plans/2026-06-04-bulk-multiselect-views-design.md` — grid select mode, batched
   Manage View panel, search-results multi-select
-- **NEXT UP (requirements approved, not yet planned/built):**
-  `docs/plans/2026-06-05-cwd-auto-grouping-requirements.md` — auto-views from cwd leaf
-  (virtual, collapse-priority below user views) + group-by-directory grid mode
+- cwd auto-grouping (v0.8.0): requirements
+  `docs/plans/2026-06-05-cwd-auto-grouping-requirements.md`, code audit
+  `docs/plans/2026-06-05-cwd-auto-grouping-audit.md`, implementation plan
+  `docs/plans/2026-06-05-cwd-auto-grouping-plan.md` — directory auto-views
+  (virtual `dir:` views, user-pill collapse priority) + group-by-directory grid
+  mode + Grid Grouping settings relocation

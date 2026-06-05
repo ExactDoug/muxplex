@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.8.0 (2026-06-05)
+
+### Features
+
+- **Directory auto-views** — for every project directory with **2+ live sessions**, a
+  virtual view is synthesized automatically (grouping key: **git repo name**, falling
+  back to the cwd top-leaf directory — so `qw-animas` running in `…/qw-bridge` groups
+  with `qw-bridge`/`qw-bridge-2`, and hash-suffixed session pairs land together).
+  Auto-views appear alongside user views — in the main-page pill row (dashed pills with
+  a 📁 glyph), both view dropdowns, and the expanded terminal header — and filter the
+  grid/sidebar exactly like a user view. They are **never persisted or synced**:
+  derived state, recomputed every poll, vanishing when their sessions end (the active
+  view then falls back to All Sessions automatically).
+  - **Read-only by design**: no manage panel, no rename/delete, and they are never
+    offered as targets in bulk add-to-view, the new-session views picker, or the
+    search bulk chips. The `dir:` name prefix is reserved so a user view can never
+    collide.
+  - **Hidden sessions** are excluded from auto-view membership and counts.
+  - **Width-aware pill priority** — user-view pills always win the header real estate:
+    as the viewport narrows, auto-view pills collapse out first (they stay reachable
+    via the dropdown); below 600px the existing collapse-to-dropdown behaviour is
+    unchanged. The active auto-view pill is always kept visible.
+  - **Expanded terminal header** — a "same directory" sibling pill group joins the
+    view-based groups for the current session (deduped against them), and other
+    directory groups appear as dropdown pills; directory-grouped sessions no longer
+    duplicate into Other Sessions.
+  - **Search integration** — auto-view names participate in tag matching: searching a
+    directory/repo name surfaces all of that group's sessions, tagged with an outlined
+    📁 chip.
+  - **Settings → Display → "Directory auto-views"** toggle (default on) disables the
+    whole feature.
+- **Group-by-directory grid mode** — a third grid layout that clusters session tiles
+  under alphabetical 📁 directory headers (same grouping key as auto-views, but no
+  2-session minimum); sessions without path metadata (older federation remotes,
+  brand-new sessions for one poll cycle) cluster under a final **Other** bucket. Works
+  with or without multi-device; device badges, status tiles, view filtering, sort
+  order, and select mode behave exactly as in the device-grouped mode.
+- **Settings relocation** — the grid layout picker moved from Multi-Device to
+  **Settings → Display → "Grid Grouping"** (`Flat` / `Group by device` / `Group by
+  directory`), since directory grouping doesn't require multi-device; the "Group by
+  device" option is disabled while multi-device is off. The stored key is unchanged
+  (`gridViewMode`, now also `cwd`), so existing settings carry over — pick `Flat` to
+  restore the previous interface exactly.
+
+### Fixes
+
+- A deleted-while-active user view (e.g. removed on another device) now falls back to
+  All Sessions on the next poll instead of leaving a stale highlighted pill over an
+  empty grid.
+
 ## v0.7.3 (2026-06-04)
 
 ### Features

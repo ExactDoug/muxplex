@@ -1675,6 +1675,26 @@ body {
   color: var(--accent);
 }
 
+/* Auto-view pills — synthesized directory views (dashed border + folder
+   glyph distinguish them from user views; A3) */
+.view-pill--auto {
+  border-style: dashed;
+}
+
+.view-pill__glyph {
+  font-size: 11px;
+  line-height: 1;
+}
+
+.view-dropdown__item--auto {
+  font-style: italic;
+}
+
+.view-dropdown__item--auto .view-pill__glyph {
+  font-style: normal;
+  margin-right: 4px;
+}
+
 .view-dropdown {
   position: relative;
   display: flex;
@@ -1853,6 +1873,11 @@ body {
   padding: 8px 0 6px;
   border-bottom: 1px solid var(--border);
   margin-bottom: 4px;
+}
+
+/* Directory-grouped grid headers (B1) — shares the device header layout */
+.dir-group-header .view-pill__glyph {
+  margin-right: 6px;
 }
 
 .filter-bar {
@@ -2219,6 +2244,12 @@ body {
   margin-left: auto;
 }
 
+/* Auto-view (directory group) pills in the strip — dashed like the
+   main-header auto pills (A3/A9) */
+.nav-pill--auto {
+  border-style: dashed;
+}
+
 /* Amber activity dot (suppressed when activity indicator setting is 'none') */
 .nav-pill__bell {
   width: 6px;
@@ -2407,6 +2438,12 @@ body {
   border-radius: 999px;
   padding: 1px 7px;
   white-space: nowrap;
+}
+
+/* Auto-view (directory group) tag — outlined instead of filled (A10) */
+.search-tag--auto {
+  background: transparent;
+  border: 1px dashed var(--accent);
 }
 
 .session-search-results__item .nav-pill__bell {

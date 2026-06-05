@@ -188,6 +188,18 @@
             </select>
           </div>
           <div class="settings-field">
+            <label class="settings-label" for="setting-view-mode">Grid Grouping</label>
+            <select id="setting-view-mode" class="settings-select">
+              <option value="flat">Flat</option>
+              <option value="grouped">Group by device</option>
+              <option value="cwd">Group by directory</option>
+            </select>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label" for="setting-auto-views-enabled">Directory auto-views</label>
+            <input type="checkbox" id="setting-auto-views-enabled" class="settings-checkbox" checked />
+          </div>
+          <div class="settings-field">
             <label class="settings-label" for="setting-hover-delay">Hover Delay</label>
             <select id="setting-hover-delay" class="settings-select">
               <option value="0">Off</option>
@@ -274,13 +286,6 @@
             <input type="checkbox" id="setting-multi-device-enabled" class="settings-checkbox" />
           </div>
           <div id="multi-device-fields">
-            <div class="settings-field">
-              <label class="settings-label" for="setting-view-mode">View Mode</label>
-              <select id="setting-view-mode" class="settings-select">
-                <option value="flat">Flat</option>
-                <option value="grouped">Grouped</option>
-              </select>
-            </div>
             <div class="settings-field settings-field--column">
               <label class="settings-label">Federation Key</label>
               <div class="settings-federation-key">
