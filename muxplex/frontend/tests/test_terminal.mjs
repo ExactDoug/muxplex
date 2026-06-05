@@ -1024,9 +1024,9 @@ test('terminal.js Ctrl+V branch returns false WITHOUT reading the clipboard (nat
     'must NOT intercept Ctrl+Shift+V — xterm.js handles paste natively via browser events');
 });
 
-// --- Right-click pastes browser clipboard (Windows terminal convention) ---
+// --- Right-click: copy when selection is active, paste otherwise ---
 
-test('terminal.js right-click pastes from the browser clipboard', () => {
+test('terminal.js right-click pastes from the browser clipboard when nothing is selected', () => {
   const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
   assert.ok(source.includes('_pasteFromClipboard'),
     'must define _pasteFromClipboard for the right-click path');
@@ -1034,13 +1034,61 @@ test('terminal.js right-click pastes from the browser clipboard', () => {
     '_pasteFromClipboard must use navigator.clipboard.readText (no native paste event on right-click)');
   assert.ok(source.includes('_term.paste('),
     'must paste via _term.paste() so multi-line pastes use bracketed paste');
-  const ctxStart = source.indexOf("addEventListener('contextmenu'");
-  assert.ok(ctxStart !== -1, 'must have a contextmenu handler');
-  const ctxBlock = source.substring(ctxStart, source.indexOf('});', ctxStart));
-  assert.ok(ctxBlock.includes('_pasteFromClipboard()'),
-    'plain right-click must paste the clipboard');
-  assert.ok(ctxBlock.includes('e.shiftKey || e.ctrlKey'),
+  const blockStart = source.indexOf('initRightClickCopyPaste');
+  assert.ok(blockStart !== -1, 'must define initRightClickCopyPaste');
+  const block = source.substring(blockStart, source.indexOf('})();', blockStart));
+  assert.ok(block.includes('_pasteFromClipboard()'),
+    'plain right-click with no selection must paste the clipboard');
+  assert.ok(block.includes('e.shiftKey || e.ctrlKey'),
     'modified right-clicks must still open the browser context menu');
+});
+
+test('terminal.js right-click with an active selection copies and does NOT paste on the same click', () => {
+  // Bug: select-then-right-click is a COPY gesture, but the event order is
+  // mousedown → (xterm clears the selection) → contextmenu. Checking
+  // hasSelection() inside contextmenu sees false and pastes — so the same
+  // right-click both copied (auto-copy on select) and pasted. The selection
+  // state must be sampled in a CAPTURE-phase mousedown handler (before xterm's
+  // mouse handling), and contextmenu must consume that flag and return
+  // without pasting.
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  const blockStart = source.indexOf('initRightClickCopyPaste');
+  assert.ok(blockStart !== -1, 'must define initRightClickCopyPaste');
+  const block = source.substring(blockStart, source.indexOf('})();', blockStart));
+
+  // mousedown sampling, right button only, capture phase
+  const mdStart = block.indexOf("addEventListener('mousedown'");
+  assert.ok(mdStart !== -1, 'must register a mousedown listener to sample selection state');
+  const mdBlock = block.substring(mdStart, block.indexOf("addEventListener('contextmenu'", mdStart));
+  assert.ok(mdBlock.includes('e.button !== 2'), 'mousedown sampling must apply to the right button only');
+  assert.ok(mdBlock.includes('hasSelection()'), 'must sample _term.hasSelection() at mousedown time');
+  assert.ok(mdBlock.includes('_copyToClipboard'), 'must copy the selection at mousedown while it still exists');
+  assert.ok(/\},\s*true\);/.test(mdBlock), 'mousedown listener must use capture phase (ahead of xterm)');
+
+  // contextmenu consumes the flag and returns before pasting
+  const ctxStart = block.indexOf("addEventListener('contextmenu'");
+  const ctxBlock = block.substring(ctxStart);
+  const flagIdx = ctxBlock.indexOf('hadSelectionOnRightDown');
+  assert.ok(flagIdx !== -1, 'contextmenu must check the mousedown-sampled flag');
+  const guardBlock = ctxBlock.substring(flagIdx, ctxBlock.indexOf('_pasteFromClipboard()'));
+  assert.ok(guardBlock.includes('return'),
+    'selection branch must return before the paste call — copy and paste must never both fire');
+});
+
+test('terminal.js right-click handlers are attached once at module level (no stacking on reopen)', () => {
+  // The terminal container is static and openTerminal() re-runs on every
+  // session switch. Handlers registered inside openTerminal stacked — one
+  // right-click pasted once per session ever opened. The copy-or-paste
+  // listeners must live in the module-level attach-once IIFE (same pattern
+  // as initMobileTerminalScroll), NOT inside openTerminal.
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('(function initRightClickCopyPaste()'),
+    'right-click handlers must be wrapped in a module-level IIFE');
+  const openStart = source.indexOf('function openTerminal');
+  const openEnd = source.indexOf('function closeTerminal', openStart);
+  const openBlock = source.substring(openStart, openEnd);
+  assert.ok(!openBlock.includes("addEventListener('contextmenu'"),
+    'openTerminal must NOT register contextmenu handlers (they would stack across reopens)');
 });
 
 // --- Shift+Enter inserts a newline (LF) instead of submitting (CR) ---

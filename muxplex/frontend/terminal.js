@@ -532,17 +532,6 @@ function openTerminal(sessionName, remoteId, fontSize) {
     newPrev.addEventListener('click', _searchPrev);
   }
 
-  // --- Right-click → paste ---
-  // Plain right-click pastes the browser clipboard (Windows terminal convention:
-  // PuTTY, Windows Terminal). The browser context menu is suppressed so it
-  // doesn't cover the terminal; Shift+RMB and Ctrl+RMB still open the browser
-  // context menu as escape hatches.
-  container.addEventListener('contextmenu', function(e) {
-    if (e.shiftKey || e.ctrlKey || e.metaKey) return; // let modified clicks through
-    e.preventDefault();
-    _pasteFromClipboard();
-  });
-
   connectWebSocket(sessionName, remoteId);
   initVisualViewport(); /* defined in Task 14 */
 }
@@ -605,6 +594,58 @@ function setTerminalFontSize(size) {
 }
 
 window._setTerminalFontSize = setTerminalFontSize;
+
+// ---------------------------------------------------------------------------
+// Right-click copy-or-paste — module-level, attached ONCE to the static
+// #terminal-container (same pattern as initMobileTerminalScroll below), so
+// session switches can never stack duplicate handlers.
+//
+// Gesture semantics (Windows terminal convention):
+//   right-click WITH an active selection  → completes the COPY, never pastes
+//   right-click with NO selection         → pastes the browser clipboard
+//
+// CRITICAL ordering detail: a right-click fires mousedown → (xterm clears
+// the selection) → contextmenu. By the time contextmenu fires hasSelection()
+// is already false, so checking it there would treat the copy gesture as a
+// paste — copying AND pasting on the same click. The selection state is
+// therefore sampled (and the copy performed) in a capture-phase mousedown
+// handler, before xterm's own mouse handling runs; contextmenu then consumes
+// that flag and pastes only when no selection was present at press time.
+//
+// hasSelection() is buffer-based, not viewport-based — scrolling the selected
+// text out of view does not affect it, so no selection tracking of our own
+// is needed.
+//
+// Shift+RMB and Ctrl+RMB still open the browser context menu as escape hatches.
+// ---------------------------------------------------------------------------
+;(function initRightClickCopyPaste() {
+  var container = document.getElementById('terminal-container');
+  if (!container) return;
+
+  var hadSelectionOnRightDown = false;
+
+  container.addEventListener('mousedown', function (e) {
+    if (e.button !== 2) return; // right button only
+    hadSelectionOnRightDown = !!(_term && _term.hasSelection());
+    // Copy NOW while the selection still exists (auto-copy on select already
+    // ran; copying again is idempotent and covers any clipboard divergence).
+    if (hadSelectionOnRightDown) _copyToClipboard(_term.getSelection());
+  }, true); // capture phase — ahead of xterm's mousedown handling
+
+  container.addEventListener('contextmenu', function (e) {
+    if (e.shiftKey || e.ctrlKey || e.metaKey) return; // let modified clicks through
+    e.preventDefault();
+    if (!_term) return;
+    if (hadSelectionOnRightDown) {
+      // This right-click was the COPY gesture (copied at mousedown above).
+      // Do NOT paste on the same click — the next right-click pastes.
+      hadSelectionOnRightDown = false;
+      if (_term.hasSelection()) _term.clearSelection();
+      return;
+    }
+    _pasteFromClipboard();
+  });
+})();
 
 // ---------------------------------------------------------------------------
 // Mobile touch scroll — rAF-batched WheelEvent dispatch
