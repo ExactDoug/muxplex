@@ -2967,7 +2967,7 @@ test('createNewSession injects tile--loading placeholder after POST succeeds', (
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const start = source.indexOf('async function createNewSession(');
   assert.ok(start !== -1, 'createNewSession must exist');
-  const snippet = source.slice(start, start + 2500);
+  const snippet = source.slice(start, start + 4000);
   assert.ok(snippet.includes('tile--loading'), 'createNewSession must inject tile--loading placeholder class');
   assert.ok(snippet.includes('loading-tile-'), 'createNewSession must use loading-tile- id prefix for the placeholder');
 });
@@ -2975,7 +2975,8 @@ test('createNewSession injects tile--loading placeholder after POST succeeds', (
 test('createNewSession removes loading placeholder when session is found', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const start = source.indexOf('async function createNewSession(');
-  const snippet = source.slice(start, start + 2500);
+  // window sized to cover the function body (view-assignment block added in v0.7.0)
+  const snippet = source.slice(start, start + 4000);
   assert.ok(
     snippet.includes('loadingTile') && snippet.includes('.remove()'),
     'createNewSession must remove the loading tile (loadingTile.remove()) when session is found'
@@ -6228,4 +6229,54 @@ test('_epMenuSessions resolves view/overflow/other keys against the last model',
   app._setViewingSession(null);
   app._setServerSettings(null);
   app._setCurrentSessions([]);
+});
+
+// ============================================================================
+// New-session view picker + expanded-header new-session button (v0.7.0)
+// ============================================================================
+
+const appSource = fs.readFileSync(join(__dirname, '..', 'app.js'), 'utf8');
+const indexSource = fs.readFileSync(join(__dirname, '..', 'index.html'), 'utf8');
+
+test('expanded header has a new-session button wired to showNewSessionInput', () => {
+  assert.ok(indexSource.includes('id="new-session-btn-expanded"'),
+    'index.html must contain #new-session-btn-expanded in the expanded header');
+  assert.ok(appSource.includes("$('new-session-btn-expanded')"),
+    'bindStaticEventListeners must look up the expanded new-session button');
+  assert.ok(/newSessionBtnExpanded\)[\s\S]{0,120}showNewSessionInput\(newSessionBtnExpanded\)/.test(appSource),
+    'the expanded button must trigger showNewSessionInput');
+});
+
+test('_createViewPicker returns null when no user views exist', () => {
+  app._setServerSettings({ views: [] });
+  assert.strictEqual(app._createViewPicker(), null);
+  app._setServerSettings(null);
+  assert.strictEqual(app._createViewPicker(), null);
+});
+
+test('createNewSession accepts an explicit viewNames selection (picker contract)', () => {
+  const start = appSource.indexOf('async function createNewSession(');
+  assert.ok(start !== -1);
+  const snippet = appSource.slice(start, start + 3000);
+  assert.ok(snippet.includes('createNewSession(name, remoteId, viewNames)'),
+    'createNewSession must take a viewNames parameter');
+  assert.ok(snippet.includes('Array.isArray(viewNames)'),
+    'explicit (possibly empty) picker selection must override the legacy auto-add');
+  // One PATCH for all selected views — not one per view
+  const patchCount = (snippet.match(/api\('PATCH', '\/api\/settings'/g) || []).length;
+  assert.strictEqual(patchCount, 1, 'all selected views must be written in a single PATCH');
+});
+
+test('both new-session flows pass the picker selection to createNewSession', () => {
+  const flows = ['function showNewSessionInput(', 'function showFabSessionInput('];
+  for (const marker of flows) {
+    const start = appSource.indexOf(marker);
+    assert.ok(start !== -1, marker + ' must exist');
+    const snippet = appSource.slice(start, start + 4000);
+    assert.ok(snippet.includes('_createViewPicker()'), marker + ' must create the view picker');
+    assert.ok(snippet.includes('picker.getSelectedViews()'),
+      marker + ' must read the picker selection on Enter');
+    assert.ok(snippet.includes('createNewSession(name, remoteId, viewNames)'),
+      marker + ' must forward the selection to createNewSession');
+  }
 });

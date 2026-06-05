@@ -32,6 +32,19 @@
   name returns (mobile keeps the bottom-sheet switcher). Switching via pills does not
   change the active view. Design: `docs/plans/2026-06-04-expanded-header-session-pills-design.md`.
 
+## v0.7.1 (2026-06-04)
+
+### Features
+
+- **New-session button in the expanded header** — the terminal view's header now has the
+  same `+` control as the main page (far right, next to settings), so new sessions can be
+  created without leaving the current session.
+- **Views picker on session creation** — the new-session element (header `+` buttons,
+  sidebar `+ New`, and the mobile FAB) now includes a Views dropdown of checkboxes, so a
+  session can be assigned to one or more views/tags at creation time. The active user
+  view is pre-checked (matching the previous auto-add behaviour); unchecking it is now
+  possible, and all selected views are written in a single settings update.
+
 ## v0.6.8 (2026-06-04)
 
 ### Bug Fixes

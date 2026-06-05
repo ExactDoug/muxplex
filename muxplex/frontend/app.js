@@ -4289,10 +4289,82 @@ function _createDeviceSelect() {
 }
 
 /**
- * Replace the header + button with an inline text input (and optional device
- * select) for session naming. Hides the button, inserts controls before it,
- * and focuses the input.
- * On Enter: if name is non-empty after trim, calls createNewSession(name, remoteId).
+ * Create an optional views/tags picker for new-session creation.
+ * Sessions may belong to multiple views, so this is a dropdown of
+ * checkboxes rather than a <select>. The active user view is pre-checked
+ * (preserving the legacy "auto-add to active view" behaviour as the
+ * default). Returns null when no user views exist.
+ * The returned element exposes .getSelectedViews() → string[].
+ * @returns {HTMLElement|null}
+ */
+function _createViewPicker() {
+  var views = (_serverSettings && _serverSettings.views) || [];
+  if (views.length === 0) return null;
+
+  var wrap = document.createElement('div');
+  wrap.className = 'new-session-view-picker';
+  wrap.tabIndex = -1;
+
+  var trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'new-session-view-picker__trigger';
+  trigger.setAttribute('aria-haspopup', 'true');
+  trigger.setAttribute('aria-expanded', 'false');
+
+  var menu = document.createElement('div');
+  menu.className = 'new-session-view-picker__menu hidden';
+
+  var selected = {};
+  if (_activeView !== 'all' && _activeView !== 'hidden') selected[_activeView] = true;
+
+  function selectedNames() {
+    return Object.keys(selected).filter(function (n) { return selected[n]; });
+  }
+
+  function refreshLabel() {
+    var names = selectedNames();
+    var label = names.length === 0 ? 'Views'
+      : names.length === 1 ? names[0]
+      : names.length + ' views';
+    trigger.textContent = label + ' ▾';
+  }
+
+  views.forEach(function (v) {
+    var row = document.createElement('label');
+    row.className = 'new-session-view-picker__item';
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = v.name;
+    cb.checked = !!selected[v.name];
+    cb.addEventListener('change', function () {
+      selected[v.name] = cb.checked;
+      refreshLabel();
+    });
+    row.appendChild(cb);
+    row.appendChild(document.createTextNode(' ' + v.name));
+    menu.appendChild(row);
+  });
+
+  trigger.addEventListener('click', function () {
+    var wasOpen = !menu.classList.contains('hidden');
+    menu.classList.toggle('hidden');
+    trigger.setAttribute('aria-expanded', wasOpen ? 'false' : 'true');
+  });
+
+  wrap.appendChild(trigger);
+  wrap.appendChild(menu);
+  refreshLabel();
+
+  wrap.getSelectedViews = selectedNames;
+  return wrap;
+}
+
+/**
+ * Replace the header + button with an inline text input (plus optional device
+ * select and views picker) for session naming. Hides the button, inserts
+ * controls before it, and focuses the input.
+ * On Enter: if name is non-empty after trim, calls
+ *   createNewSession(name, remoteId, selectedViews).
  * On Escape: restores the button (cleanup only).
  * On blur: delayed cleanup (150ms) to allow click handlers.
  * @param {HTMLElement} btn - The button element to replace temporarily.
@@ -4300,19 +4372,30 @@ function _createDeviceSelect() {
 function showNewSessionInput(btn) {
   const select = _createDeviceSelect();
   const input = _createSessionInput();
+  const picker = _createViewPicker();
 
   function cleanup() {
     if (select && select.parentNode) select.parentNode.removeChild(select);
+    if (picker && picker.parentNode) picker.parentNode.removeChild(picker);
     if (input.parentNode) input.parentNode.removeChild(input);
     btn.style.display = '';
+  }
+
+  function focusStillInside() {
+    var ae = document.activeElement;
+    if (ae === input) return true;
+    if (select && ae === select) return true;
+    if (picker && picker.contains && picker.contains(ae)) return true;
+    return false;
   }
 
   input.addEventListener('keydown', function (e) {
     if (e.key === 'Enter') {
       const name = input.value.trim();
       const remoteId = select ? select.value : '';
+      const viewNames = picker ? picker.getSelectedViews() : undefined;
       cleanup();
-      if (name) createNewSession(name, remoteId);
+      if (name) createNewSession(name, remoteId, viewNames);
     } else if (e.key === 'Escape') {
       cleanup();
     }
@@ -4320,8 +4403,8 @@ function showNewSessionInput(btn) {
 
   input.addEventListener('blur', function() {
     setTimeout(function() {
-      // Don't close if focus moved to the device select dropdown
-      if (select && document.activeElement === select) return;
+      // Don't close if focus moved to the device select or views picker
+      if (focusStillInside()) return;
       cleanup();
     }, 150);
   });
@@ -4329,8 +4412,7 @@ function showNewSessionInput(btn) {
   if (select) {
     select.addEventListener('blur', function() {
       setTimeout(function() {
-        // Don't close if focus moved back to the name input
-        if (document.activeElement === input) return;
+        if (focusStillInside()) return;
         cleanup();
       }, 150);
     });
@@ -4339,9 +4421,22 @@ function showNewSessionInput(btn) {
     });
   }
 
+  if (picker) {
+    picker.addEventListener('focusout', function() {
+      setTimeout(function() {
+        if (focusStillInside()) return;
+        cleanup();
+      }, 150);
+    });
+    picker.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') { cleanup(); }
+    });
+  }
+
   btn.style.display = 'none';
   if (select) btn.parentNode.insertBefore(select, btn);
   btn.parentNode.insertBefore(input, btn);
+  if (picker) btn.parentNode.insertBefore(picker, btn);
   input.focus();
 }
 
@@ -4361,21 +4456,32 @@ function showFabSessionInput() {
 
   const select = _createDeviceSelect();
   const input = _createSessionInput();
+  const picker = _createViewPicker();
 
   if (select) overlay.appendChild(select);
   overlay.appendChild(input);
+  if (picker) overlay.appendChild(picker);
 
   function cleanup() {
     if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
     if (fab) fab.style.display = '';
   }
 
+  function focusStillInside() {
+    var ae = document.activeElement;
+    if (ae === input) return true;
+    if (select && ae === select) return true;
+    if (picker && picker.contains && picker.contains(ae)) return true;
+    return false;
+  }
+
   input.addEventListener('keydown', function(e) {
     if (e.key === 'Enter') {
       const name = input.value.trim();
       const remoteId = select ? select.value : '';
+      const viewNames = picker ? picker.getSelectedViews() : undefined;
       cleanup();
-      if (name) createNewSession(name, remoteId);
+      if (name) createNewSession(name, remoteId, viewNames);
     } else if (e.key === 'Escape') {
       cleanup();
     }
@@ -4383,8 +4489,8 @@ function showFabSessionInput() {
 
   input.addEventListener('blur', function() {
     setTimeout(function() {
-      // Don't close if focus moved to the device select dropdown
-      if (select && document.activeElement === select) return;
+      // Don't close if focus moved to the device select or views picker
+      if (focusStillInside()) return;
       cleanup();
     }, 150);
   });
@@ -4392,12 +4498,23 @@ function showFabSessionInput() {
   if (select) {
     select.addEventListener('blur', function() {
       setTimeout(function() {
-        // Don't close if focus moved back to the name input
-        if (document.activeElement === input) return;
+        if (focusStillInside()) return;
         cleanup();
       }, 150);
     });
     select.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') { cleanup(); }
+    });
+  }
+
+  if (picker) {
+    picker.addEventListener('focusout', function() {
+      setTimeout(function() {
+        if (focusStillInside()) return;
+        cleanup();
+      }, 150);
+    });
+    picker.addEventListener('keydown', function(e) {
       if (e.key === 'Escape') { cleanup(); }
     });
   }
@@ -4414,9 +4531,14 @@ function showFabSessionInput() {
  * that take time to create the tmux session (e.g. cloning repos, setup scripts).
  * If auto_open_created is false in server settings, skips the auto-open.
  * @param {string} name - The session name to create.
+ * @param {string} [remoteId] - Device id for remote creation ('' = local).
+ * @param {string[]} [viewNames] - Views to add the new session to. When the
+ *   view picker was shown, this is its explicit selection (possibly empty =
+ *   none, even if a user view is active). When undefined (no picker — e.g.
+ *   no user views exist), falls back to the legacy auto-add-to-active-view.
  * @returns {Promise<void>}
  */
-async function createNewSession(name, remoteId) {
+async function createNewSession(name, remoteId, viewNames) {
   var deviceId = remoteId || '';  // Accept device_id string (was integer index in old protocol)
   try {
     var endpoint = deviceId ? '/api/federation/' + encodeURIComponent(deviceId) + '/sessions' : '/api/sessions';
@@ -4424,26 +4546,37 @@ async function createNewSession(name, remoteId) {
     const data = await res.json();
     const sessionName = data.name || name;
 
-    // Auto-add to active user view (not 'all' or 'hidden')
-    if (_activeView !== 'all' && _activeView !== 'hidden') {
+    // Add to views: explicit picker selection wins; legacy fallback is the
+    // active user view (not 'all' or 'hidden'). One PATCH for all of them.
+    var targetViewNames;
+    if (Array.isArray(viewNames)) {
+      targetViewNames = viewNames;
+    } else if (_activeView !== 'all' && _activeView !== 'hidden') {
+      targetViewNames = [_activeView];
+    } else {
+      targetViewNames = [];
+    }
+    if (targetViewNames.length > 0) {
       var views = (_serverSettings && _serverSettings.views) || [];
-      var viewIdx = -1;
-      for (var vi = 0; vi < views.length; vi++) {
-        if (views[vi].name === _activeView) { viewIdx = vi; break; }
+      var newSessionKey = remoteId ? (remoteId + ':' + sessionName) : sessionName;
+      if (!remoteId && _localDeviceId) {
+        newSessionKey = _localDeviceId + ':' + sessionName;
       }
-      if (viewIdx >= 0) {
-        var newSessionKey = remoteId ? (remoteId + ':' + sessionName) : sessionName;
-        if (!remoteId && _localDeviceId) {
-          newSessionKey = _localDeviceId + ':' + sessionName;
+      var updatedViews = JSON.parse(JSON.stringify(views));
+      var viewsChanged = false;
+      for (var vi = 0; vi < updatedViews.length; vi++) {
+        if (targetViewNames.indexOf(updatedViews[vi].name) === -1) continue;
+        updatedViews[vi].sessions = updatedViews[vi].sessions || [];
+        if (!updatedViews[vi].sessions.includes(newSessionKey)) {
+          updatedViews[vi].sessions.push(newSessionKey);
+          viewsChanged = true;
         }
-        var updatedViews = JSON.parse(JSON.stringify(views));
-        if (!updatedViews[viewIdx].sessions.includes(newSessionKey)) {
-          updatedViews[viewIdx].sessions.push(newSessionKey);
-          api('PATCH', '/api/settings', { views: updatedViews }).catch(function(err) {
-            console.warn('[createNewSession] auto-add to view failed:', err);
-          });
-          if (_serverSettings) _serverSettings.views = updatedViews;
-        }
+      }
+      if (viewsChanged) {
+        api('PATCH', '/api/settings', { views: updatedViews }).catch(function(err) {
+          console.warn('[createNewSession] add to views failed:', err);
+        });
+        if (_serverSettings) _serverSettings.views = updatedViews;
       }
     }
 
@@ -4690,6 +4823,8 @@ function bindStaticEventListeners() {
 
   var newSessionBtn = $('new-session-btn');
   if (newSessionBtn) on(newSessionBtn, 'click', function() { showNewSessionInput(newSessionBtn); });
+  var newSessionBtnExpanded = $('new-session-btn-expanded');
+  if (newSessionBtnExpanded) on(newSessionBtnExpanded, 'click', function() { showNewSessionInput(newSessionBtnExpanded); });
   var sidebarNewSessionBtn = $('sidebar-new-session-btn');
   if (sidebarNewSessionBtn) on(sidebarNewSessionBtn, 'click', function() { showNewSessionInput(sidebarNewSessionBtn); });
   var newSessionFab = $('new-session-fab');
@@ -5098,6 +5233,7 @@ if (typeof module !== 'undefined' && module.exports) {
     api,
     // Header + button with inline name input
     _createDeviceSelect,
+    _createViewPicker,
     showNewSessionInput,
     showFabSessionInput,
     createNewSession,
