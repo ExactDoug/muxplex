@@ -5,7 +5,7 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.7.0**.
+improvements. Current version: **0.7.3**.
 
 ## Running locally (development)
 
@@ -87,3 +87,9 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
 - Expanded-header session pills (v0.7.0):
   `docs/plans/2026-06-04-expanded-header-session-pills-design.md` — grouped sibling
   pills + view dropdowns + width-aware collapse in the terminal header
+- Universal session search (v0.7.2):
+  `docs/plans/2026-06-04-universal-session-search-design.md` — name/cwd-leaf/git-repo/tag
+  matching; backend cwd+gitRepo session metadata
+- Bulk multi-select → Views (v0.7.3):
+  `docs/plans/2026-06-04-bulk-multiselect-views-design.md` — grid select mode, batched
+  Manage View panel, search-results multi-select

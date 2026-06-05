@@ -6384,3 +6384,107 @@ test('search containers exist in both headers and results menu is shared', () =>
   assert.strictEqual((idx.match(/id="session-search-results"/g) || []).length, 1,
     'exactly one shared results dropdown');
 });
+
+// ============================================================================
+// Bulk multi-select → add to Views (v0.7.x)
+// docs/plans/2026-06-04-bulk-multiselect-views-design.md
+// ============================================================================
+
+test('bulkAddToViewsOp adds all keys to all views, unhiding them, in one patch', () => {
+  const settings = {
+    hidden_sessions: ['k2'],
+    views: [
+      { name: 'A', sessions: ['k1'] },
+      { name: 'B', sessions: [] },
+    ],
+  };
+  const patch = app.bulkAddToViewsOp(settings, ['A', 'B'], ['k1', 'k2', 'k3']);
+  assert.deepStrictEqual(patch.views[0].sessions, ['k1', 'k2', 'k3'], 'no duplicate for existing member k1');
+  assert.deepStrictEqual(patch.views[1].sessions, ['k1', 'k2', 'k3']);
+  assert.deepStrictEqual(patch.hidden_sessions, [], 'add implies unhide');
+  // Source settings untouched (pure op on a clone)
+  assert.deepStrictEqual(settings.views[1].sessions, []);
+  assert.deepStrictEqual(settings.hidden_sessions, ['k2']);
+});
+
+test('bulkHideOp hides all keys and removes them from every view', () => {
+  const settings = {
+    hidden_sessions: [],
+    views: [
+      { name: 'A', sessions: ['k1', 'k2'] },
+      { name: 'B', sessions: ['k2', 'k3'] },
+    ],
+  };
+  const patch = app.bulkHideOp(settings, ['k1', 'k2']);
+  assert.deepStrictEqual(patch.hidden_sessions, ['k1', 'k2']);
+  assert.deepStrictEqual(patch.views[0].sessions, []);
+  assert.deepStrictEqual(patch.views[1].sessions, ['k3']);
+  assert.deepStrictEqual(settings.views[0].sessions, ['k1', 'k2'], 'source untouched');
+});
+
+test('grid tile click toggles selection instead of opening in select mode (source contract)', () => {
+  const start = appSource.indexOf("document.querySelectorAll('.session-tile').forEach");
+  assert.ok(start !== -1);
+  const snippet = appSource.slice(start, start + 1700);
+  assert.ok(snippet.includes('_selectMode') && snippet.includes('_toggleTileSelection(tile)'),
+    'tile click handler must branch on _selectMode before openSession');
+  assert.ok(snippet.indexOf('_toggleTileSelection') < snippet.indexOf('openSession(tile.dataset.session'),
+    'selection branch must come before the open call');
+  assert.ok(snippet.includes('session-tile--selected'),
+    'selection highlight must be reapplied across poll re-renders');
+});
+
+test('manage-view panel batches checkbox changes and applies them in one PATCH', () => {
+  // onchange records pending; no api() call inside the change handler
+  const onchangeStart = appSource.indexOf('// Delegated change handler — BATCHED');
+  assert.ok(onchangeStart !== -1, 'batched change handler comment must exist');
+  const onchangeSnippet = appSource.slice(onchangeStart, onchangeStart + 700);
+  assert.ok(onchangeSnippet.includes('_managePending[sessionKey]'), 'pending map records changes');
+  assert.ok(!onchangeSnippet.includes("api('PATCH'"), 'no immediate PATCH on checkbox change');
+  // Apply composes ops and PATCHes once
+  const applyStart = appSource.indexOf('function _applyManagePending(');
+  assert.ok(applyStart !== -1);
+  const applySnippet = appSource.slice(applyStart, applyStart + 1800);
+  assert.strictEqual((applySnippet.match(/api\('PATCH', '\/api\/settings'/g) || []).length, 1,
+    'apply must issue exactly one settings PATCH');
+  assert.ok(applySnippet.includes('_opUnhide'), 'apply preserves add-implies-unhide invariant');
+});
+
+test('openManageViewPanel accepts a target view; settings-tab Manage no longer switches views', () => {
+  assert.ok(appSource.includes('function openManageViewPanel(viewName)'),
+    'openManageViewPanel must take a viewName param');
+  const manageActionStart = appSource.indexOf("getAttribute('data-action') === 'manage'");
+  const manageSnippet = appSource.slice(manageActionStart, manageActionStart + 420);
+  assert.ok(manageSnippet.includes('openManageViewPanel(viewName)'),
+    'settings-tab manage must open the panel for that view');
+  assert.ok(!manageSnippet.includes('switchView('),
+    'settings-tab manage must NOT switch the active view');
+});
+
+test('search results carry a selection checkbox and bulk view chips (source contract)', () => {
+  const itemStart = appSource.indexOf('function _searchItemHTML(');
+  const itemSnippet = appSource.slice(itemStart, itemStart + 2200);
+  assert.ok(itemSnippet.includes('session-search-results__cb'), 'result rows include a checkbox');
+  assert.ok(itemSnippet.includes("'<div class=") || itemSnippet.includes('"<div class='),
+    'row container must be a div (buttons cannot nest inputs)');
+  const footerStart = appSource.indexOf('function _searchFooterHTML(');
+  assert.ok(footerStart !== -1, 'footer builder must exist');
+  const footerSnippet = appSource.slice(footerStart, footerStart + 1200);
+  assert.ok(footerSnippet.includes('data-bulk-view'), 'footer renders per-view bulk chips');
+});
+
+test('searchSessions slim sessions expose key for bulk identity', () => {
+  const r = app.searchSessions('web', [
+    { name: 'web', sessionKey: 'dev1:web', remoteId: 'dev1', snapshot: '' },
+    { name: 'web2', snapshot: '' },
+  ], { views: [] });
+  const keys = r.map(x => x.session.key).sort();
+  assert.deepStrictEqual(keys, ['dev1:web', 'web2']);
+});
+
+test('Escape exits grid select mode (source contract)', () => {
+  const start = appSource.indexOf('function handleGlobalKeydown(');
+  const snippet = appSource.slice(start, start + 2600);
+  assert.ok(snippet.includes("e.key === 'Escape' && _selectMode"),
+    'Escape must exit select mode in the grid');
+});

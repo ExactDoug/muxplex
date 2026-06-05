@@ -20,7 +20,7 @@ _CSS: str = CSS_PATH.read_text()
 def test_open_manage_view_panel_adds_rename_click_handler() -> None:
     """openManageViewPanel must attach a click handler on #manage-view-name."""
     match = re.search(
-        r"function openManageViewPanel\s*\(\s*\)\s*\{(.*?)(?=\nfunction |\n// )",
+        r"function openManageViewPanel\s*\([^)]*\)\s*\{(.*?)(?=\nfunction |\n// )",
         _JS,
         re.DOTALL,
     )
@@ -59,7 +59,7 @@ def test_manage_view_rename_patches_settings() -> None:
 def test_manage_view_rename_handles_escape() -> None:
     """The rename input must revert on Escape key."""
     match = re.search(
-        r"function openManageViewPanel\s*\(\s*\)\s*\{(.*?)(?=\nfunction |\n// )",
+        r"function openManageViewPanel\s*\([^)]*\)\s*\{(.*?)(?=\nfunction |\n// )",
         _JS,
         re.DOTALL,
     )
@@ -73,7 +73,7 @@ def test_manage_view_rename_handles_escape() -> None:
 def test_manage_view_rename_handles_enter() -> None:
     """The rename input must commit on Enter key."""
     match = re.search(
-        r"function openManageViewPanel\s*\(\s*\)\s*\{(.*?)(?=\nfunction |\n// )",
+        r"function openManageViewPanel\s*\([^)]*\)\s*\{(.*?)(?=\nfunction |\n// )",
         _JS,
         re.DOTALL,
     )
@@ -87,7 +87,7 @@ def test_manage_view_rename_handles_enter() -> None:
 def test_manage_view_rename_updates_active_view() -> None:
     """After rename, _activeView must be updated to the new name."""
     match = re.search(
-        r"function openManageViewPanel\s*\(\s*\)\s*\{(.*?)(?=\nfunction |\n// )",
+        r"function openManageViewPanel\s*\([^)]*\)\s*\{(.*?)(?=\nfunction |\n// )",
         _JS,
         re.DOTALL,
     )
@@ -113,7 +113,7 @@ def test_manage_view_name_input_css_exists() -> None:
 def test_open_manage_view_panel_has_delete_button() -> None:
     """openManageViewPanel must render a delete/trash button in the header."""
     match = re.search(
-        r"function openManageViewPanel\s*\(\s*\)\s*\{(.*?)(?=\nfunction |\n// )",
+        r"function openManageViewPanel\s*\([^)]*\)\s*\{(.*?)(?=\nfunction |\n// )",
         _JS,
         re.DOTALL,
     )
@@ -132,7 +132,7 @@ def test_open_manage_view_panel_has_delete_button() -> None:
 def test_manage_view_delete_shows_confirmation() -> None:
     """The delete button must show inline confirmation before deleting."""
     match = re.search(
-        r"function openManageViewPanel\s*\(\s*\)\s*\{(.*?)(?=\nfunction |\n// )",
+        r"function openManageViewPanel\s*\([^)]*\)\s*\{(.*?)(?=\nfunction |\n// )",
         _JS,
         re.DOTALL,
     )
@@ -156,7 +156,7 @@ def test_manage_view_delete_removes_view_from_settings() -> None:
     # This is already present for the delete in settings tab, so check it's
     # also connected from openManageViewPanel
     match = re.search(
-        r"function openManageViewPanel\s*\(\s*\)\s*\{(.*?)(?=\nfunction |\n// )",
+        r"function openManageViewPanel\s*\([^)]*\)\s*\{(.*?)(?=\nfunction |\n// )",
         _JS,
         re.DOTALL,
     )
@@ -171,7 +171,7 @@ def test_manage_view_delete_removes_view_from_settings() -> None:
 def test_manage_view_delete_switches_to_all() -> None:
     """After deleting the view, must switch to 'all' view."""
     match = re.search(
-        r"function openManageViewPanel\s*\(\s*\)\s*\{(.*?)(?=\nfunction |\n// )",
+        r"function openManageViewPanel\s*\([^)]*\)\s*\{(.*?)(?=\nfunction |\n// )",
         _JS,
         re.DOTALL,
     )
@@ -185,7 +185,7 @@ def test_manage_view_delete_switches_to_all() -> None:
 def test_manage_view_delete_shows_toast() -> None:
     """After confirming delete, must show a toast notification."""
     match = re.search(
-        r"function openManageViewPanel\s*\(\s*\)\s*\{(.*?)(?=\nfunction |\n// )",
+        r"function openManageViewPanel\s*\([^)]*\)\s*\{(.*?)(?=\nfunction |\n// )",
         _JS,
         re.DOTALL,
     )
