@@ -2,6 +2,18 @@
 
 ## v0.7.0 (2026-06-04)
 
+### Bug Fixes
+
+- **Views appeared empty after a hard refresh (single-device mode)** — `/api/sessions`
+  did not include `sessionKey`, so clients stored bare session names in view membership.
+  The server's background normalize cycle then rewrote those entries to the canonical
+  `device_id:name` form in `settings.json`; the in-memory SPA kept working, but after a
+  page reload the frontend could no longer match canonical members against bare-name live
+  sessions — views rendered empty. `/api/sessions` now tags every session with its
+  canonical `sessionKey` (same form as `/api/federation/sessions`), and
+  `normalize_session_keys()` dedupes entries (re-adding "lost" sessions had been creating
+  exact duplicates next to their canonical siblings).
+
 ### Features
 
 - **Session pills in the expanded (terminal) header** — the mostly-empty header above the

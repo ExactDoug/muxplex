@@ -580,10 +580,20 @@ async def patch_state(patch: StatePatch) -> dict:
 
 @app.get("/api/sessions")
 async def get_sessions() -> list[dict]:
-    """Return list of sessions with name, snapshot, and bell data."""
+    """Return list of sessions with name, sessionKey, snapshot, and bell data.
+
+    sessionKey is the canonical ``device_id:name`` form — the SAME form the
+    background normalize cycle (13b) rewrites stored view/hidden entries into,
+    and the same form /api/federation/sessions tags local sessions with.
+    Without it, single-device clients stored bare names in view.sessions,
+    normalization upgraded them to canonical form server-side, and after a
+    page reload the frontend could no longer match members against live
+    sessions — views appeared empty after a hard refresh.
+    """
     names = get_session_list()
     snapshots = get_snapshots()
     state = await read_state()
+    device_id = load_device_id()
 
     result = []
     for name in names:
@@ -592,6 +602,7 @@ async def get_sessions() -> list[dict]:
         result.append(
             {
                 "name": name,
+                "sessionKey": f"{device_id}:{name}",
                 "snapshot": snapshots.get(name, ""),
                 "bell": bell,
             }
