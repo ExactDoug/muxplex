@@ -356,6 +356,7 @@ async function pollSessions() {
     renderGrid(sessions);
     renderViewPills();
     renderSidebar(sessions, _viewingSession, _viewingRemoteId);
+    renderExpandedHeaderPills();
     handleBellTransitions(prev, sessions);
     updateSessionPill(sessions);
     updateFaviconBadge();
@@ -3035,6 +3036,7 @@ async function openSession(name, opts = {}) {
   // Update expanded header
   const nameEl = $('expanded-session-name');
   if (nameEl) nameEl.textContent = name;
+  renderExpandedHeaderPills();
 
   // Zoom animation: pin tile at current position, then animate to full viewport
   // Skipped on restore (skipAnimation:true) — no tile DOM element to zoom from
@@ -3128,6 +3130,7 @@ async function openSession(name, opts = {}) {
 function closeSession() {
   _viewMode = 'grid';
   _viewingSession = null;
+  renderExpandedHeaderPills(); // clears the strip + closes any open pill dropdown
 
   if (window._closeTerminal) window._closeTerminal();
 
@@ -3170,6 +3173,424 @@ function closeSession() {
 /** Test-only helper: set _viewingSession directly. */
 function _setViewingSession(name) {
   _viewingSession = name;
+}
+
+/** Test-only helper: set _viewingRemoteId directly. */
+function _setViewingRemoteId(rid) {
+  _viewingRemoteId = rid;
+}
+
+// ─── Expanded-header session pills ───────────────────────────────────────────
+// Session-level navigation strip in the expanded (terminal) header.
+// Design: docs/plans/2026-06-04-expanded-header-session-pills-design.md
+//
+// Layout (left→right): current-session pill (distinct, no-op) → one group of
+// sibling pills per "home view" (views containing the current session),
+// separated by vertical bars → dropdown pill per other view → right-aligned
+// "Other Sessions" dropdown. Hidden sessions excluded everywhere; strip is
+// hidden < 600px via CSS (the plain name label returns).
+
+var _expandedPillsModel = null;   // last built model (slim sessions)
+var _expandedPillsAlloc = null;   // last per-group inline counts
+var _expandedPillMenuFor = null;  // open dropdown key ('view:i'|'overflow:i'|'other') or null
+var _pillMeasureEl = null;        // offscreen measurement container
+var _pillWidthCache = {};         // pill HTML -> measured width
+
+var EP_GAP = 6; // must match .expanded-pills CSS gap
+
+/** Slim, render-relevant projection of a session (keeps the re-render
+ *  signature small and stable — full sessions carry the snapshot text). */
+function _epSlim(s) {
+  return {
+    name: s.name,
+    remoteId: s.remoteId != null ? String(s.remoteId) : '',
+    deviceName: s.deviceName || '',
+    bell: !!(s.bell && s.bell.unseen_count > 0),
+  };
+}
+
+/** Alphabetical (case-insensitive) by name; tie-break by device name. */
+function _epSessionSort(a, b) {
+  var an = (a.name || '').toLowerCase(), bn = (b.name || '').toLowerCase();
+  if (an < bn) return -1;
+  if (an > bn) return 1;
+  var ad = a.deviceName || '', bd = b.deviceName || '';
+  return ad < bd ? -1 : ad > bd ? 1 : 0;
+}
+
+/**
+ * Build the expanded-header pills model. Pure — no DOM access.
+ *
+ * Rules (see design doc):
+ * - live, non-hidden sessions only (status sentinels excluded);
+ * - homeGroups = views containing the current session, in views-array order;
+ *   each holds the view's OTHER members (current excluded), alphabetical,
+ *   deduped across groups (a sibling in several home views renders in the
+ *   first one only); empty groups are dropped;
+ * - otherViews = remaining (non-empty) views with full membership;
+ * - otherSessions = sessions in NO view (and not current);
+ * - same 7-view cap as the main-page pills.
+ *
+ * @returns {object|null} { current, homeGroups, otherViews, otherSessions }
+ */
+function buildExpandedPillsModel(sessions, settings, currentName, currentRemoteId) {
+  if (!currentName) return null;
+
+  var hiddenList = (settings && settings.hidden_sessions) || [];
+  function keyOf(s) { return s.sessionKey || s.name; }
+  function isHiddenS(s) {
+    return hiddenList.indexOf(keyOf(s)) !== -1 || hiddenList.indexOf(s.name) !== -1;
+  }
+  var pool = (sessions || []).filter(function (s) { return !s.status && !isHiddenS(s); });
+
+  var rid = currentRemoteId != null ? String(currentRemoteId) : '';
+  function isCurrent(s) {
+    return s.name === currentName && (s.remoteId != null ? String(s.remoteId) : '') === rid;
+  }
+  var currentSession = null;
+  for (var ci = 0; ci < pool.length; ci++) {
+    if (isCurrent(pool[ci])) { currentSession = pool[ci]; break; }
+  }
+
+  var views = ((settings && settings.views) || []).slice(0, 7);
+  function inView(v, s) {
+    var members = v.sessions || [];
+    return members.indexOf(keyOf(s)) !== -1 || members.indexOf(s.name) !== -1;
+  }
+  function currentInView(v) {
+    if (currentSession) return inView(v, currentSession);
+    // Current session not in poll data yet (first tick) — match by name
+    return (v.sessions || []).indexOf(currentName) !== -1;
+  }
+
+  var homeGroups = [];
+  var otherViews = [];
+  var seen = {}; // sibling dedup across home groups
+  for (var vi = 0; vi < views.length; vi++) {
+    var v = views[vi];
+    var members = pool.filter(function (s) { return inView(v, s); }).sort(_epSessionSort);
+    if (currentInView(v)) {
+      var sibs = [];
+      for (var si = 0; si < members.length; si++) {
+        var s = members[si];
+        if (isCurrent(s)) continue;
+        var k = keyOf(s);
+        if (seen[k]) continue;
+        seen[k] = true;
+        sibs.push(_epSlim(s));
+      }
+      if (sibs.length > 0) homeGroups.push({ viewName: v.name, sessions: sibs });
+    } else if (members.length > 0) {
+      otherViews.push({ viewName: v.name, sessions: members.map(_epSlim) });
+    }
+  }
+
+  var otherSessions = pool.filter(function (s) {
+    if (isCurrent(s)) return false;
+    for (var ki = 0; ki < views.length; ki++) {
+      if (inView(views[ki], s)) return false;
+    }
+    return true;
+  }).sort(_epSessionSort).map(_epSlim);
+
+  var current = currentSession
+    ? _epSlim(currentSession)
+    : { name: currentName, remoteId: rid, deviceName: '', bell: false };
+
+  return { current: current, homeGroups: homeGroups, otherViews: otherViews, otherSessions: otherSessions };
+}
+
+/**
+ * Decide how many sibling pills each home group shows inline. Pure.
+ *
+ * Each group is either fully expanded (all n inline, no dropdown) or shows
+ * k inline + a "ViewName +overflow ▾" dropdown with k ≤ n−2 — never k = n−1,
+ * because a dropdown pill is about as wide as the session pill it replaces
+ * (the final expansion step absorbs the last TWO sessions at once).
+ *
+ * Fair-share growth: round-robin over groups in order, one expansion step per
+ * group per round, committing only steps that fit. Width-measured, so
+ * variable-length names are handled; small groups finish early and stop
+ * consuming rounds.
+ *
+ * @param {Array<{sessionWidths:number[], collapsedWidth:number}>} groups
+ * @param {number} fixedWidth - width of always-present items incl. gaps
+ *   (current pill, separators, other-view pills, Other Sessions pill)
+ * @param {number} available - strip container width
+ * @param {number} [gap]
+ * @returns {number[]} per-group inline counts (count === n ⇒ fully expanded)
+ */
+function allocateExpandedPills(groups, fixedWidth, available, gap) {
+  gap = gap != null ? gap : EP_GAP;
+  var counts = groups.map(function () { return 0; });
+  // Minimum layout: every group collapsed to its dropdown pill. If even this
+  // overflows, the strip scrolls horizontally — we never go below one pill
+  // per home view.
+  var used = fixedWidth;
+  for (var i = 0; i < groups.length; i++) used += groups[i].collapsedWidth + gap;
+
+  var done = groups.map(function (g) { return g.sessionWidths.length === 0; });
+  var progressed = true;
+  while (progressed) {
+    progressed = false;
+    for (var gi = 0; gi < groups.length; gi++) {
+      if (done[gi]) continue;
+      var g = groups[gi];
+      var n = g.sessionWidths.length;
+      var k = counts[gi];
+      var cost, nextCount;
+      if (k + 1 <= n - 2) {
+        // Add one inline pill; the dropdown stays.
+        cost = g.sessionWidths[k] + gap;
+        nextCount = k + 1;
+      } else {
+        // Final step: replace the dropdown with ALL remaining pills.
+        cost = -(g.collapsedWidth + gap);
+        for (var si = k; si < n; si++) cost += g.sessionWidths[si] + gap;
+        nextCount = n;
+      }
+      if (used + cost <= available) {
+        used += cost;
+        counts[gi] = nextCount;
+        if (nextCount >= n) done[gi] = true;
+        progressed = true;
+      } else {
+        done[gi] = true;
+      }
+    }
+  }
+  return counts;
+}
+
+/** Amber activity dot for a slim session; respects the activity-indicator
+ *  display setting ('none' suppresses). */
+function _epBellHTML(s) {
+  if (!s || !s.bell) return '';
+  var ds = getDisplaySettings();
+  if (ds.activityIndicator === 'none') return '';
+  return '<span class="nav-pill__bell" aria-hidden="true"></span>';
+}
+
+/** Session pill HTML (inline strip). */
+function _epSessionPillHTML(s, isCurrent) {
+  var cls = 'nav-pill nav-pill--session' + (isCurrent ? ' nav-pill--current' : '');
+  var title = s.name + (s.deviceName ? ' — ' + s.deviceName : '');
+  return '<button class="' + cls + '" data-session="' + escapeHtml(s.name) +
+    '" data-remote-id="' + escapeHtml(s.remoteId) + '" title="' + escapeHtml(title) + '">' +
+    escapeHtml(s.name) + _epBellHTML(s) + '</button>';
+}
+
+/** Dropdown pill HTML (other view / group overflow / Other Sessions). */
+function _epMenuPillHTML(menuKey, label, countText, extraClass) {
+  return '<button class="nav-pill nav-pill--menu' + (extraClass || '') +
+    '" data-pill-menu="' + escapeHtml(menuKey) + '" aria-haspopup="true" aria-expanded="false" title="' +
+    escapeHtml(label) + '">' + escapeHtml(label) +
+    ' <span class="nav-pill__count">' + escapeHtml(countText) + '</span>' +
+    '<span class="nav-pill__caret" aria-hidden="true">▾</span></button>';
+}
+
+/** Dropdown menu item HTML for a slim session. */
+function _epMenuItemHTML(s) {
+  var ds = getDisplaySettings();
+  var badge = '';
+  if (_serverSettings && _serverSettings.multi_device_enabled && s.deviceName && ds.showDeviceBadges !== false) {
+    badge = ' <span class="device-badge">' + escapeHtml(s.deviceName) + '</span>';
+  }
+  return '<button class="view-dropdown__item" role="menuitem" data-session="' + escapeHtml(s.name) +
+    '" data-remote-id="' + escapeHtml(s.remoteId) + '">' + escapeHtml(s.name) + badge + _epBellHTML(s) + '</button>';
+}
+
+/**
+ * Measure a pill's rendered width via an offscreen container that inherits
+ * the strip's styles. Cached by HTML string (font/padding are fixed).
+ * Returns 0 when real layout isn't available (test env) — the allocator then
+ * expands everything, which is harmless there.
+ */
+function _epMeasureWidth(html) {
+  if (_pillWidthCache[html] != null) return _pillWidthCache[html];
+  if (!_pillMeasureEl) {
+    if (!document.body || typeof document.createElement !== 'function') return 0;
+    _pillMeasureEl = document.createElement('div');
+    _pillMeasureEl.className = 'expanded-pills expanded-pills--measure';
+    if (_pillMeasureEl.style) {
+      _pillMeasureEl.style.position = 'fixed';
+      _pillMeasureEl.style.visibility = 'hidden';
+      _pillMeasureEl.style.left = '-9999px';
+      _pillMeasureEl.style.top = '0';
+    }
+    if (typeof document.body.appendChild === 'function') document.body.appendChild(_pillMeasureEl);
+  }
+  _pillMeasureEl.innerHTML = html;
+  var el = _pillMeasureEl.firstElementChild;
+  var w = (el && el.offsetWidth) || 0;
+  _pillWidthCache[html] = w;
+  return w;
+}
+
+/**
+ * Render the expanded-header pill strip. Called from pollSessions(),
+ * openSession(), closeSession(), and the (rAF-debounced) resize handler.
+ * Skips the DOM write when neither the model nor the container width changed
+ * (string-compare signature guard — same convention as renderViewPills).
+ */
+function renderExpandedHeaderPills() {
+  var nav = $('expanded-pills');
+  if (!nav) return;
+  var header = (typeof document.querySelector === 'function') ? document.querySelector('.expanded-header') : null;
+
+  if (_viewMode !== 'fullscreen' || !_viewingSession) {
+    if ((nav._lastSig || '') !== '') {
+      nav.innerHTML = '';
+      nav._lastSig = '';
+    }
+    if (header && header.classList) header.classList.remove('expanded-header--pills');
+    _epCloseMenu();
+    return;
+  }
+
+  var model = buildExpandedPillsModel(_currentSessions, _serverSettings, _viewingSession, _viewingRemoteId);
+  if (!model) return;
+
+  var width = nav.clientWidth || 0;
+  var ds = getDisplaySettings();
+  var sig = JSON.stringify(model) + '|' + width + '|' + (ds.activityIndicator || 'both');
+  if (nav._lastSig === sig) return;
+
+  // — Measure fixed items
+  var sepHtml = '<span class="expanded-pills__sep" aria-hidden="true"></span>';
+  var currentHtml = _epSessionPillHTML(model.current, true);
+  var fixed = _epMeasureWidth(currentHtml) + EP_GAP;
+  if (model.homeGroups.length > 1) {
+    fixed += (model.homeGroups.length - 1) * (_epMeasureWidth(sepHtml) + EP_GAP);
+  }
+  var otherViewPills = model.otherViews.map(function (v, i) {
+    return _epMenuPillHTML('view:' + i, v.viewName, String(v.sessions.length), '');
+  });
+  for (var oi = 0; oi < otherViewPills.length; oi++) fixed += _epMeasureWidth(otherViewPills[oi]) + EP_GAP;
+  var otherPillHtml = '';
+  if (model.otherSessions.length > 0) {
+    otherPillHtml = _epMenuPillHTML('other', 'Other Sessions', String(model.otherSessions.length), ' nav-pill--other');
+    fixed += _epMeasureWidth(otherPillHtml) + EP_GAP;
+  }
+
+  // — Measure home-group pills and allocate inline slots
+  var groups = model.homeGroups.map(function (g, i) {
+    var pillHtmls = g.sessions.map(function (s) { return _epSessionPillHTML(s, false); });
+    return {
+      pillHtmls: pillHtmls,
+      sessionWidths: pillHtmls.map(_epMeasureWidth),
+      // Measured with the max overflow count — conservative for partial states
+      collapsedWidth: _epMeasureWidth(_epMenuPillHTML('overflow:' + i, g.viewName, '+' + g.sessions.length, '')),
+    };
+  });
+  var counts = allocateExpandedPills(groups, fixed, width, EP_GAP);
+
+  _expandedPillsModel = model;
+  _expandedPillsAlloc = counts;
+
+  // — Build final strip HTML
+  var html = currentHtml;
+  for (var gi = 0; gi < model.homeGroups.length; gi++) {
+    if (gi > 0) html += sepHtml;
+    var g = model.homeGroups[gi];
+    for (var si = 0; si < counts[gi]; si++) html += groups[gi].pillHtmls[si];
+    if (counts[gi] < g.sessions.length) {
+      html += _epMenuPillHTML('overflow:' + gi, g.viewName, '+' + (g.sessions.length - counts[gi]), '');
+    }
+  }
+  for (var pi = 0; pi < otherViewPills.length; pi++) html += otherViewPills[pi];
+  html += otherPillHtml;
+
+  nav._lastSig = sig;
+  nav.innerHTML = html;
+  if (header && header.classList) header.classList.add('expanded-header--pills');
+
+  // Keep an open dropdown alive across re-renders; close it if its pill is gone
+  if (_expandedPillMenuFor) {
+    var openPill = (typeof nav.querySelector === 'function')
+      ? nav.querySelector('[data-pill-menu="' + _expandedPillMenuFor + '"]')
+      : null;
+    if (openPill) {
+      if (openPill.setAttribute) openPill.setAttribute('aria-expanded', 'true');
+      _epRenderMenu();
+      _epPositionMenu(openPill);
+    } else {
+      _epCloseMenu();
+    }
+  }
+}
+
+/** Resolve the slim-session list behind a dropdown key. */
+function _epMenuSessions(key) {
+  if (!_expandedPillsModel) return [];
+  if (key === 'other') return _expandedPillsModel.otherSessions;
+  var m = /^view:(\d+)$/.exec(key || '');
+  if (m) {
+    var v = _expandedPillsModel.otherViews[Number(m[1])];
+    return v ? v.sessions : [];
+  }
+  m = /^overflow:(\d+)$/.exec(key || '');
+  if (m) {
+    var i = Number(m[1]);
+    var g = _expandedPillsModel.homeGroups[i];
+    if (!g) return [];
+    var shown = (_expandedPillsAlloc && _expandedPillsAlloc[i]) || 0;
+    return g.sessions.slice(shown);
+  }
+  return [];
+}
+
+/** Populate and show the shared #expanded-pill-menu for the open key. */
+function _epRenderMenu() {
+  var menu = $('expanded-pill-menu');
+  if (!menu) return;
+  var list = _epMenuSessions(_expandedPillMenuFor);
+  var html = '';
+  for (var i = 0; i < list.length; i++) html += _epMenuItemHTML(list[i]);
+  if (!html) html = '<div class="view-dropdown__item" aria-disabled="true">No sessions</div>';
+  menu.innerHTML = html;
+  menu.classList.remove('hidden');
+}
+
+/** Fixed-position the menu under its pill (the strip is overflow-x:auto,
+ *  which would clip an absolutely-positioned child — same trick as the
+ *  sidebar view dropdown). */
+function _epPositionMenu(pillEl) {
+  var menu = $('expanded-pill-menu');
+  if (!menu || !menu.style || typeof pillEl.getBoundingClientRect !== 'function') return;
+  var rect = pillEl.getBoundingClientRect();
+  var left = rect.left;
+  if (window.innerWidth) left = Math.min(left, Math.max(0, window.innerWidth - 290));
+  menu.style.top = (rect.bottom + 4) + 'px';
+  menu.style.left = left + 'px';
+}
+
+/** Toggle the dropdown for a pill (only one open at a time). */
+function _epToggleMenu(pillEl) {
+  var key = pillEl && pillEl.dataset ? pillEl.dataset.pillMenu : null;
+  if (!key) return;
+  if (_expandedPillMenuFor === key) {
+    _epCloseMenu();
+    return;
+  }
+  _epCloseMenu();
+  _expandedPillMenuFor = key;
+  _epRenderMenu();
+  _epPositionMenu(pillEl);
+  if (pillEl.setAttribute) pillEl.setAttribute('aria-expanded', 'true');
+}
+
+/** Close the expanded-header pill dropdown, if open. */
+function _epCloseMenu() {
+  if (!_expandedPillMenuFor) return;
+  _expandedPillMenuFor = null;
+  var menu = $('expanded-pill-menu');
+  if (menu) menu.classList.add('hidden');
+  var nav = $('expanded-pills');
+  if (nav && typeof nav.querySelector === 'function') {
+    var open = nav.querySelector('[data-pill-menu][aria-expanded="true"]');
+    if (open && open.setAttribute) open.setAttribute('aria-expanded', 'false');
+  }
 }
 
 // ─── Server settings ─────────────────────────────────────────────────────────
@@ -4161,6 +4582,51 @@ function bindStaticEventListeners() {
     });
   }
 
+  // Expanded-header session pills — delegated (pills re-render each poll;
+  // #expanded-pills is static, so listeners attach ONCE here — contract #3)
+  var expandedPills = $('expanded-pills');
+  if (expandedPills) {
+    expandedPills.addEventListener('click', function (e) {
+      var menuPill = e.target.closest && e.target.closest('[data-pill-menu]');
+      if (menuPill) {
+        _epToggleMenu(menuPill);
+        return;
+      }
+      var sessPill = e.target.closest && e.target.closest('[data-session]');
+      if (!sessPill) return;
+      if (sessPill.classList && sessPill.classList.contains('nav-pill--current')) return; // current pill is a no-op
+      _epCloseMenu();
+      var pillRid = sessPill.dataset.remoteId || '';
+      if (sessPill.dataset.session !== _viewingSession || pillRid !== (_viewingRemoteId || '')) {
+        openSession(sessPill.dataset.session, { remoteId: pillRid });
+      }
+    });
+  }
+
+  // Expanded-header pill dropdown — delegated session item clicks switch session
+  var expandedPillMenu = $('expanded-pill-menu');
+  if (expandedPillMenu) {
+    expandedPillMenu.addEventListener('click', function (e) {
+      var item = e.target.closest && e.target.closest('[data-session]');
+      if (!item) return;
+      var itemRid = item.dataset.remoteId || '';
+      _epCloseMenu();
+      if (item.dataset.session !== _viewingSession || itemRid !== (_viewingRemoteId || '')) {
+        openSession(item.dataset.session, { remoteId: itemRid });
+      }
+    });
+  }
+
+  // Click-outside / Escape close the expanded-header pill dropdown
+  document.addEventListener('click', function (e) {
+    if (!_expandedPillMenuFor) return;
+    if (e.target.closest && (e.target.closest('#expanded-pill-menu') || e.target.closest('[data-pill-menu]'))) return;
+    _epCloseMenu();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && _expandedPillMenuFor) _epCloseMenu();
+  });
+
   // Sidebar view dropdown — trigger opens/closes, delegated item clicks switch view
   var sidebarViewTrigger = $('sidebar-view-dropdown-trigger');
   if (sidebarViewTrigger) on(sidebarViewTrigger, 'click', toggleSidebarViewDropdown);
@@ -4505,6 +4971,21 @@ window.addEventListener('resize', function() {
   }
 });
 
+// Re-allocate the expanded-header pill strip on resize (rAF-debounced —
+// widths are cached, only the allocation + render re-run)
+var _epResizePending = false;
+window.addEventListener('resize', function () {
+  if (_epResizePending || _viewMode !== 'fullscreen') return;
+  _epResizePending = true;
+  var raf = (typeof requestAnimationFrame === 'function')
+    ? requestAnimationFrame
+    : function (fn) { return setTimeout(fn, 50); };
+  raf(function () {
+    _epResizePending = false;
+    renderExpandedHeaderPills();
+  });
+});
+
 document.addEventListener('DOMContentLoaded', async function() {
   initDeviceId();
 
@@ -4642,6 +5123,14 @@ if (typeof module !== 'undefined' && module.exports) {
     renderSidebarViewDropdown,
     toggleSidebarViewDropdown,
     showSidebarNewViewInput,
+    // Expanded-header session pills
+    buildExpandedPillsModel,
+    allocateExpandedPills,
+    renderExpandedHeaderPills,
+    _epMenuSessions,
+    _epToggleMenu,
+    _epCloseMenu,
+    _setViewingRemoteId,
     // Manage Views settings tab
     renderViewsSettingsTab,
     _saveViewsAndRerender,

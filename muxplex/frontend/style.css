@@ -2138,6 +2138,120 @@ body {
    Responsive overlay sidebar at <960px
    ============================================================ */
 
+/* ============================================================
+   Expanded-header session pills
+   (docs/plans/2026-06-04-expanded-header-session-pills-design.md)
+   ============================================================ */
+
+.expanded-pills {
+  display: flex;
+  align-items: center;
+  gap: 6px; /* must match EP_GAP in app.js */
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none; /* Firefox — minimum layout may still overflow; strip scrolls */
+}
+
+.expanded-pills::-webkit-scrollbar {
+  display: none; /* Chrome/Safari */
+}
+
+/* The strip replaces the plain name label — the current-session pill IS the
+   name. The label returns below 600px where the strip is hidden. */
+.expanded-header--pills .expanded-session-name {
+  display: none;
+}
+
+@media (max-width: 599px) {
+  .expanded-pills { display: none; }
+  .expanded-header--pills .expanded-session-name { display: block; }
+}
+
+.nav-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  max-width: 180px;
+  overflow: hidden;
+  white-space: nowrap;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  font-family: var(--font-ui);
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 3px 12px;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+
+.nav-pill:hover,
+.nav-pill[aria-expanded="true"] {
+  border-color: var(--accent);
+  color: var(--text);
+  background: var(--bg-surface);
+}
+
+/* Current session — distinctly filled; not a navigation target */
+.nav-pill--current,
+.nav-pill--current:hover {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+  cursor: default;
+}
+
+.nav-pill__count {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.nav-pill__caret {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* Right-aligned Other Sessions pill */
+.nav-pill--other {
+  margin-left: auto;
+}
+
+/* Amber activity dot (suppressed when activity indicator setting is 'none') */
+.nav-pill__bell {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--bell);
+  flex-shrink: 0;
+}
+
+/* Vertical bar between home-view groups */
+.expanded-pills__sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+/* Shared dropdown — fixed-positioned to escape the strip's overflow clipping */
+.expanded-pill-menu {
+  position: fixed;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.expanded-pill-menu .view-dropdown__item .device-badge {
+  margin-left: auto;
+}
+
+.expanded-pill-menu .nav-pill__bell {
+  margin-left: 6px;
+}
+
+
 @media (max-width: 959px) {
   .session-sidebar {
     position: fixed;

@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.7.0 (2026-06-04)
+
+### Features
+
+- **Session pills in the expanded (terminal) header** — the mostly-empty header above the
+  terminal is now a session-level navigation strip. Left to right: a distinctly-styled pill
+  for the **current session**, then one group of click-to-switch **sibling pills** per view
+  the session belongs to (alphabetical, vertical-bar separators between groups, siblings in
+  several of those views deduped into their first group), then a **dropdown pill per other
+  view** listing its sessions (any session anywhere is 2 clicks away), and a right-aligned
+  **Other Sessions** dropdown for view-less sessions. Hidden sessions are excluded
+  everywhere. The strip is width-aware: each sibling group collapses into a
+  `ViewName +N ▾` overflow dropdown as the viewport narrows (round-robin fair-share
+  expansion as it widens — never collapsing exactly one session, since a dropdown pill is
+  as wide as the pill it replaces) and is guaranteed at least one pill per view. Pills show
+  amber activity dots (respecting the activity-indicator setting) and re-render each poll
+  cycle behind a string-compare guard. Below 600 px the strip hides and the plain session
+  name returns (mobile keeps the bottom-sheet switcher). Switching via pills does not
+  change the active view. Design: `docs/plans/2026-06-04-expanded-header-session-pills-design.md`.
+
 ## v0.6.8 (2026-06-04)
 
 ### Bug Fixes
