@@ -12,16 +12,21 @@
 
 - **Live session grid** — preview tiles with ANSI-colored terminal snapshots, auto-refreshed
 - **Two view modes** — Auto (scrollable grid) and Fit (all sessions fill the viewport)
+- **Views (tags)** — user-defined session groups with header pills (live counts, one-click switch), a management dropdown, and a Manage View panel with batched Apply
+- **Universal search** — 🔍 in the header (or `/`): partial-match sessions by name, cwd top-leaf directory, git repo name, or view/tag name; hidden sessions flagged; arrow-key + Enter navigation
+- **Bulk select mode** — ☑ toggle makes tiles multi-selectable; a floating bar adds the whole selection to a view or hides it in one action (search results offer the same via row checkboxes)
 - **Hover preview** — full-size overlay of session content on tile hover
 - **Activity indicators** — bell notification badges on tiles; amber favicon dot + `(N)` count in browser tab title when sessions have unseen activity
-- **Session creation** — `+` button with device selector dropdown when multi-device is enabled; custom command template support
+- **Session creation** — `+` button (on both the dashboard and terminal headers) with a views/tags picker for assignment at creation, plus a device selector dropdown when multi-device is enabled; custom command template support
 - **Session deletion** — `×` button with custom command template support
 - **Mobile-friendly** — responsive layout, PWA-capable for home-screen install
 
 ### Terminal
 
 - **Full interactive terminal** — powered by xterm.js + ttyd
-- **Native clipboard** — Ctrl+Shift+C to copy, Cmd+V (macOS) / Ctrl+Shift+V (Linux) to paste
+- **Session pills in the header** — current session highlighted; same-view sibling sessions inline (width-aware, grouped per view); dropdown pills reach any other session in 2 clicks
+- **Native clipboard** — Ctrl+V / Cmd+V pastes the browser clipboard (bracketed paste); Ctrl+Shift+C copies; right-click pastes — or completes a copy when text is selected (Windows-terminal style)
+- **Shift+Enter newline** — sends LF so TUI apps (e.g. Claude Code) insert a line instead of submitting
 - **Mouse select auto-copy** — selecting text copies to system clipboard on release
 - **OSC 52 tmux clipboard bridge** — tmux copy mode selections go to system clipboard
 - **Search** — Ctrl+F opens a search bar to find text in terminal scrollback (xterm-addon-search)
