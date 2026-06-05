@@ -1,5 +1,12 @@
 # Views Design
 
+> **Update (2026-06-04):** view navigation was extended with header **pills** — one
+> button per view rendered across the overview header (desktop ≥600px), single click
+> activates; the dropdown described in this doc remains as the management menu
+> (fixed "Views" label on desktop) and as the sole switcher on narrow screens.
+> See `CHANGELOG.md` v0.6.8 and `renderViewPills()` in `muxplex/frontend/app.js`.
+> The dropdown design below is otherwise unchanged and still accurate.
+
 ## Goal
 
 Add user-defined "Views" to muxplex — curated collections of sessions that let users focus on subsets of their terminal sessions across devices, replacing the current `filtered` gridViewMode with something strictly more powerful.
