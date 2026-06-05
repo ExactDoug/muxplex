@@ -324,6 +324,28 @@ def test_get_sessions_includes_canonical_session_key(client, monkeypatch):
     assert [i["sessionKey"] for i in items] == ["dev-uuid-1:alpha", "dev-uuid-1:beta"]
 
 
+def test_get_sessions_includes_cwd_and_git_metadata(client, monkeypatch):
+    """Universal search metadata: cwd, cwdLeaf, gitRepo per session (None when unknown)."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["proj", "mystery"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {})
+    monkeypatch.setattr(
+        "muxplex.main.get_session_paths",
+        lambda: {"proj": "/home/u/dev/myrepo/sub"},
+    )
+    monkeypatch.setattr("muxplex.main.resolve_git_repo", lambda cwd: "myrepo")
+
+    response = client.get("/api/sessions")
+    assert response.status_code == 200
+    by_name = {i["name"]: i for i in response.json()}
+    assert by_name["proj"]["cwd"] == "/home/u/dev/myrepo/sub"
+    assert by_name["proj"]["cwdLeaf"] == "sub"
+    assert by_name["proj"]["gitRepo"] == "myrepo"
+    # No known cwd -> all three None
+    assert by_name["mystery"]["cwd"] is None
+    assert by_name["mystery"]["cwdLeaf"] is None
+    assert by_name["mystery"]["gitRepo"] is None
+
+
 def test_get_sessions_includes_snapshot_text(client, monkeypatch):
     """GET /api/sessions snapshot field must contain the cached capture-pane text."""
     monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["gamma"])

@@ -2967,7 +2967,7 @@ test('createNewSession injects tile--loading placeholder after POST succeeds', (
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const start = source.indexOf('async function createNewSession(');
   assert.ok(start !== -1, 'createNewSession must exist');
-  const snippet = source.slice(start, start + 2500);
+  const snippet = source.slice(start, start + 4000);
   assert.ok(snippet.includes('tile--loading'), 'createNewSession must inject tile--loading placeholder class');
   assert.ok(snippet.includes('loading-tile-'), 'createNewSession must use loading-tile- id prefix for the placeholder');
 });
@@ -2975,7 +2975,8 @@ test('createNewSession injects tile--loading placeholder after POST succeeds', (
 test('createNewSession removes loading placeholder when session is found', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const start = source.indexOf('async function createNewSession(');
-  const snippet = source.slice(start, start + 2500);
+  // window sized to cover the function body (view-assignment block added in v0.7.0)
+  const snippet = source.slice(start, start + 4000);
   assert.ok(
     snippet.includes('loadingTile') && snippet.includes('.remove()'),
     'createNewSession must remove the loading tile (loadingTile.remove()) when session is found'
@@ -4270,8 +4271,8 @@ test('updatePageTitle function exists and uses activity count', () => {
 
 test('updatePageTitle is called from pollSessions', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
-  // Use 700 chars — the call is ~562 chars into the function after comments/whitespace
-  const pollFn = source.substring(source.indexOf('async function pollSessions'), source.indexOf('async function pollSessions') + 700);
+  // Window sized to cover the render-call block (expanded pills + search refresh added in v0.7.x)
+  const pollFn = source.substring(source.indexOf('async function pollSessions'), source.indexOf('async function pollSessions') + 1200);
   assert.ok(pollFn.includes('updatePageTitle'), 'pollSessions must call updatePageTitle');
 });
 
@@ -6228,4 +6229,262 @@ test('_epMenuSessions resolves view/overflow/other keys against the last model',
   app._setViewingSession(null);
   app._setServerSettings(null);
   app._setCurrentSessions([]);
+});
+
+// ============================================================================
+// New-session view picker + expanded-header new-session button (v0.7.0)
+// ============================================================================
+
+const appSource = fs.readFileSync(join(__dirname, '..', 'app.js'), 'utf8');
+const indexSource = fs.readFileSync(join(__dirname, '..', 'index.html'), 'utf8');
+
+test('expanded header has a new-session button wired to showNewSessionInput', () => {
+  assert.ok(indexSource.includes('id="new-session-btn-expanded"'),
+    'index.html must contain #new-session-btn-expanded in the expanded header');
+  assert.ok(appSource.includes("$('new-session-btn-expanded')"),
+    'bindStaticEventListeners must look up the expanded new-session button');
+  assert.ok(/newSessionBtnExpanded\)[\s\S]{0,120}showNewSessionInput\(newSessionBtnExpanded\)/.test(appSource),
+    'the expanded button must trigger showNewSessionInput');
+});
+
+test('_createViewPicker returns null when no user views exist', () => {
+  app._setServerSettings({ views: [] });
+  assert.strictEqual(app._createViewPicker(), null);
+  app._setServerSettings(null);
+  assert.strictEqual(app._createViewPicker(), null);
+});
+
+test('createNewSession accepts an explicit viewNames selection (picker contract)', () => {
+  const start = appSource.indexOf('async function createNewSession(');
+  assert.ok(start !== -1);
+  const snippet = appSource.slice(start, start + 3000);
+  assert.ok(snippet.includes('createNewSession(name, remoteId, viewNames)'),
+    'createNewSession must take a viewNames parameter');
+  assert.ok(snippet.includes('Array.isArray(viewNames)'),
+    'explicit (possibly empty) picker selection must override the legacy auto-add');
+  // One PATCH for all selected views — not one per view
+  const patchCount = (snippet.match(/api\('PATCH', '\/api\/settings'/g) || []).length;
+  assert.strictEqual(patchCount, 1, 'all selected views must be written in a single PATCH');
+});
+
+test('both new-session flows pass the picker selection to createNewSession', () => {
+  const flows = ['function showNewSessionInput(', 'function showFabSessionInput('];
+  for (const marker of flows) {
+    const start = appSource.indexOf(marker);
+    assert.ok(start !== -1, marker + ' must exist');
+    const snippet = appSource.slice(start, start + 4000);
+    assert.ok(snippet.includes('_createViewPicker()'), marker + ' must create the view picker');
+    assert.ok(snippet.includes('picker.getSelectedViews()'),
+      marker + ' must read the picker selection on Enter');
+    assert.ok(snippet.includes('createNewSession(name, remoteId, viewNames)'),
+      marker + ' must forward the selection to createNewSession');
+  }
+});
+
+// ============================================================================
+// Universal session search (v0.7.x)
+// docs/plans/2026-06-04-universal-session-search-design.md
+// ============================================================================
+
+const ussSessions = [
+  { name: 'muxplex',  cwdLeaf: 'muxplex',  gitRepo: 'muxplex',  snapshot: '' },
+  { name: 'apiwork',  cwdLeaf: 'cw-manage-api', gitRepo: 'cw-manage-api', snapshot: '' },
+  { name: 'scratch',  cwdLeaf: 'tmp', gitRepo: null, snapshot: '' },
+  { name: 'firewall', cwdLeaf: 'arista', gitRepo: 'arista-ngfw', snapshot: '' },
+  { name: 'ghost',    status: 'unreachable' },
+];
+const ussSettings = {
+  hidden_sessions: ['scratch'],
+  views: [
+    { name: 'SecOps', sessions: ['firewall'] },
+    { name: 'WebApps', sessions: ['apiwork', 'muxplex'] },
+  ],
+};
+
+test('searchSessions returns [] for empty/whitespace query', () => {
+  assert.deepStrictEqual(app.searchSessions('', ussSessions, ussSettings), []);
+  assert.deepStrictEqual(app.searchSessions('   ', ussSessions, ussSettings), []);
+});
+
+test('searchSessions matches name partially and case-insensitively', () => {
+  const r = app.searchSessions('MUX', ussSessions, ussSettings);
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].session.name, 'muxplex');
+  assert.ok(r[0].matchedFields.includes('name'));
+});
+
+test('searchSessions matches cwd leaf and git repo', () => {
+  const byDir = app.searchSessions('cw-manage', ussSessions, ussSettings);
+  assert.strictEqual(byDir[0].session.name, 'apiwork');
+  assert.ok(byDir[0].matchedFields.includes('dir'));
+  assert.ok(byDir[0].matchedFields.includes('repo'));
+
+  const byRepo = app.searchSessions('ngfw', ussSessions, ussSettings);
+  assert.strictEqual(byRepo[0].session.name, 'firewall');
+  assert.deepStrictEqual(byRepo[0].matchedFields, ['repo']);
+});
+
+test('searchSessions expands view-name (tag) matches to member sessions', () => {
+  const r = app.searchSessions('secops', ussSessions, ussSettings);
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].session.name, 'firewall');
+  assert.ok(r[0].matchedFields.includes('tag'));
+  assert.deepStrictEqual(r[0].tags, ['SecOps']);
+});
+
+test('searchSessions includes hidden sessions flagged, excludes status sentinels', () => {
+  const r = app.searchSessions('scratch', ussSessions, ussSettings);
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].hidden, true, 'hidden session is returned, flagged');
+  assert.deepStrictEqual(app.searchSessions('ghost', ussSessions, ussSettings), [],
+    'status sentinel must never match');
+});
+
+test('searchSessions ranks name-prefix > name-substring > dir > repo > tag', () => {
+  const sessions = [
+    { name: 'zz-api',   cwdLeaf: 'x', gitRepo: 'x', snapshot: '' },       // name substring
+    { name: 'apifirst', cwdLeaf: 'x', gitRepo: 'x', snapshot: '' },       // name prefix
+    { name: 'bydir',    cwdLeaf: 'api-dir', gitRepo: 'x', snapshot: '' }, // dir
+    { name: 'byrepo',   cwdLeaf: 'x', gitRepo: 'api-repo', snapshot: '' },// repo
+    { name: 'bytag',    cwdLeaf: 'x', gitRepo: 'x', snapshot: '' },       // tag only
+  ];
+  const settings = { hidden_sessions: [], views: [{ name: 'api-team', sessions: ['bytag'] }] };
+  const r = app.searchSessions('api', sessions, settings);
+  assert.deepStrictEqual(r.map(x => x.session.name),
+    ['apifirst', 'zz-api', 'bydir', 'byrepo', 'bytag']);
+});
+
+test('searchSessions dedups multi-field matches into one row', () => {
+  const r = app.searchSessions('muxplex', ussSessions, ussSettings);
+  assert.strictEqual(r.length, 1, 'name+dir+repo match must yield one row');
+  assert.deepStrictEqual(r[0].matchedFields.sort(), ['dir', 'name', 'repo']);
+});
+
+test('searchSessions tolerates sessions without cwd/git metadata (old remotes)', () => {
+  const r = app.searchSessions('legacy', [{ name: 'legacy-box', snapshot: '' }], { views: [] });
+  assert.strictEqual(r.length, 1);
+  assert.deepStrictEqual(r[0].matchedFields, ['name']);
+});
+
+test('handleGlobalKeydown: "/" opens overview search only outside inputs and only in grid mode', () => {
+  const source = appSource;
+  const start = source.indexOf('function handleGlobalKeydown(');
+  const snippet = source.slice(start, start + 2200);
+  assert.ok(snippet.includes("e.key === '/'"), 'must handle the / key');
+  assert.ok(snippet.indexOf("e.key === '/'") > snippet.indexOf("_viewMode === 'grid' && !inInput"),
+    '/ handling must be inside the grid-only, not-in-input guard');
+  assert.ok(snippet.includes("openSearch('session-search-overview')"),
+    '/ must open the overview search box');
+});
+
+test('search containers exist in both headers and results menu is shared', () => {
+  const idx = fs.readFileSync(join(__dirname, '..', 'index.html'), 'utf8');
+  assert.ok(idx.includes('id="session-search-overview"'), 'overview header search container');
+  assert.ok(idx.includes('id="session-search-expanded"'), 'expanded header search container');
+  assert.strictEqual((idx.match(/id="session-search-results"/g) || []).length, 1,
+    'exactly one shared results dropdown');
+});
+
+// ============================================================================
+// Bulk multi-select → add to Views (v0.7.x)
+// docs/plans/2026-06-04-bulk-multiselect-views-design.md
+// ============================================================================
+
+test('bulkAddToViewsOp adds all keys to all views, unhiding them, in one patch', () => {
+  const settings = {
+    hidden_sessions: ['k2'],
+    views: [
+      { name: 'A', sessions: ['k1'] },
+      { name: 'B', sessions: [] },
+    ],
+  };
+  const patch = app.bulkAddToViewsOp(settings, ['A', 'B'], ['k1', 'k2', 'k3']);
+  assert.deepStrictEqual(patch.views[0].sessions, ['k1', 'k2', 'k3'], 'no duplicate for existing member k1');
+  assert.deepStrictEqual(patch.views[1].sessions, ['k1', 'k2', 'k3']);
+  assert.deepStrictEqual(patch.hidden_sessions, [], 'add implies unhide');
+  // Source settings untouched (pure op on a clone)
+  assert.deepStrictEqual(settings.views[1].sessions, []);
+  assert.deepStrictEqual(settings.hidden_sessions, ['k2']);
+});
+
+test('bulkHideOp hides all keys and removes them from every view', () => {
+  const settings = {
+    hidden_sessions: [],
+    views: [
+      { name: 'A', sessions: ['k1', 'k2'] },
+      { name: 'B', sessions: ['k2', 'k3'] },
+    ],
+  };
+  const patch = app.bulkHideOp(settings, ['k1', 'k2']);
+  assert.deepStrictEqual(patch.hidden_sessions, ['k1', 'k2']);
+  assert.deepStrictEqual(patch.views[0].sessions, []);
+  assert.deepStrictEqual(patch.views[1].sessions, ['k3']);
+  assert.deepStrictEqual(settings.views[0].sessions, ['k1', 'k2'], 'source untouched');
+});
+
+test('grid tile click toggles selection instead of opening in select mode (source contract)', () => {
+  const start = appSource.indexOf("document.querySelectorAll('.session-tile').forEach");
+  assert.ok(start !== -1);
+  const snippet = appSource.slice(start, start + 1700);
+  assert.ok(snippet.includes('_selectMode') && snippet.includes('_toggleTileSelection(tile)'),
+    'tile click handler must branch on _selectMode before openSession');
+  assert.ok(snippet.indexOf('_toggleTileSelection') < snippet.indexOf('openSession(tile.dataset.session'),
+    'selection branch must come before the open call');
+  assert.ok(snippet.includes('session-tile--selected'),
+    'selection highlight must be reapplied across poll re-renders');
+});
+
+test('manage-view panel batches checkbox changes and applies them in one PATCH', () => {
+  // onchange records pending; no api() call inside the change handler
+  const onchangeStart = appSource.indexOf('// Delegated change handler — BATCHED');
+  assert.ok(onchangeStart !== -1, 'batched change handler comment must exist');
+  const onchangeSnippet = appSource.slice(onchangeStart, onchangeStart + 700);
+  assert.ok(onchangeSnippet.includes('_managePending[sessionKey]'), 'pending map records changes');
+  assert.ok(!onchangeSnippet.includes("api('PATCH'"), 'no immediate PATCH on checkbox change');
+  // Apply composes ops and PATCHes once
+  const applyStart = appSource.indexOf('function _applyManagePending(');
+  assert.ok(applyStart !== -1);
+  const applySnippet = appSource.slice(applyStart, applyStart + 1800);
+  assert.strictEqual((applySnippet.match(/api\('PATCH', '\/api\/settings'/g) || []).length, 1,
+    'apply must issue exactly one settings PATCH');
+  assert.ok(applySnippet.includes('_opUnhide'), 'apply preserves add-implies-unhide invariant');
+});
+
+test('openManageViewPanel accepts a target view; settings-tab Manage no longer switches views', () => {
+  assert.ok(appSource.includes('function openManageViewPanel(viewName)'),
+    'openManageViewPanel must take a viewName param');
+  const manageActionStart = appSource.indexOf("getAttribute('data-action') === 'manage'");
+  const manageSnippet = appSource.slice(manageActionStart, manageActionStart + 420);
+  assert.ok(manageSnippet.includes('openManageViewPanel(viewName)'),
+    'settings-tab manage must open the panel for that view');
+  assert.ok(!manageSnippet.includes('switchView('),
+    'settings-tab manage must NOT switch the active view');
+});
+
+test('search results carry a selection checkbox and bulk view chips (source contract)', () => {
+  const itemStart = appSource.indexOf('function _searchItemHTML(');
+  const itemSnippet = appSource.slice(itemStart, itemStart + 2200);
+  assert.ok(itemSnippet.includes('session-search-results__cb'), 'result rows include a checkbox');
+  assert.ok(itemSnippet.includes("'<div class=") || itemSnippet.includes('"<div class='),
+    'row container must be a div (buttons cannot nest inputs)');
+  const footerStart = appSource.indexOf('function _searchFooterHTML(');
+  assert.ok(footerStart !== -1, 'footer builder must exist');
+  const footerSnippet = appSource.slice(footerStart, footerStart + 1200);
+  assert.ok(footerSnippet.includes('data-bulk-view'), 'footer renders per-view bulk chips');
+});
+
+test('searchSessions slim sessions expose key for bulk identity', () => {
+  const r = app.searchSessions('web', [
+    { name: 'web', sessionKey: 'dev1:web', remoteId: 'dev1', snapshot: '' },
+    { name: 'web2', snapshot: '' },
+  ], { views: [] });
+  const keys = r.map(x => x.session.key).sort();
+  assert.deepStrictEqual(keys, ['dev1:web', 'web2']);
+});
+
+test('Escape exits grid select mode (source contract)', () => {
+  const start = appSource.indexOf('function handleGlobalKeydown(');
+  const snippet = appSource.slice(start, start + 2600);
+  assert.ok(snippet.includes("e.key === 'Escape' && _selectMode"),
+    'Escape must exit select mode in the grid');
 });

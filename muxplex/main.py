@@ -51,10 +51,14 @@ from muxplex.bells import apply_bell_clear_rule, process_bell_flags
 from muxplex.sessions import (
     enumerate_sessions,
     get_session_list,
+    get_session_paths,
     get_snapshots,
+    list_session_paths,
+    resolve_git_repo,
     run_tmux,
     snapshot_all,
     update_session_cache,
+    update_session_paths,
 )
 from muxplex.state import (
     empty_bell,
@@ -185,6 +189,12 @@ async def _run_poll_cycle() -> None:
         # 2. Capture pane snapshots and update in-memory snapshot cache
         new_snapshots = await snapshot_all(names)
         update_session_cache(names, new_snapshots)
+
+        # 2b. Refresh active-pane cwd per session (universal search metadata)
+        try:
+            update_session_paths(await list_session_paths())
+        except Exception:
+            _log.exception("session-path refresh error")
 
         # 3. Load current persisted state
         state = load_state()
@@ -578,6 +588,19 @@ async def patch_state(patch: StatePatch) -> dict:
         return state
 
 
+def _session_path_fields(name: str, paths: dict[str, str]) -> dict:
+    """cwd / cwdLeaf / gitRepo fields for a session (universal search metadata).
+
+    All three are None when the session's active-pane cwd is unknown (tmux
+    briefly unavailable, or the cache hasn't refreshed yet).
+    """
+    cwd = paths.get(name)
+    if not cwd:
+        return {"cwd": None, "cwdLeaf": None, "gitRepo": None}
+    leaf = os.path.basename(cwd.rstrip("/")) or cwd
+    return {"cwd": cwd, "cwdLeaf": leaf, "gitRepo": resolve_git_repo(cwd)}
+
+
 @app.get("/api/sessions")
 async def get_sessions() -> list[dict]:
     """Return list of sessions with name, sessionKey, snapshot, and bell data.
@@ -594,19 +617,20 @@ async def get_sessions() -> list[dict]:
     snapshots = get_snapshots()
     state = await read_state()
     device_id = load_device_id()
+    paths = get_session_paths()
 
     result = []
     for name in names:
         session_state = state.get("sessions", {}).get(name, {})
         bell = session_state.get("bell", empty_bell())
-        result.append(
-            {
-                "name": name,
-                "sessionKey": f"{device_id}:{name}",
-                "snapshot": snapshots.get(name, ""),
-                "bell": bell,
-            }
-        )
+        item = {
+            "name": name,
+            "sessionKey": f"{device_id}:{name}",
+            "snapshot": snapshots.get(name, ""),
+            "bell": bell,
+        }
+        item.update(_session_path_fields(name, paths))
+        result.append(item)
     return result
 
 
@@ -1338,21 +1362,22 @@ async def federation_sessions(request: Request) -> list[dict]:
     names = get_session_list()
     snapshots = get_snapshots()
     state = await read_state()
+    local_paths = get_session_paths()
     local_sessions: list[dict] = []
     for name in names:
         session_state = state.get("sessions", {}).get(name, {})
         bell = session_state.get("bell", empty_bell())
-        local_sessions.append(
-            {
-                "name": name,
-                "snapshot": snapshots.get(name, ""),
-                "bell": bell,
-                "deviceId": local_device_id,
-                "deviceName": local_device_name,
-                "remoteId": None,
-                "sessionKey": f"{local_device_id}:{name}",
-            }
-        )
+        local_item = {
+            "name": name,
+            "snapshot": snapshots.get(name, ""),
+            "bell": bell,
+            "deviceId": local_device_id,
+            "deviceName": local_device_name,
+            "remoteId": None,
+            "sessionKey": f"{local_device_id}:{name}",
+        }
+        local_item.update(_session_path_fields(name, local_paths))
+        local_sessions.append(local_item)
 
     if not remote_instances:
         return local_sessions

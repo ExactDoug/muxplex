@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.7.3 (2026-06-04)
+
+### Features
+
+- **Bulk multi-select → add to Views**, on three surfaces:
+  - **Grid select mode** — a ☑ toggle in the main header makes tiles
+    checkbox-selectable (click toggles a highlight instead of opening); a floating
+    action bar offers `Add to View ▾` (selection kept, so the same set can go into a
+    second view), `Hide`, and `Done` (Escape also exits). One settings write per action
+    regardless of how many sessions are selected.
+  - **Manage View panel** — checkbox changes are now **batched**: an `Apply (N)` button
+    commits everything in a single update (Close discards). The panel can be opened for
+    **any view directly** from Settings → Views without switching the active view first;
+    rename/delete inside the panel only touch the active view when it is the one being
+    managed.
+  - **Search-results multi-select** — universal-search rows now carry checkboxes; with a
+    selection, a footer shows `+ ViewName` chips — search a pattern, check the matches,
+    one click tags them all.
+  - Bulk adds preserve the add-implies-unhide invariant; bulk hide removes sessions from
+    all views (same semantics as single-session operations).
+
+## v0.7.2 (2026-06-04)
+
+### Features
+
+- **Universal session search** — a 🔍 control in both headers (right of the wordmark on
+  the main page; right of the sidebar toggle in the terminal view). Typing drops down
+  sessions matching — partially, case-insensitively — the **session name**, the **cwd
+  top-leaf directory**, the **git repo name**, or a **view/tag name** (a matching view
+  expands to its member sessions, each shown with the view as a tag chip). Hidden
+  sessions are included with a `hidden` badge; rows show match badges (`dir:`, `repo:`),
+  device badges, and activity dots. `/` focuses search on the main page (never
+  intercepted inside the terminal); ArrowUp/Down + Enter navigate, Escape closes. One
+  click switches to the session.
+- **Session metadata for search** — `/api/sessions` (and federation payloads) now carry
+  `cwd`, `cwdLeaf`, and `gitRepo` per session: the active pane's working directory is
+  read with a single `tmux list-panes` call per poll cycle, and the repo name resolves
+  via a memoized pure-Python `.git` walk-up (no git subprocess).
+
+## v0.7.1 (2026-06-04)
+
+### Features
+
+- **New-session button in the expanded header** — the terminal view's header now has the
+  same `+` control as the main page (far right, next to settings), so new sessions can be
+  created without leaving the current session.
+- **Views picker on session creation** — the new-session element (header `+` buttons,
+  sidebar `+ New`, and the mobile FAB) now includes a Views dropdown of checkboxes, so a
+  session can be assigned to one or more views/tags at creation time. The active user
+  view is pre-checked (matching the previous auto-add behaviour); unchecking it is now
+  possible, and all selected views are written in a single settings update.
+
 ## v0.7.0 (2026-06-04)
 
 ### Bug Fixes

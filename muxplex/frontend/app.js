@@ -357,6 +357,7 @@ async function pollSessions() {
     renderViewPills();
     renderSidebar(sessions, _viewingSession, _viewingRemoteId);
     renderExpandedHeaderPills();
+    if (_searchOpenFor) renderSearchResults(); // keep open results live
     handleBellTransitions(prev, sessions);
     updateSessionPill(sessions);
     updateFaviconBadge();
@@ -1564,14 +1565,14 @@ function renderViewsSettingsTab() {
       return;
     }
 
-    // Manage: close settings, switch to that view, open Manage View panel
+    // Manage: close settings and open the Manage View panel for that view
+    // directly — WITHOUT switching the active view (bulk-multiselect design)
     if (target.getAttribute('data-action') === 'manage') {
       var idx = parseInt(target.getAttribute('data-idx'), 10);
       var viewName = views[idx] && views[idx].name;
       if (!viewName) return;
       closeSettings();
-      switchView(viewName);
-      openManageViewPanel();
+      openManageViewPanel(viewName);
       return;
     }
 
@@ -1757,17 +1758,24 @@ function renderGrid(sessions) {
 
   // Bind interaction handlers on each tile
   document.querySelectorAll('.session-tile').forEach(function(tile) {
+    // Select mode: reapply the selection highlight across poll re-renders
+    if (_selectMode && tile.dataset && _selectedKeys[tile.dataset.sessionKey || tile.dataset.session]) {
+      tile.classList.add('session-tile--selected');
+    }
     on(tile, 'click', (e) => {
       // Don't navigate when clicking the options button inside the tile
       if (e.target.closest && e.target.closest('.tile-options-btn')) return;
       // Don't open error/status tiles (unreachable, auth_failed)
       if (tile.classList.contains('source-tile--error') || !tile.dataset.session) return;
+      // Select mode: click toggles selection instead of opening
+      if (_selectMode) { _toggleTileSelection(tile); return; }
       openSession(tile.dataset.session, { remoteId: tile.dataset.remoteId || '' });
     });
     on(tile, 'keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') {
         // Don't open error/status tiles (unreachable, auth_failed)
         if (tile.classList.contains('source-tile--error') || !tile.dataset.session) return;
+        if (_selectMode) { _toggleTileSelection(tile); return; }
         openSession(tile.dataset.session, { remoteId: tile.dataset.remoteId || '' });
       }
     });
@@ -2508,8 +2516,15 @@ function _executeKill(name, remoteId) {
  * Only available for user views (not "All" or "Hidden").
  * Renders the view name (clickable to rename) and a delete button in the header.
  */
-function openManageViewPanel() {
-  if (_activeView === 'all' || _activeView === 'hidden') return;
+function openManageViewPanel(viewName) {
+  // Manage *viewName* when given; otherwise keep the already-managed view
+  // (re-renders during rename) or fall back to the active view.
+  _manageViewTarget = viewName || _manageViewTarget || _activeView;
+  if (_manageViewTarget === 'all' || _manageViewTarget === 'hidden') {
+    _manageViewTarget = null;
+    return;
+  }
+  _managePending = {};
 
   var panel = $('manage-view-panel');
   if (!panel) return;
@@ -2518,27 +2533,32 @@ function openManageViewPanel() {
   var nameRow = panel.querySelector('.manage-view-panel__name-row');
   if (nameRow) {
     nameRow.innerHTML =
-      '<h2 id="manage-view-name" class="manage-view-panel__name">' + escapeHtml(_activeView) + '</h2>' +
+      '<h2 id="manage-view-name" class="manage-view-panel__name">' + escapeHtml(_manageViewTarget) + '</h2>' +
       '<button id="manage-view-delete-btn" class="manage-view-panel__delete-btn" ' +
         'title="Delete this view" aria-label="Delete view">\u2715</button>';
   }
 
   renderManageViewList();
+  _updateManageApplyBtn();
   panel.classList.remove('hidden');
 
-  // Close on backdrop click
+  // Close on backdrop click (discards pending changes)
   var backdrop = $('manage-view-backdrop');
   if (backdrop) backdrop.onclick = closeManageViewPanel;
 
-  // Close button at bottom
+  // Close button at bottom (discards pending changes)
   var closeBtn = $('manage-view-close');
   if (closeBtn) closeBtn.onclick = closeManageViewPanel;
+
+  // Apply button — commits all pending checkbox changes in ONE PATCH
+  var applyBtn = $('manage-view-apply');
+  if (applyBtn) applyBtn.onclick = _applyManagePending;
 
   // — Rename click handler on the view name —
   var nameEl = $('manage-view-name');
   if (nameEl) {
     nameEl.onclick = function() {
-      var currentName = _activeView;
+      var currentName = _manageViewTarget;
       // Replace h2 with an inline input for rename
       var input = document.createElement('input');
       input.type = 'text';
@@ -2572,8 +2592,13 @@ function openManageViewPanel() {
         api('PATCH', '/api/settings', { views: updatedViews })
           .then(function() {
             if (_serverSettings) _serverSettings.views = updatedViews;
-            _activeView = newName;
-            api('PATCH', '/api/state', { active_view: newName }).catch(function() {});
+            // Only retarget the ACTIVE view when it is the one being renamed —
+            // the panel can manage a view that is not active.
+            if (_activeView === currentName) {
+              _activeView = newName;
+              api('PATCH', '/api/state', { active_view: newName }).catch(function() {});
+            }
+            _manageViewTarget = newName;
             renderViewDropdown();
             openManageViewPanel();
           })
@@ -2623,14 +2648,15 @@ function openManageViewPanel() {
       var noBtn = $('manage-view-confirm-no');
       if (yesBtn) {
         yesBtn.onclick = function() {
-          var viewToDelete = _activeView;
+          var viewToDelete = _manageViewTarget || _activeView;
           var views = (_serverSettings && _serverSettings.views) || [];
           var updatedViews = views.filter(function(v) { return v.name !== viewToDelete; });
           api('PATCH', '/api/settings', { views: updatedViews })
             .then(function() {
               if (_serverSettings) _serverSettings.views = updatedViews;
               closeManageViewPanel();
-              switchView('all');
+              // Only leave the current view when IT was the one deleted
+              if (_activeView === viewToDelete) switchView('all');
               showToast('View \'' + viewToDelete + '\' deleted');
               renderViewDropdown();
             })
@@ -2645,11 +2671,60 @@ function openManageViewPanel() {
 }
 
 /**
- * Close the Manage View panel.
+ * Close the Manage View panel. Discards any pending (un-applied) checkbox
+ * changes and clears the managed-view target.
  */
 function closeManageViewPanel() {
+  _manageViewTarget = null;
+  _managePending = {};
   var panel = $('manage-view-panel');
   if (panel) panel.classList.add('hidden');
+}
+
+/** Enable/disable + label the Apply button from the pending-changes count. */
+function _updateManageApplyBtn() {
+  var btn = $('manage-view-apply');
+  if (!btn) return;
+  var n = Object.keys(_managePending).length;
+  btn.textContent = n > 0 ? 'Apply (' + n + ')' : 'Apply';
+  btn.disabled = n === 0;
+}
+
+/** Commit all pending Manage View checkbox changes in ONE PATCH. */
+function _applyManagePending() {
+  var target = _manageViewTarget || _activeView;
+  var keys = Object.keys(_managePending);
+  if (keys.length === 0 || !target || target === 'all' || target === 'hidden') return;
+
+  var state = _cloneOpState(_serverSettings);
+  for (var i = 0; i < keys.length; i++) {
+    if (_managePending[keys[i]]) {
+      // add-implies-unhide, same invariant as addSessionToViewOp
+      _opUnhide(state, keys[i]);
+      _opAddMembership(state, target, keys[i]);
+    } else {
+      _opRemoveMembership(state, target, keys[i]);
+    }
+  }
+  var patch = { hidden_sessions: state.hidden_sessions, views: state.views };
+  var count = keys.length;
+  api('PATCH', '/api/settings', patch)
+    .then(function() {
+      if (_serverSettings) {
+        _serverSettings.views = patch.views;
+        _serverSettings.hidden_sessions = patch.hidden_sessions;
+      }
+      _managePending = {};
+      _updateManageApplyBtn();
+      renderManageViewList();
+      renderGrid(_currentSessions || []);
+      renderViewPills();
+      showToast('Applied ' + count + ' change' + (count === 1 ? '' : 's'));
+    })
+    .catch(function(err) {
+      showToast('Couldn’t save — try again');
+      console.warn('[manage-view apply] PATCH failed:', err);
+    });
 }
 
 /**
@@ -2664,12 +2739,16 @@ function renderManageViewList() {
   var summaryEl = $('manage-view-summary');
   if (!listEl) return;
 
+  // Manage the panel's target view (falls back to the active view so direct
+  // callers — and pre-target code paths — keep working).
+  var targetView = _manageViewTarget || _activeView;
+
   var views = (_serverSettings && _serverSettings.views) || [];
 
-  // Find the active view's session list
+  // Find the managed view's session list
   var activeViewObj = null;
   for (var i = 0; i < views.length; i++) {
-    if (views[i].name === _activeView) {
+    if (views[i].name === targetView) {
       activeViewObj = views[i];
       break;
     }
@@ -2684,7 +2763,7 @@ function renderManageViewList() {
 
   // Update summary line
   if (summaryEl) {
-    summaryEl.textContent = allSessions.length + ' sessions · ' + visibleCount(_currentSessions, _serverSettings, _activeView, { includeHidden: true }) + ' in this view';
+    summaryEl.textContent = allSessions.length + ' sessions · ' + visibleCount(_currentSessions, _serverSettings, targetView, { includeHidden: true }) + ' in this view';
   }
 
   // Partition into inView (checked first) and notInView
@@ -2716,6 +2795,8 @@ function renderManageViewList() {
     var s = sorted[j];
     var key = s.sessionKey || s.name;
     var isInView = viewSessions.indexOf(key) !== -1 || viewSessions.indexOf(s.name) !== -1;
+    // Pending (un-applied) change overrides the stored membership state
+    var shown = Object.prototype.hasOwnProperty.call(_managePending, key) ? _managePending[key] : isInView;
     // Phase 5: use the isHidden() helper (Phase 1) — do not inline a hidden check here.
     // The manage-view-item--hidden class triggers opacity + CSS ::after "(hidden)" badge.
     var sessionIsHidden = isHidden(key, _serverSettings);
@@ -2723,7 +2804,7 @@ function renderManageViewList() {
     var deviceName = escapeHtml(_getDeviceDisplayName(s) || '');
 
     html += '<label class="manage-view-item' + (sessionIsHidden ? ' manage-view-item--hidden' : '') + '">';
-    html += '<input type="checkbox" class="manage-view-item__checkbox" data-session-key="' + escapeHtml(key) + '"' + (isInView ? ' checked' : '') + (sessionIsHidden ? ' data-is-hidden="1"' : '') + ' />';
+    html += '<input type="checkbox" class="manage-view-item__checkbox" data-session-key="' + escapeHtml(key) + '" data-orig-checked="' + (isInView ? '1' : '0') + '"' + (shown ? ' checked' : '') + (sessionIsHidden ? ' data-is-hidden="1"' : '') + ' />';
     html += '<span class="manage-view-item__name">' + escapedName + '</span>';
     if (deviceName) html += '<span class="manage-view-item__device">' + deviceName + '</span>';
     html += '</label>';
@@ -2734,45 +2815,20 @@ function renderManageViewList() {
 
   listEl.innerHTML = html;
 
-  // Delegated change handler for immediate-commit checkboxes
+  // Delegated change handler — BATCHED: checkbox toggles accumulate in
+  // _managePending and are committed by the Apply button in one PATCH.
+  // Toggling a box back to its original state removes the pending entry.
   listEl.onchange = function(e) {
     var cb = e.target.closest('.manage-view-item__checkbox');
     if (!cb) return;
     var sessionKey = cb.dataset.sessionKey;
-    var isChecked = cb.checked;
-
-    var patch;
-    if (isChecked) {
-      patch = addSessionToViewOp(_serverSettings, _activeView, sessionKey);
+    var orig = cb.dataset.origChecked === '1';
+    if (cb.checked === orig) {
+      delete _managePending[sessionKey];
     } else {
-      patch = removeSessionFromViewOp(_serverSettings, _activeView, sessionKey);
+      _managePending[sessionKey] = cb.checked;
     }
-
-    api('PATCH', '/api/settings', patch)
-      .then(function() {
-        if (_serverSettings) {
-          _serverSettings.views = patch.views;
-          if (patch.hidden_sessions) _serverSettings.hidden_sessions = patch.hidden_sessions;
-        }
-        // Update summary count in-place — do NOT re-render the full list (avoids layout thrash)
-        var summaryEl = $('manage-view-summary');
-        if (summaryEl) {
-          var latestViews = (_serverSettings && _serverSettings.views) || [];
-          var latestViewObj = null;
-          for (var si = 0; si < latestViews.length; si++) {
-            if (latestViews[si].name === _activeView) { latestViewObj = latestViews[si]; break; }
-          }
-          var latestViewSessions = (latestViewObj && latestViewObj.sessions) || [];
-          var latestAllSessions = (_currentSessions || []).filter(function(s) { return !s.status; });
-          summaryEl.textContent = latestAllSessions.length + ' sessions \u00b7 ' + latestViewSessions.length + ' in this view';
-        }
-        renderGrid(_currentSessions || []);
-      })
-      .catch(function(err) {
-        showToast('Couldn’t save — try again');
-        if (cb) cb.checked = !isChecked;
-        console.warn('[renderManageViewList] PATCH failed:', err);
-      });
+    _updateManageApplyBtn();
   };
 }
 
@@ -3593,6 +3649,427 @@ function _epCloseMenu() {
   }
 }
 
+// ─── Universal session search ────────────────────────────────────────────────
+// Compact search control in both headers. Matches session name, cwd leaf
+// directory, git repo name, and view (tag) names — partial, case-insensitive.
+// Design: docs/plans/2026-06-04-universal-session-search-design.md
+
+var _searchOpenFor = null;     // 'session-search-overview' | 'session-search-expanded' | null
+var _searchResults = [];       // last searchSessions() output
+var _searchActiveIndex = -1;   // keyboard-highlighted row
+
+// Match ranks: lower = better. Grouped ordering in the dropdown.
+var SEARCH_RANKS = { namePrefix: 0, name: 1, dir: 2, repo: 3, tag: 4 };
+
+/**
+ * Pure search over the in-memory session list. No network, no DOM.
+ *
+ * @param {string} query - raw input value
+ * @param {object[]} sessions - poll payload sessions
+ * @param {object} settings - server settings (views, hidden_sessions)
+ * @returns {Array<{session: object, matchedFields: string[], tags: string[],
+ *   hidden: boolean, rank: number}>} sorted by rank then name. A session
+ *   matching several fields appears ONCE with all its match badges. Hidden
+ *   sessions are INCLUDED (flagged via .hidden); status sentinels never match.
+ */
+function searchSessions(query, sessions, settings) {
+  var q = (query || '').trim().toLowerCase();
+  if (!q) return [];
+
+  var hiddenList = (settings && settings.hidden_sessions) || [];
+  var views = (settings && settings.views) || [];
+  function keyOf(s) { return s.sessionKey || s.name; }
+  function isHiddenS(s) {
+    return hiddenList.indexOf(keyOf(s)) !== -1 || hiddenList.indexOf(s.name) !== -1;
+  }
+  function inView(v, s) {
+    var members = v.sessions || [];
+    return members.indexOf(keyOf(s)) !== -1 || members.indexOf(s.name) !== -1;
+  }
+
+  // Views whose NAME matches the query — their members match via 'tag'
+  var matchingViews = views.filter(function (v) {
+    return (v.name || '').toLowerCase().indexOf(q) !== -1;
+  });
+
+  var out = [];
+  var live = (sessions || []).filter(function (s) { return !s.status; });
+  for (var i = 0; i < live.length; i++) {
+    var s = live[i];
+    var name = (s.name || '').toLowerCase();
+    var dir = (s.cwdLeaf || '').toLowerCase();
+    var repo = (s.gitRepo || '').toLowerCase();
+
+    var matchedFields = [];
+    var rank = Infinity;
+    if (name.indexOf(q) === 0) {
+      matchedFields.push('name');
+      rank = SEARCH_RANKS.namePrefix;
+    } else if (name.indexOf(q) !== -1) {
+      matchedFields.push('name');
+      rank = SEARCH_RANKS.name;
+    }
+    if (dir && dir.indexOf(q) !== -1) {
+      matchedFields.push('dir');
+      rank = Math.min(rank, SEARCH_RANKS.dir);
+    }
+    if (repo && repo.indexOf(q) !== -1) {
+      matchedFields.push('repo');
+      rank = Math.min(rank, SEARCH_RANKS.repo);
+    }
+    var tags = [];
+    for (var vi = 0; vi < matchingViews.length; vi++) {
+      if (inView(matchingViews[vi], s)) tags.push(matchingViews[vi].name);
+    }
+    if (tags.length > 0) {
+      matchedFields.push('tag');
+      rank = Math.min(rank, SEARCH_RANKS.tag);
+    }
+
+    if (matchedFields.length === 0) continue;
+    out.push({
+      session: {
+        name: s.name,
+        key: keyOf(s),
+        remoteId: s.remoteId != null ? String(s.remoteId) : '',
+        deviceName: s.deviceName || '',
+        bell: !!(s.bell && s.bell.unseen_count > 0),
+        cwdLeaf: s.cwdLeaf || '',
+        gitRepo: s.gitRepo || '',
+      },
+      matchedFields: matchedFields,
+      tags: tags,
+      hidden: isHiddenS(s),
+      rank: rank,
+    });
+  }
+
+  out.sort(function (a, b) {
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    var an = a.session.name.toLowerCase(), bn = b.session.name.toLowerCase();
+    if (an < bn) return -1;
+    if (an > bn) return 1;
+    return a.session.deviceName < b.session.deviceName ? -1 : 1;
+  });
+  return out;
+}
+
+/** Build one search-result row. */
+function _searchItemHTML(r, index) {
+  var s = r.session;
+  var ds = getDisplaySettings();
+  var cls = 'view-dropdown__item session-search-results__item';
+  if (index === _searchActiveIndex) cls += ' session-search-results__item--active';
+  if (r.hidden) cls += ' session-search-results__item--hidden';
+
+  var badges = '';
+  if (r.matchedFields.indexOf('dir') !== -1) {
+    badges += ' <span class="search-badge">dir:' + escapeHtml(s.cwdLeaf) + '</span>';
+  }
+  if (r.matchedFields.indexOf('repo') !== -1) {
+    badges += ' <span class="search-badge">repo:' + escapeHtml(s.gitRepo) + '</span>';
+  }
+  for (var t = 0; t < r.tags.length; t++) {
+    badges += ' <span class="search-tag">' + escapeHtml(r.tags[t]) + '</span>';
+  }
+  if (r.hidden) badges += ' <span class="search-badge search-badge--hidden">hidden</span>';
+
+  var deviceBadge = '';
+  if (_serverSettings && _serverSettings.multi_device_enabled && s.deviceName && ds.showDeviceBadges !== false) {
+    deviceBadge = ' <span class="device-badge">' + escapeHtml(s.deviceName) + '</span>';
+  }
+  var bell = s.bell && ds.activityIndicator !== 'none'
+    ? '<span class="nav-pill__bell" aria-hidden="true"></span>' : '';
+
+  // div (not button): rows contain an interactive checkbox, and buttons
+  // cannot legally nest interactive content
+  var checked = _searchSelected[s.key] ? ' checked' : '';
+  return '<div class="' + cls + '" role="option" tabindex="0" data-index="' + index +
+    '" data-session="' + escapeHtml(s.name) + '" data-remote-id="' + escapeHtml(s.remoteId) +
+    '" data-key="' + escapeHtml(s.key) + '">' +
+    '<input type="checkbox" class="session-search-results__cb" data-key="' + escapeHtml(s.key) +
+    '" aria-label="Select session"' + checked + ' />' +
+    escapeHtml(s.name) + bell + deviceBadge + badges + '</div>';
+}
+
+/** Footer for the search dropdown: selection count + one "+ View" chip per
+ *  user view (7-cap). Empty string when nothing is selected. */
+function _searchFooterHTML() {
+  var selCount = Object.keys(_searchSelected).length;
+  if (selCount === 0) return '';
+  var views = ((_serverSettings && _serverSettings.views) || []).slice(0, 7);
+  var chips = '';
+  for (var i = 0; i < views.length; i++) {
+    chips += '<button class="search-bulk-chip" data-bulk-view="' + escapeHtml(views[i].name) + '">+ ' +
+      escapeHtml(views[i].name) + '</button>';
+  }
+  if (!chips) chips = '<span class="search-badge">no views yet</span>';
+  return '<div class="session-search-results__footer">' +
+    '<span class="session-search-results__footer-count">' + selCount + ' selected</span>' + chips + '</div>';
+}
+
+/** Re-render the shared results dropdown for the currently-open search box. */
+function renderSearchResults() {
+  if (!_searchOpenFor) return;
+  var menu = $('session-search-results');
+  var box = $(_searchOpenFor);
+  if (!menu || !box || typeof box.querySelector !== 'function') return;
+  var input = box.querySelector('.session-search__input');
+  if (!input) return;
+
+  _searchResults = searchSessions(input.value, _currentSessions, _serverSettings);
+  if (_searchActiveIndex >= _searchResults.length) _searchActiveIndex = _searchResults.length - 1;
+
+  if ((input.value || '').trim() === '') {
+    menu.classList.add('hidden');
+    menu.innerHTML = '';
+    return;
+  }
+
+  var html = '';
+  for (var i = 0; i < _searchResults.length; i++) html += _searchItemHTML(_searchResults[i], i);
+  if (!html) html = '<div class="view-dropdown__item" aria-disabled="true">No matches</div>';
+  html += _searchFooterHTML();
+  menu.innerHTML = html;
+  menu.classList.remove('hidden');
+
+  // Fixed-position under the input (shared menu escapes header overflow)
+  if (menu.style && typeof input.getBoundingClientRect === 'function') {
+    var rect = input.getBoundingClientRect();
+    var left = rect.left;
+    if (window.innerWidth) left = Math.min(left, Math.max(0, window.innerWidth - 330));
+    menu.style.top = (rect.bottom + 4) + 'px';
+    menu.style.left = left + 'px';
+  }
+}
+
+/** Open the search box inside the given container id and focus its input. */
+function openSearch(containerId) {
+  var box = $(containerId);
+  if (!box || typeof box.querySelector !== 'function') return;
+  if (_searchOpenFor && _searchOpenFor !== containerId) closeSearch();
+  _searchOpenFor = containerId;
+  _searchActiveIndex = -1;
+  var input = box.querySelector('.session-search__input');
+  if (input) {
+    input.classList.remove('hidden');
+    if (input.focus) input.focus();
+  }
+  renderSearchResults();
+}
+
+/** Close the search box (if open), clearing input, results, and selection. */
+function closeSearch() {
+  if (!_searchOpenFor) return;
+  var box = $(_searchOpenFor);
+  _searchOpenFor = null;
+  _searchActiveIndex = -1;
+  _searchResults = [];
+  _searchSelected = {};
+  if (box && typeof box.querySelector === 'function') {
+    var input = box.querySelector('.session-search__input');
+    if (input) {
+      input.value = '';
+      input.classList.add('hidden');
+    }
+  }
+  var menu = $('session-search-results');
+  if (menu) {
+    menu.classList.add('hidden');
+    menu.innerHTML = '';
+  }
+}
+
+/** Open the result at *index* (or the first when index is out of range). */
+function _searchOpenResult(index) {
+  if (_searchResults.length === 0) return;
+  var i = (index >= 0 && index < _searchResults.length) ? index : 0;
+  var s = _searchResults[i].session;
+  closeSearch();
+  if (s.name !== _viewingSession || (s.remoteId || '') !== (_viewingRemoteId || '')) {
+    openSession(s.name, { remoteId: s.remoteId });
+  }
+}
+
+/** Keydown handling for the search input (arrows / Enter / Escape). */
+function _searchInputKeydown(e) {
+  if (e.key === 'ArrowDown') {
+    if (e.preventDefault) e.preventDefault();
+    if (_searchActiveIndex < _searchResults.length - 1) _searchActiveIndex++;
+    renderSearchResults();
+  } else if (e.key === 'ArrowUp') {
+    if (e.preventDefault) e.preventDefault();
+    if (_searchActiveIndex > -1) _searchActiveIndex--;
+    renderSearchResults();
+  } else if (e.key === 'Enter') {
+    _searchOpenResult(_searchActiveIndex);
+  } else if (e.key === 'Escape') {
+    closeSearch();
+  }
+}
+
+// ─── Bulk multi-select → add to Views ────────────────────────────────────────
+// Three surfaces share two pure ops: grid select mode, batched Manage View
+// panel, and search-results multi-select.
+// Design: docs/plans/2026-06-04-bulk-multiselect-views-design.md
+
+var _selectMode = false;
+var _selectedKeys = {};      // sessionKey -> true (grid select mode)
+var _manageViewTarget = null; // view managed by the panel (decoupled from _activeView)
+var _managePending = {};     // sessionKey -> desired membership (batched panel changes)
+var _searchSelected = {};    // sessionKey -> true (search-results selection)
+
+/**
+ * Bulk user-intent op: add *keys* to each view in *viewNames*, unhiding each
+ * key (add-implies-unhide invariant, same as addSessionToViewOp). Pure —
+ * returns a {hidden_sessions, views} patch for ONE PATCH request.
+ */
+function bulkAddToViewsOp(settings, viewNames, keys) {
+  var state = _cloneOpState(settings);
+  for (var i = 0; i < keys.length; i++) {
+    _opUnhide(state, keys[i]);
+    for (var v = 0; v < viewNames.length; v++) {
+      _opAddMembership(state, viewNames[v], keys[i]);
+    }
+  }
+  return { hidden_sessions: state.hidden_sessions, views: state.views };
+}
+
+/**
+ * Bulk user-intent op: hide every key, removing each from all views (mirrors
+ * hideSessionOp). Pure — returns a {hidden_sessions, views} patch.
+ */
+function bulkHideOp(settings, keys) {
+  var state = _cloneOpState(settings);
+  for (var i = 0; i < keys.length; i++) {
+    _opHide(state, keys[i]);
+    _opRemoveFromAllViews(state, keys[i]);
+  }
+  return { hidden_sessions: state.hidden_sessions, views: state.views };
+}
+
+/** PATCH a bulk {hidden_sessions, views} patch, sync _serverSettings, and
+ *  re-render every surface that shows membership. */
+function _applyBulkPatch(patch, msg, after) {
+  return api('PATCH', '/api/settings', patch)
+    .then(function () {
+      if (_serverSettings) {
+        _serverSettings.views = patch.views;
+        _serverSettings.hidden_sessions = patch.hidden_sessions;
+      }
+      renderGrid(_currentSessions || []);
+      renderViewPills();
+      renderExpandedHeaderPills();
+      if (msg) showToast(msg);
+      if (after) after();
+    })
+    .catch(function (err) {
+      showToast('Couldn’t save — try again');
+      console.warn('[bulk] PATCH failed:', err);
+    });
+}
+
+/** Toggle grid select mode. Entering clears any previous selection. */
+function toggleSelectMode() {
+  _selectMode = !_selectMode;
+  _selectedKeys = {};
+  var btn = $('select-mode-btn');
+  if (btn && btn.classList) btn.classList.toggle('header-btn--active', _selectMode);
+  _updateBulkBar();
+  renderGrid(_currentSessions || []);
+}
+
+/** Exit select mode (Done button / Escape). */
+function exitSelectMode() {
+  if (_selectMode) toggleSelectMode();
+}
+
+/** Toggle one tile's membership in the grid selection. */
+function _toggleTileSelection(tile) {
+  var key = tile.dataset && (tile.dataset.sessionKey || tile.dataset.session);
+  if (!key) return;
+  if (_selectedKeys[key]) {
+    delete _selectedKeys[key];
+    if (tile.classList) tile.classList.remove('session-tile--selected');
+  } else {
+    _selectedKeys[key] = true;
+    if (tile.classList) tile.classList.add('session-tile--selected');
+  }
+  _updateBulkBar();
+}
+
+/** Sync the floating action bar with select-mode state + selection count. */
+function _updateBulkBar() {
+  var bar = $('bulk-action-bar');
+  if (!bar) return;
+  if (!_selectMode) {
+    bar.classList.add('hidden');
+    var menu = $('bulk-view-menu');
+    if (menu) menu.classList.add('hidden');
+    return;
+  }
+  bar.classList.remove('hidden');
+  var count = Object.keys(_selectedKeys).length;
+  var countEl = $('bulk-count');
+  if (countEl) countEl.textContent = count + ' selected';
+}
+
+/** Render the user-view list into the bulk Add-to-View dropdown. */
+function _renderBulkViewMenu() {
+  var menu = $('bulk-view-menu');
+  if (!menu) return;
+  var views = (_serverSettings && _serverSettings.views) || [];
+  var html = '';
+  for (var i = 0; i < views.length; i++) {
+    html += '<button class="view-dropdown__item" role="menuitem" data-view="' +
+      escapeHtml(views[i].name) + '">' + escapeHtml(views[i].name) + '</button>';
+  }
+  if (!html) html = '<div class="view-dropdown__item" aria-disabled="true">No views yet</div>';
+  menu.innerHTML = html;
+}
+
+/** Add the current grid selection to *viewName* (selection is kept so the
+ *  same set can be added to another view). */
+function _bulkAddSelectionToView(viewName) {
+  var keys = Object.keys(_selectedKeys);
+  if (keys.length === 0) return;
+  var patch = bulkAddToViewsOp(_serverSettings, [viewName], keys);
+  _applyBulkPatch(patch, 'Added ' + keys.length + ' to “' + viewName + '”');
+}
+
+/** Hide the current grid selection (clears it — tiles leave the grid). */
+function _bulkHideSelection() {
+  var keys = Object.keys(_selectedKeys);
+  if (keys.length === 0) return;
+  var patch = bulkHideOp(_serverSettings, keys);
+  _applyBulkPatch(patch, 'Hid ' + keys.length + ' session' + (keys.length === 1 ? '' : 's'), function () {
+    _selectedKeys = {};
+    _updateBulkBar();
+  });
+}
+
+/** Attach-once wiring for one search container (called once from the
+ *  static-listener binder — containers are static, contract #3). */
+function _bindSearchBox(containerId) {
+  var box = $(containerId);
+  if (!box || typeof box.querySelector !== 'function') return;
+  var btn = box.querySelector('.session-search__btn');
+  var input = box.querySelector('.session-search__input');
+  if (btn) {
+    btn.addEventListener('click', function () {
+      if (_searchOpenFor === containerId) closeSearch();
+      else openSearch(containerId);
+    });
+  }
+  if (input) {
+    input.addEventListener('input', function () {
+      _searchActiveIndex = -1;
+      renderSearchResults();
+    });
+    input.addEventListener('keydown', _searchInputKeydown);
+  }
+}
+
 // ─── Server settings ─────────────────────────────────────────────────────────
 
 /**
@@ -4102,6 +4579,18 @@ function handleGlobalKeydown(e) {
   }
   // View dropdown shortcuts — grid overview only, not in input, no ctrl/meta
   if (_viewMode === 'grid' && !inInput && !e.ctrlKey && !e.metaKey) {
+    // Escape exits grid select mode
+    if (e.key === 'Escape' && _selectMode) {
+      exitSelectMode();
+      return;
+    }
+    // '/' focuses the universal session search (overview only — never
+    // intercepted in the terminal view, where keys belong to the terminal)
+    if (e.key === '/') {
+      e.preventDefault();
+      openSearch('session-search-overview');
+      return;
+    }
     // Backtick toggles the view dropdown
     if (e.code === 'Backquote') {
       e.preventDefault();
@@ -4289,10 +4778,82 @@ function _createDeviceSelect() {
 }
 
 /**
- * Replace the header + button with an inline text input (and optional device
- * select) for session naming. Hides the button, inserts controls before it,
- * and focuses the input.
- * On Enter: if name is non-empty after trim, calls createNewSession(name, remoteId).
+ * Create an optional views/tags picker for new-session creation.
+ * Sessions may belong to multiple views, so this is a dropdown of
+ * checkboxes rather than a <select>. The active user view is pre-checked
+ * (preserving the legacy "auto-add to active view" behaviour as the
+ * default). Returns null when no user views exist.
+ * The returned element exposes .getSelectedViews() → string[].
+ * @returns {HTMLElement|null}
+ */
+function _createViewPicker() {
+  var views = (_serverSettings && _serverSettings.views) || [];
+  if (views.length === 0) return null;
+
+  var wrap = document.createElement('div');
+  wrap.className = 'new-session-view-picker';
+  wrap.tabIndex = -1;
+
+  var trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'new-session-view-picker__trigger';
+  trigger.setAttribute('aria-haspopup', 'true');
+  trigger.setAttribute('aria-expanded', 'false');
+
+  var menu = document.createElement('div');
+  menu.className = 'new-session-view-picker__menu hidden';
+
+  var selected = {};
+  if (_activeView !== 'all' && _activeView !== 'hidden') selected[_activeView] = true;
+
+  function selectedNames() {
+    return Object.keys(selected).filter(function (n) { return selected[n]; });
+  }
+
+  function refreshLabel() {
+    var names = selectedNames();
+    var label = names.length === 0 ? 'Views'
+      : names.length === 1 ? names[0]
+      : names.length + ' views';
+    trigger.textContent = label + ' ▾';
+  }
+
+  views.forEach(function (v) {
+    var row = document.createElement('label');
+    row.className = 'new-session-view-picker__item';
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = v.name;
+    cb.checked = !!selected[v.name];
+    cb.addEventListener('change', function () {
+      selected[v.name] = cb.checked;
+      refreshLabel();
+    });
+    row.appendChild(cb);
+    row.appendChild(document.createTextNode(' ' + v.name));
+    menu.appendChild(row);
+  });
+
+  trigger.addEventListener('click', function () {
+    var wasOpen = !menu.classList.contains('hidden');
+    menu.classList.toggle('hidden');
+    trigger.setAttribute('aria-expanded', wasOpen ? 'false' : 'true');
+  });
+
+  wrap.appendChild(trigger);
+  wrap.appendChild(menu);
+  refreshLabel();
+
+  wrap.getSelectedViews = selectedNames;
+  return wrap;
+}
+
+/**
+ * Replace the header + button with an inline text input (plus optional device
+ * select and views picker) for session naming. Hides the button, inserts
+ * controls before it, and focuses the input.
+ * On Enter: if name is non-empty after trim, calls
+ *   createNewSession(name, remoteId, selectedViews).
  * On Escape: restores the button (cleanup only).
  * On blur: delayed cleanup (150ms) to allow click handlers.
  * @param {HTMLElement} btn - The button element to replace temporarily.
@@ -4300,19 +4861,30 @@ function _createDeviceSelect() {
 function showNewSessionInput(btn) {
   const select = _createDeviceSelect();
   const input = _createSessionInput();
+  const picker = _createViewPicker();
 
   function cleanup() {
     if (select && select.parentNode) select.parentNode.removeChild(select);
+    if (picker && picker.parentNode) picker.parentNode.removeChild(picker);
     if (input.parentNode) input.parentNode.removeChild(input);
     btn.style.display = '';
+  }
+
+  function focusStillInside() {
+    var ae = document.activeElement;
+    if (ae === input) return true;
+    if (select && ae === select) return true;
+    if (picker && picker.contains && picker.contains(ae)) return true;
+    return false;
   }
 
   input.addEventListener('keydown', function (e) {
     if (e.key === 'Enter') {
       const name = input.value.trim();
       const remoteId = select ? select.value : '';
+      const viewNames = picker ? picker.getSelectedViews() : undefined;
       cleanup();
-      if (name) createNewSession(name, remoteId);
+      if (name) createNewSession(name, remoteId, viewNames);
     } else if (e.key === 'Escape') {
       cleanup();
     }
@@ -4320,8 +4892,8 @@ function showNewSessionInput(btn) {
 
   input.addEventListener('blur', function() {
     setTimeout(function() {
-      // Don't close if focus moved to the device select dropdown
-      if (select && document.activeElement === select) return;
+      // Don't close if focus moved to the device select or views picker
+      if (focusStillInside()) return;
       cleanup();
     }, 150);
   });
@@ -4329,8 +4901,7 @@ function showNewSessionInput(btn) {
   if (select) {
     select.addEventListener('blur', function() {
       setTimeout(function() {
-        // Don't close if focus moved back to the name input
-        if (document.activeElement === input) return;
+        if (focusStillInside()) return;
         cleanup();
       }, 150);
     });
@@ -4339,9 +4910,22 @@ function showNewSessionInput(btn) {
     });
   }
 
+  if (picker) {
+    picker.addEventListener('focusout', function() {
+      setTimeout(function() {
+        if (focusStillInside()) return;
+        cleanup();
+      }, 150);
+    });
+    picker.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') { cleanup(); }
+    });
+  }
+
   btn.style.display = 'none';
   if (select) btn.parentNode.insertBefore(select, btn);
   btn.parentNode.insertBefore(input, btn);
+  if (picker) btn.parentNode.insertBefore(picker, btn);
   input.focus();
 }
 
@@ -4361,21 +4945,32 @@ function showFabSessionInput() {
 
   const select = _createDeviceSelect();
   const input = _createSessionInput();
+  const picker = _createViewPicker();
 
   if (select) overlay.appendChild(select);
   overlay.appendChild(input);
+  if (picker) overlay.appendChild(picker);
 
   function cleanup() {
     if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
     if (fab) fab.style.display = '';
   }
 
+  function focusStillInside() {
+    var ae = document.activeElement;
+    if (ae === input) return true;
+    if (select && ae === select) return true;
+    if (picker && picker.contains && picker.contains(ae)) return true;
+    return false;
+  }
+
   input.addEventListener('keydown', function(e) {
     if (e.key === 'Enter') {
       const name = input.value.trim();
       const remoteId = select ? select.value : '';
+      const viewNames = picker ? picker.getSelectedViews() : undefined;
       cleanup();
-      if (name) createNewSession(name, remoteId);
+      if (name) createNewSession(name, remoteId, viewNames);
     } else if (e.key === 'Escape') {
       cleanup();
     }
@@ -4383,8 +4978,8 @@ function showFabSessionInput() {
 
   input.addEventListener('blur', function() {
     setTimeout(function() {
-      // Don't close if focus moved to the device select dropdown
-      if (select && document.activeElement === select) return;
+      // Don't close if focus moved to the device select or views picker
+      if (focusStillInside()) return;
       cleanup();
     }, 150);
   });
@@ -4392,12 +4987,23 @@ function showFabSessionInput() {
   if (select) {
     select.addEventListener('blur', function() {
       setTimeout(function() {
-        // Don't close if focus moved back to the name input
-        if (document.activeElement === input) return;
+        if (focusStillInside()) return;
         cleanup();
       }, 150);
     });
     select.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') { cleanup(); }
+    });
+  }
+
+  if (picker) {
+    picker.addEventListener('focusout', function() {
+      setTimeout(function() {
+        if (focusStillInside()) return;
+        cleanup();
+      }, 150);
+    });
+    picker.addEventListener('keydown', function(e) {
       if (e.key === 'Escape') { cleanup(); }
     });
   }
@@ -4414,9 +5020,14 @@ function showFabSessionInput() {
  * that take time to create the tmux session (e.g. cloning repos, setup scripts).
  * If auto_open_created is false in server settings, skips the auto-open.
  * @param {string} name - The session name to create.
+ * @param {string} [remoteId] - Device id for remote creation ('' = local).
+ * @param {string[]} [viewNames] - Views to add the new session to. When the
+ *   view picker was shown, this is its explicit selection (possibly empty =
+ *   none, even if a user view is active). When undefined (no picker — e.g.
+ *   no user views exist), falls back to the legacy auto-add-to-active-view.
  * @returns {Promise<void>}
  */
-async function createNewSession(name, remoteId) {
+async function createNewSession(name, remoteId, viewNames) {
   var deviceId = remoteId || '';  // Accept device_id string (was integer index in old protocol)
   try {
     var endpoint = deviceId ? '/api/federation/' + encodeURIComponent(deviceId) + '/sessions' : '/api/sessions';
@@ -4424,26 +5035,37 @@ async function createNewSession(name, remoteId) {
     const data = await res.json();
     const sessionName = data.name || name;
 
-    // Auto-add to active user view (not 'all' or 'hidden')
-    if (_activeView !== 'all' && _activeView !== 'hidden') {
+    // Add to views: explicit picker selection wins; legacy fallback is the
+    // active user view (not 'all' or 'hidden'). One PATCH for all of them.
+    var targetViewNames;
+    if (Array.isArray(viewNames)) {
+      targetViewNames = viewNames;
+    } else if (_activeView !== 'all' && _activeView !== 'hidden') {
+      targetViewNames = [_activeView];
+    } else {
+      targetViewNames = [];
+    }
+    if (targetViewNames.length > 0) {
       var views = (_serverSettings && _serverSettings.views) || [];
-      var viewIdx = -1;
-      for (var vi = 0; vi < views.length; vi++) {
-        if (views[vi].name === _activeView) { viewIdx = vi; break; }
+      var newSessionKey = remoteId ? (remoteId + ':' + sessionName) : sessionName;
+      if (!remoteId && _localDeviceId) {
+        newSessionKey = _localDeviceId + ':' + sessionName;
       }
-      if (viewIdx >= 0) {
-        var newSessionKey = remoteId ? (remoteId + ':' + sessionName) : sessionName;
-        if (!remoteId && _localDeviceId) {
-          newSessionKey = _localDeviceId + ':' + sessionName;
+      var updatedViews = JSON.parse(JSON.stringify(views));
+      var viewsChanged = false;
+      for (var vi = 0; vi < updatedViews.length; vi++) {
+        if (targetViewNames.indexOf(updatedViews[vi].name) === -1) continue;
+        updatedViews[vi].sessions = updatedViews[vi].sessions || [];
+        if (!updatedViews[vi].sessions.includes(newSessionKey)) {
+          updatedViews[vi].sessions.push(newSessionKey);
+          viewsChanged = true;
         }
-        var updatedViews = JSON.parse(JSON.stringify(views));
-        if (!updatedViews[viewIdx].sessions.includes(newSessionKey)) {
-          updatedViews[viewIdx].sessions.push(newSessionKey);
-          api('PATCH', '/api/settings', { views: updatedViews }).catch(function(err) {
-            console.warn('[createNewSession] auto-add to view failed:', err);
-          });
-          if (_serverSettings) _serverSettings.views = updatedViews;
-        }
+      }
+      if (viewsChanged) {
+        api('PATCH', '/api/settings', { views: updatedViews }).catch(function(err) {
+          console.warn('[createNewSession] add to views failed:', err);
+        });
+        if (_serverSettings) _serverSettings.views = updatedViews;
       }
     }
 
@@ -4627,6 +5249,78 @@ function bindStaticEventListeners() {
     if (e.key === 'Escape' && _expandedPillMenuFor) _epCloseMenu();
   });
 
+  // Universal session search — both header containers + shared results menu
+  _bindSearchBox('session-search-overview');
+  _bindSearchBox('session-search-expanded');
+  var searchResultsMenu = $('session-search-results');
+  if (searchResultsMenu) {
+    searchResultsMenu.addEventListener('click', function (e) {
+      // Checkbox: toggle multi-selection, don't open the session
+      var cb = e.target.closest && e.target.closest('.session-search-results__cb');
+      if (cb) {
+        var key = cb.dataset.key;
+        if (_searchSelected[key]) delete _searchSelected[key];
+        else _searchSelected[key] = true;
+        renderSearchResults();
+        return;
+      }
+      // "+ View" chip: bulk-add the selection to that view
+      var chip = e.target.closest && e.target.closest('[data-bulk-view]');
+      if (chip) {
+        var keys = Object.keys(_searchSelected);
+        if (keys.length === 0) return;
+        var viewName = chip.dataset.bulkView;
+        var patch = bulkAddToViewsOp(_serverSettings, [viewName], keys);
+        _applyBulkPatch(patch, 'Added ' + keys.length + ' to “' + viewName + '”', function () {
+          _searchSelected = {};
+          renderSearchResults();
+        });
+        return;
+      }
+      // Row body: open the session
+      var item = e.target.closest && e.target.closest('[data-session]');
+      if (!item) return;
+      _searchOpenResult(parseInt(item.dataset.index, 10));
+    });
+  }
+  // Click-outside closes the search (anywhere outside the box + results)
+  document.addEventListener('click', function (e) {
+    if (!_searchOpenFor) return;
+    if (e.target.closest && (e.target.closest('.session-search') || e.target.closest('#session-search-results'))) return;
+    closeSearch();
+  });
+
+  // Grid select mode + bulk action bar
+  on($('select-mode-btn'), 'click', toggleSelectMode);
+  on($('bulk-done-btn'), 'click', exitSelectMode);
+  on($('bulk-hide-btn'), 'click', _bulkHideSelection);
+  var bulkAddViewBtn = $('bulk-add-view-btn');
+  if (bulkAddViewBtn) {
+    on(bulkAddViewBtn, 'click', function () {
+      var menu = $('bulk-view-menu');
+      if (!menu) return;
+      var isOpen = !menu.classList.contains('hidden');
+      if (isOpen) {
+        menu.classList.add('hidden');
+        bulkAddViewBtn.setAttribute('aria-expanded', 'false');
+      } else {
+        _renderBulkViewMenu();
+        menu.classList.remove('hidden');
+        bulkAddViewBtn.setAttribute('aria-expanded', 'true');
+      }
+    });
+  }
+  var bulkViewMenu = $('bulk-view-menu');
+  if (bulkViewMenu) {
+    bulkViewMenu.addEventListener('click', function (e) {
+      var item = e.target.closest && e.target.closest('[data-view]');
+      if (!item) return;
+      bulkViewMenu.classList.add('hidden');
+      if (bulkAddViewBtn) bulkAddViewBtn.setAttribute('aria-expanded', 'false');
+      _bulkAddSelectionToView(item.dataset.view);
+    });
+  }
+
   // Sidebar view dropdown — trigger opens/closes, delegated item clicks switch view
   var sidebarViewTrigger = $('sidebar-view-dropdown-trigger');
   if (sidebarViewTrigger) on(sidebarViewTrigger, 'click', toggleSidebarViewDropdown);
@@ -4690,6 +5384,8 @@ function bindStaticEventListeners() {
 
   var newSessionBtn = $('new-session-btn');
   if (newSessionBtn) on(newSessionBtn, 'click', function() { showNewSessionInput(newSessionBtn); });
+  var newSessionBtnExpanded = $('new-session-btn-expanded');
+  if (newSessionBtnExpanded) on(newSessionBtnExpanded, 'click', function() { showNewSessionInput(newSessionBtnExpanded); });
   var sidebarNewSessionBtn = $('sidebar-new-session-btn');
   if (sidebarNewSessionBtn) on(sidebarNewSessionBtn, 'click', function() { showNewSessionInput(sidebarNewSessionBtn); });
   var newSessionFab = $('new-session-fab');
@@ -5098,6 +5794,7 @@ if (typeof module !== 'undefined' && module.exports) {
     api,
     // Header + button with inline name input
     _createDeviceSelect,
+    _createViewPicker,
     showNewSessionInput,
     showFabSessionInput,
     createNewSession,
@@ -5131,6 +5828,16 @@ if (typeof module !== 'undefined' && module.exports) {
     _epToggleMenu,
     _epCloseMenu,
     _setViewingRemoteId,
+    // Universal session search
+    searchSessions,
+    renderSearchResults,
+    openSearch,
+    closeSearch,
+    // Bulk multi-select → add to Views
+    bulkAddToViewsOp,
+    bulkHideOp,
+    toggleSelectMode,
+    exitSelectMode,
     // Manage Views settings tab
     renderViewsSettingsTab,
     _saveViewsAndRerender,
