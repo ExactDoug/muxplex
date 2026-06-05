@@ -134,7 +134,8 @@ def normalize_session_keys(settings: dict, sessions: list[dict]) -> dict:
     Idempotent: entries already in canonical form are left untouched.
     Entries that have no matching live session are also left untouched —
     they may match in the future, or they may be pruned by
-    `prune_stale_keys` (Phase 4).
+    `prune_stale_keys` (Phase 4). Duplicate entries (including duplicates
+    created by the upgrade itself) are collapsed to the first occurrence.
 
     Mutates and returns *settings*.
     """
@@ -152,12 +153,18 @@ def normalize_session_keys(settings: dict, sessions: list[dict]) -> dict:
             name_to_key.setdefault(name, key)
 
     def upgrade(entries: list[str]) -> list[str]:
+        # Dedupe while preserving first-occurrence order. Upgrading a bare
+        # name that already has a canonical sibling in the same list would
+        # otherwise produce exact duplicates (seen in the wild when a client
+        # re-added a session it could no longer match after normalization).
         result: list[str] = []
+        seen: set[str] = set()
         for entry in entries:
-            if entry in name_to_key:
-                result.append(name_to_key[entry])
-            else:
-                result.append(entry)
+            upgraded = name_to_key.get(entry, entry)
+            if upgraded in seen:
+                continue
+            seen.add(upgraded)
+            result.append(upgraded)
         return result
 
     if isinstance(settings.get("hidden_sessions"), list):

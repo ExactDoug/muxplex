@@ -5864,3 +5864,368 @@ test('v0.6.3: empty-state still appears when every device has zero visible sessi
   app._setServerSettings(null);
   app._setActiveView('all');
 });
+
+// ============================================================================
+// Expanded-header session pills (v0.7.0)
+// docs/plans/2026-06-04-expanded-header-session-pills-design.md
+// ============================================================================
+
+// --- buildExpandedPillsModel ---
+
+const epSessions = [
+  { name: 'zeta',  snapshot: '' },
+  { name: 'alpha', snapshot: '' },
+  { name: 'mike',  snapshot: '' },
+  { name: 'bravo', snapshot: '' },
+  { name: 'kilo',  snapshot: '' },
+];
+
+test('buildExpandedPillsModel returns null without a current session name', () => {
+  assert.strictEqual(app.buildExpandedPillsModel(epSessions, {}, null, ''), null);
+  assert.strictEqual(app.buildExpandedPillsModel(epSessions, {}, '', ''), null);
+});
+
+test('buildExpandedPillsModel: single home view — siblings alphabetical, current excluded', () => {
+  const settings = { views: [{ name: 'Work', sessions: ['mike', 'zeta', 'alpha'] }] };
+  const m = app.buildExpandedPillsModel(epSessions, settings, 'mike', '');
+  assert.strictEqual(m.current.name, 'mike');
+  assert.strictEqual(m.homeGroups.length, 1);
+  assert.strictEqual(m.homeGroups[0].viewName, 'Work');
+  assert.deepStrictEqual(m.homeGroups[0].sessions.map(s => s.name), ['alpha', 'zeta'],
+    'siblings sorted alphabetically, current session NOT in the group');
+  assert.strictEqual(m.otherViews.length, 0);
+  assert.deepStrictEqual(m.otherSessions.map(s => s.name), ['bravo', 'kilo'],
+    'sessions in no view land in otherSessions, alphabetical');
+});
+
+test('buildExpandedPillsModel: other views listed with full membership, empty views skipped', () => {
+  const settings = { views: [
+    { name: 'Work',  sessions: ['mike', 'zeta'] },
+    { name: 'Play',  sessions: ['bravo', 'alpha'] },
+    { name: 'Empty', sessions: [] },
+  ] };
+  const m = app.buildExpandedPillsModel(epSessions, settings, 'mike', '');
+  assert.deepStrictEqual(m.otherViews.map(v => v.viewName), ['Play'], 'empty view skipped');
+  assert.deepStrictEqual(m.otherViews[0].sessions.map(s => s.name), ['alpha', 'bravo'],
+    'other-view sessions alphabetical');
+  assert.deepStrictEqual(m.otherSessions.map(s => s.name), ['kilo']);
+});
+
+test('buildExpandedPillsModel: multi-home-view — groups in views order, sibling dedup', () => {
+  const settings = { views: [
+    { name: 'A', sessions: ['mike', 'alpha', 'kilo'] },
+    { name: 'B', sessions: ['mike', 'alpha', 'zeta'] }, // alpha also in A — dedup
+  ] };
+  const m = app.buildExpandedPillsModel(epSessions, settings, 'mike', '');
+  assert.deepStrictEqual(m.homeGroups.map(g => g.viewName), ['A', 'B']);
+  assert.deepStrictEqual(m.homeGroups[0].sessions.map(s => s.name), ['alpha', 'kilo']);
+  assert.deepStrictEqual(m.homeGroups[1].sessions.map(s => s.name), ['zeta'],
+    'alpha must not repeat in group B (deduped into its first home group)');
+});
+
+test('buildExpandedPillsModel: home view containing ONLY the current session is dropped', () => {
+  const settings = { views: [{ name: 'Solo', sessions: ['mike'] }] };
+  const m = app.buildExpandedPillsModel(epSessions, settings, 'mike', '');
+  assert.strictEqual(m.homeGroups.length, 0, 'no empty group rendered');
+});
+
+test('buildExpandedPillsModel excludes hidden sessions and status sentinels everywhere', () => {
+  const sessions = epSessions.concat([
+    { name: 'ghost', status: 'unreachable' },
+  ]);
+  const settings = {
+    hidden_sessions: ['alpha', 'kilo'],
+    views: [{ name: 'Work', sessions: ['mike', 'alpha', 'zeta'] }],
+  };
+  const m = app.buildExpandedPillsModel(sessions, settings, 'mike', '');
+  assert.deepStrictEqual(m.homeGroups[0].sessions.map(s => s.name), ['zeta'],
+    'hidden alpha excluded from its home group');
+  assert.deepStrictEqual(m.otherSessions.map(s => s.name), ['bravo'],
+    'hidden kilo and status ghost excluded from otherSessions');
+});
+
+test('buildExpandedPillsModel matches membership by sessionKey for remote sessions', () => {
+  const sessions = [
+    { name: 'web', remoteId: 'dev1', sessionKey: 'dev1:web', deviceName: 'dev1', snapshot: '' },
+    { name: 'api', remoteId: 'dev1', sessionKey: 'dev1:api', deviceName: 'dev1', snapshot: '' },
+    { name: 'web', snapshot: '' }, // local session, same name as remote
+  ];
+  const settings = { views: [{ name: 'Remote', sessions: ['dev1:web', 'dev1:api'] }] };
+  const m = app.buildExpandedPillsModel(sessions, settings, 'web', 'dev1');
+  assert.strictEqual(m.current.remoteId, 'dev1');
+  assert.deepStrictEqual(m.homeGroups[0].sessions.map(s => s.name), ['api']);
+  assert.strictEqual(m.homeGroups[0].sessions[0].remoteId, 'dev1');
+  assert.deepStrictEqual(m.otherSessions.map(s => s.remoteId), [''],
+    'the LOCAL web session is not a member of the Remote view (keyed by sessionKey)');
+});
+
+test('buildExpandedPillsModel sorts case-insensitively', () => {
+  const sessions = [
+    { name: 'Zulu', snapshot: '' }, { name: 'apple', snapshot: '' },
+    { name: 'Mango', snapshot: '' }, { name: 'cur', snapshot: '' },
+  ];
+  const settings = { views: [{ name: 'V', sessions: ['cur', 'Zulu', 'apple', 'Mango'] }] };
+  const m = app.buildExpandedPillsModel(sessions, settings, 'cur', '');
+  assert.deepStrictEqual(m.homeGroups[0].sessions.map(s => s.name), ['apple', 'Mango', 'Zulu']);
+});
+
+test('buildExpandedPillsModel applies the 7-view cap', () => {
+  const views = [];
+  for (let i = 0; i < 9; i++) views.push({ name: 'V' + i, sessions: ['s' + i] });
+  const sessions = [];
+  for (let i = 0; i < 9; i++) sessions.push({ name: 's' + i, snapshot: '' });
+  sessions.push({ name: 'cur', snapshot: '' });
+  const m = app.buildExpandedPillsModel(sessions, { views }, 'cur', '');
+  assert.strictEqual(m.otherViews.length, 7, 'only the first 7 views render');
+  assert.ok(m.otherSessions.some(s => s.name === 's7') && m.otherSessions.some(s => s.name === 's8'),
+    'sessions in capped-out views remain reachable via Other Sessions');
+});
+
+test('buildExpandedPillsModel falls back to name matching when current session not in poll data', () => {
+  const settings = { views: [{ name: 'Work', sessions: ['mike', 'alpha'] }] };
+  const m = app.buildExpandedPillsModel(
+    [{ name: 'alpha', snapshot: '' }], settings, 'mike', '');
+  assert.strictEqual(m.current.name, 'mike');
+  assert.deepStrictEqual(m.homeGroups[0].sessions.map(s => s.name), ['alpha'],
+    'home view detected by name even though "mike" is missing from the session list');
+});
+
+test('buildExpandedPillsModel marks bell state on slim sessions', () => {
+  const sessions = [
+    { name: 'cur', snapshot: '' },
+    { name: 'busy', snapshot: '', bell: { unseen_count: 2 } },
+    { name: 'calm', snapshot: '', bell: { unseen_count: 0 } },
+  ];
+  const settings = { views: [{ name: 'V', sessions: ['cur', 'busy', 'calm'] }] };
+  const m = app.buildExpandedPillsModel(sessions, settings, 'cur', '');
+  const byName = {};
+  m.homeGroups[0].sessions.forEach(s => { byName[s.name] = s.bell; });
+  assert.strictEqual(byName.busy, true);
+  assert.strictEqual(byName.calm, false);
+});
+
+// --- allocateExpandedPills ---
+
+test('allocateExpandedPills: empty groups → empty counts', () => {
+  assert.deepStrictEqual(app.allocateExpandedPills([], 100, 800, 6), []);
+});
+
+test('allocateExpandedPills: ample space fully expands every group', () => {
+  const groups = [
+    { sessionWidths: [50, 50, 50], collapsedWidth: 60 },
+    { sessionWidths: [50, 50],     collapsedWidth: 60 },
+  ];
+  assert.deepStrictEqual(app.allocateExpandedPills(groups, 100, 10000, 6), [3, 2]);
+});
+
+test('allocateExpandedPills: no space → minimum layout (all collapsed)', () => {
+  const groups = [
+    { sessionWidths: [50, 50, 50], collapsedWidth: 60 },
+    { sessionWidths: [50, 50],     collapsedWidth: 60 },
+  ];
+  assert.deepStrictEqual(app.allocateExpandedPills(groups, 100, 0, 6), [0, 0],
+    'even when the minimum overflows, one dropdown pill per group is kept (strip scrolls)');
+});
+
+test('allocateExpandedPills never leaves exactly one session in a dropdown', () => {
+  // n=3: partial states allowed are k=0 or k=1 (k ≤ n−2); from k=1 the only
+  // next step is full expansion (absorb the last TWO at once).
+  // fixed=0; min layout = collapsed 60+6 = 66. Step to k=1: +56 → 122.
+  // Full expansion from k=1: -(60+6) + (50+6)+(50+6) = +46 → 168.
+  // available=150: k=1 fits, full expansion (168) does not → counts [1], never 2.
+  const groups = [{ sessionWidths: [50, 50, 50], collapsedWidth: 60 }];
+  assert.deepStrictEqual(app.allocateExpandedPills(groups, 0, 150, 6), [1]);
+  // available=170: full expansion fits → 3 inline, no dropdown.
+  assert.deepStrictEqual(app.allocateExpandedPills(groups, 0, 170, 6), [3]);
+});
+
+test('allocateExpandedPills: a two-session group is all-or-nothing', () => {
+  // n=2 → no partial state exists (k ≤ n−2 = 0): either collapsed or both inline.
+  const groups = [{ sessionWidths: [50, 50], collapsedWidth: 60 }];
+  // min = 66; full = 66 - 66 + 112 = 112. available=111 → stays collapsed.
+  assert.deepStrictEqual(app.allocateExpandedPills(groups, 0, 111, 6), [0]);
+  assert.deepStrictEqual(app.allocateExpandedPills(groups, 0, 112, 6), [2]);
+});
+
+test('allocateExpandedPills expands round-robin (fair share across groups)', () => {
+  // Two groups of 4; budget allows each group ~2 inline pills + dropdowns,
+  // NOT one group hogging all the space.
+  const groups = [
+    { sessionWidths: [50, 50, 50, 50], collapsedWidth: 60 },
+    { sessionWidths: [50, 50, 50, 50], collapsedWidth: 60 },
+  ];
+  // min: 2*(60+6)=132. Each k+1 step: +56.
+  // available 360: rounds give g0:+56(188), g1:+56(244), g0:+56(300), g1:+56(356), then
+  // full-expansion steps (+46 each) don't fit → [2, 2].
+  assert.deepStrictEqual(app.allocateExpandedPills(groups, 0, 360, 6), [2, 2]);
+});
+
+test('allocateExpandedPills reclaims the dropdown width on the final step', () => {
+  // Single group n=2, wide dropdown: full expansion NET cost is small because
+  // the collapsed pill is removed.
+  const groups = [{ sessionWidths: [40, 40], collapsedWidth: 100 }];
+  // min = 106; full = 106 - 106 + 92 = 92 ≤ 100 → expands even though "adding"
+  // two pills to 106 would naively exceed 100.
+  assert.deepStrictEqual(app.allocateExpandedPills(groups, 0, 100, 6), [2]);
+});
+
+// --- renderExpandedHeaderPills (render contracts) ---
+
+function epMockDom() {
+  const nav = {
+    innerHTML: '',
+    clientWidth: 800,
+    writes: 0,
+    querySelector: () => null,
+  };
+  Object.defineProperty(nav, 'innerHTML', {
+    get() { return this._html || ''; },
+    set(v) { this._html = v; this.writes = (this.writes || 0) + 1; },
+    configurable: true,
+  });
+  const headerClasses = new Set();
+  const header = {
+    classList: {
+      add: (c) => headerClasses.add(c),
+      remove: (c) => headerClasses.delete(c),
+    },
+  };
+  return { nav, header, headerClasses };
+}
+
+test('renderExpandedHeaderPills renders current pill once, siblings, separator, Other Sessions', () => {
+  const { nav, header, headerClasses } = epMockDom();
+  const origGetById = globalThis.document.getElementById;
+  const origQs = globalThis.document.querySelector;
+  globalThis.document.getElementById = (id) => (id === 'expanded-pills' ? nav : null);
+  globalThis.document.querySelector = (sel) => (sel === '.expanded-header' ? header : null);
+
+  app._setServerSettings({ views: [
+    { name: 'A', sessions: ['cur', 'a1', 'a2'] },
+    { name: 'B', sessions: ['cur', 'b1'] },
+    { name: 'C', sessions: ['c1'] },
+  ] });
+  app._setCurrentSessions([
+    { name: 'cur', snapshot: '' }, { name: 'a1', snapshot: '' }, { name: 'a2', snapshot: '' },
+    { name: 'b1', snapshot: '' }, { name: 'c1', snapshot: '' }, { name: 'loose', snapshot: '' },
+  ]);
+  app._setViewMode('fullscreen');
+  app._setViewingSession('cur');
+  app._setViewingRemoteId('');
+
+  app.renderExpandedHeaderPills();
+
+  const html = nav.innerHTML;
+  assert.strictEqual((html.match(/nav-pill--current/g) || []).length, 1, 'current pill appears exactly once');
+  assert.ok(html.indexOf('nav-pill--current') < html.indexOf('data-session="a1"'),
+    'current pill renders before the sibling groups');
+  assert.ok(html.includes('data-session="a1"') && html.includes('data-session="a2"') && html.includes('data-session="b1"'),
+    'sibling pills for both home views present (measure widths are 0 in tests → fully expanded)');
+  assert.strictEqual((html.match(/expanded-pills__sep/g) || []).length, 1,
+    'exactly one separator between the two home groups');
+  assert.ok(html.includes('data-pill-menu="view:0"'), 'other view C renders as a dropdown pill');
+  assert.ok(html.includes('data-pill-menu="other"'), 'Other Sessions pill present');
+  assert.ok(html.includes('Other Sessions <span class="nav-pill__count">1</span>'), 'Other Sessions count = 1 (loose)');
+  assert.ok(headerClasses.has('expanded-header--pills'), 'header gets the pills class (name label hidden via CSS)');
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelector = origQs;
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  app._setServerSettings(null);
+  app._setCurrentSessions([]);
+});
+
+test('renderExpandedHeaderPills: signature guard skips the DOM write when nothing changed', () => {
+  const { nav, header } = epMockDom();
+  const origGetById = globalThis.document.getElementById;
+  const origQs = globalThis.document.querySelector;
+  globalThis.document.getElementById = (id) => (id === 'expanded-pills' ? nav : null);
+  globalThis.document.querySelector = (sel) => (sel === '.expanded-header' ? header : null);
+
+  app._setServerSettings({ views: [{ name: 'A', sessions: ['cur', 'a1'] }] });
+  app._setCurrentSessions([{ name: 'cur', snapshot: 'x' }, { name: 'a1', snapshot: 'y' }]);
+  app._setViewMode('fullscreen');
+  app._setViewingSession('cur');
+  app._setViewingRemoteId('');
+
+  app.renderExpandedHeaderPills();
+  const writesAfterFirst = nav.writes;
+  // Snapshot churn must NOT trigger a re-render (slim model ignores snapshots)
+  app._setCurrentSessions([{ name: 'cur', snapshot: 'CHANGED' }, { name: 'a1', snapshot: 'CHANGED' }]);
+  app.renderExpandedHeaderPills();
+  assert.strictEqual(nav.writes, writesAfterFirst, 'no innerHTML write when render-relevant data is unchanged');
+  // A real change (new sibling) re-renders
+  app._setCurrentSessions([{ name: 'cur', snapshot: '' }, { name: 'a1', snapshot: '' }, { name: 'a2', snapshot: '' }]);
+  app._setServerSettings({ views: [{ name: 'A', sessions: ['cur', 'a1', 'a2'] }] });
+  app.renderExpandedHeaderPills();
+  assert.strictEqual(nav.writes, writesAfterFirst + 1, 'model change triggers exactly one more write');
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelector = origQs;
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  app._setServerSettings(null);
+  app._setCurrentSessions([]);
+});
+
+test('renderExpandedHeaderPills clears the strip outside fullscreen mode', () => {
+  const { nav, header, headerClasses } = epMockDom();
+  const origGetById = globalThis.document.getElementById;
+  const origQs = globalThis.document.querySelector;
+  globalThis.document.getElementById = (id) => (id === 'expanded-pills' ? nav : null);
+  globalThis.document.querySelector = (sel) => (sel === '.expanded-header' ? header : null);
+
+  app._setServerSettings({ views: [{ name: 'A', sessions: ['cur', 'a1'] }] });
+  app._setCurrentSessions([{ name: 'cur', snapshot: '' }, { name: 'a1', snapshot: '' }]);
+  app._setViewMode('fullscreen');
+  app._setViewingSession('cur');
+  app._setViewingRemoteId('');
+  app.renderExpandedHeaderPills();
+  assert.ok(nav.innerHTML.length > 0);
+
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  app.renderExpandedHeaderPills();
+  assert.strictEqual(nav.innerHTML, '', 'strip cleared after leaving fullscreen');
+  assert.ok(!headerClasses.has('expanded-header--pills'), 'header pills class removed');
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelector = origQs;
+  app._setServerSettings(null);
+  app._setCurrentSessions([]);
+});
+
+test('_epMenuSessions resolves view/overflow/other keys against the last model', () => {
+  const { nav, header } = epMockDom();
+  const origGetById = globalThis.document.getElementById;
+  const origQs = globalThis.document.querySelector;
+  globalThis.document.getElementById = (id) => (id === 'expanded-pills' ? nav : null);
+  globalThis.document.querySelector = (sel) => (sel === '.expanded-header' ? header : null);
+
+  app._setServerSettings({ views: [
+    { name: 'Home', sessions: ['cur', 'h1', 'h2'] },
+    { name: 'Other', sessions: ['o1', 'o2'] },
+  ] });
+  app._setCurrentSessions([
+    { name: 'cur', snapshot: '' }, { name: 'h1', snapshot: '' }, { name: 'h2', snapshot: '' },
+    { name: 'o1', snapshot: '' }, { name: 'o2', snapshot: '' }, { name: 'free', snapshot: '' },
+  ]);
+  app._setViewMode('fullscreen');
+  app._setViewingSession('cur');
+  app._setViewingRemoteId('');
+  app.renderExpandedHeaderPills();
+
+  assert.deepStrictEqual(app._epMenuSessions('view:0').map(s => s.name), ['o1', 'o2']);
+  assert.deepStrictEqual(app._epMenuSessions('other').map(s => s.name), ['free']);
+  // Fully expanded in tests (0 widths) → overflow list is empty
+  assert.deepStrictEqual(app._epMenuSessions('overflow:0').map(s => s.name), []);
+  assert.deepStrictEqual(app._epMenuSessions('bogus'), []);
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelector = origQs;
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  app._setServerSettings(null);
+  app._setCurrentSessions([]);
+});

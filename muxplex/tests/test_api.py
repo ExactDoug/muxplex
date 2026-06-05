@@ -306,6 +306,24 @@ def test_get_sessions_each_item_has_required_fields(client, monkeypatch):
     assert "bell" in item
 
 
+def test_get_sessions_includes_canonical_session_key(client, monkeypatch):
+    """Each item must carry sessionKey in canonical device_id:name form.
+
+    This is the same form the background normalize cycle rewrites stored
+    view/hidden entries into. Without it, single-device clients stored bare
+    names that stopped matching after normalization — views appeared empty
+    after a hard refresh.
+    """
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha", "beta"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {})
+    monkeypatch.setattr("muxplex.main.load_device_id", lambda: "dev-uuid-1")
+
+    response = client.get("/api/sessions")
+    assert response.status_code == 200
+    items = response.json()
+    assert [i["sessionKey"] for i in items] == ["dev-uuid-1:alpha", "dev-uuid-1:beta"]
+
+
 def test_get_sessions_includes_snapshot_text(client, monkeypatch):
     """GET /api/sessions snapshot field must contain the cached capture-pane text."""
     monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["gamma"])

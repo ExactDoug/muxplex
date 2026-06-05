@@ -967,3 +967,41 @@ def test_normalize_then_prune_stale_canonical_key_is_pruned_after_grace():
     )
     assert changed is True
     assert "gone" not in settings["hidden_sessions"]
+
+
+def test_normalize_dedupes_exact_duplicates():
+    """Pre-existing exact duplicates collapse to the first occurrence."""
+    sessions = [_session("a"), _session("b")]
+    settings = {
+        "hidden_sessions": ["dev1:a", "dev1:a"],
+        "views": [{"name": "Work", "sessions": ["dev1:a", "dev1:b", "dev1:a", "dev1:b"]}],
+    }
+    result = normalize_session_keys(settings, sessions)
+    assert result["hidden_sessions"] == ["dev1:a"]
+    assert result["views"][0]["sessions"] == ["dev1:a", "dev1:b"]
+
+
+def test_normalize_dedupes_bare_name_upgraded_onto_canonical_sibling():
+    """A bare name whose upgrade collides with an existing canonical entry
+    must NOT produce a duplicate — the real-world 'views lost on hard
+    refresh' aftermath: clients re-added bare names next to the canonical
+    entries normalization had already written."""
+    sessions = [_session("a")]
+    settings = {
+        "hidden_sessions": [],
+        "views": [{"name": "Work", "sessions": ["dev1:a", "a"]}],
+    }
+    result = normalize_session_keys(settings, sessions)
+    assert result["views"][0]["sessions"] == ["dev1:a"]
+
+
+def test_normalize_dedupe_preserves_order_and_unmatched_entries():
+    sessions = [_session("a")]
+    settings = {
+        "hidden_sessions": [],
+        "views": [{"name": "Work", "sessions": ["ghost", "a", "dev1:a", "ghost"]}],
+    }
+    result = normalize_session_keys(settings, sessions)
+    # 'a' upgrades to dev1:a (first occurrence kept at its position);
+    # the later literal dev1:a and the repeated ghost are dropped.
+    assert result["views"][0]["sessions"] == ["ghost", "dev1:a"]

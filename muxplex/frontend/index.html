@@ -48,6 +48,7 @@
       <button id="back-btn" class="back-btn" aria-label="Back">&#8592;</button>
       <button id="sidebar-toggle-btn" class="sidebar-toggle-btn" aria-label="Toggle session list">&#9776;</button>
       <span id="expanded-session-name" class="expanded-session-name"></span>
+      <nav id="expanded-pills" class="expanded-pills" aria-label="Session navigation"></nav>
       <button id="settings-btn-expanded" class="header-btn" aria-label="Settings">&#9881;</button>
     </header>
     <div class="view-body">
@@ -80,6 +81,9 @@
     </div>
     <div id="reconnect-overlay" class="reconnect-overlay hidden" aria-live="polite">Reconnecting&hellip;</div>
   </div>
+
+  <!-- ── Expanded-header pill dropdown (shared, fixed-positioned) ───────── -->
+  <div id="expanded-pill-menu" class="view-dropdown__menu expanded-pill-menu hidden" role="menu" aria-label="Sessions"></div>
 
   <!-- ── Bottom sheet (session switcher) ────────────────────────────────── -->
   <div id="bottom-sheet" class="bottom-sheet hidden" role="dialog" aria-modal="true" aria-label="Switch session">
