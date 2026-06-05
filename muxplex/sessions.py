@@ -4,18 +4,24 @@ tmux session enumeration and snapshot helpers for the tmux-web muxplex.
 In-memory cache:
     _session_list  — most-recently-enumerated list of session names.
     _snapshots     — most-recently-captured pane text, keyed by session name.
+    _session_paths — active-pane cwd per session, keyed by session name.
 
 Public API:
     get_session_list()                    → list[str]
     get_snapshots()                       → dict[str, str]
+    get_session_paths()                   → dict[str, str]
     update_session_cache(names, snapshots) → None
+    update_session_paths(paths)           → None
     run_tmux(*args)                       → str   (raises RuntimeError on nonzero exit)
     enumerate_sessions()                  → list[str]
     capture_pane(name, lines)             → str
     snapshot_all(names)                   → dict[str, str]
+    list_session_paths()                  → dict[str, str]
+    resolve_git_repo(cwd)                 → str | None
 """
 
 import asyncio
+import os
 
 # ---------------------------------------------------------------------------
 # In-memory cache
@@ -23,6 +29,7 @@ import asyncio
 
 _session_list: list[str] = []
 _snapshots: dict[str, str] = {}
+_session_paths: dict[str, str] = {}
 
 
 def get_session_list() -> list[str]:
@@ -44,6 +51,20 @@ def update_session_cache(names: list[str], snapshots: dict[str, str]) -> None:
     global _session_list, _snapshots
     _session_list = list(names)
     _snapshots = snapshots
+
+
+def get_session_paths() -> dict[str, str]:
+    """Return a copy of the cached session→cwd dict."""
+    return dict(_session_paths)
+
+
+def update_session_paths(paths: dict[str, str]) -> None:
+    """Replace the cached session→cwd dict with fresh data.
+
+    Callers must pass the return value of list_session_paths().
+    """
+    global _session_paths
+    _session_paths = dict(paths)
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +135,80 @@ async def capture_pane(session_name: str, lines: int = 30) -> str:
         )
     except RuntimeError:
         return ""
+
+
+async def list_session_paths() -> dict[str, str]:
+    """Return {session_name: active-pane cwd} for all sessions.
+
+    ONE subprocess per call:
+        tmux list-panes -a -F '#{session_name}\\t#{window_active}\\t#{pane_active}\\t#{pane_current_path}'
+    keeping only rows where both the window and the pane are active (the
+    session's "current" pane). Sessions whose row can't be parsed are simply
+    omitted. Returns {} when tmux is unavailable.
+
+    Note: the cwd is split off with maxsplit on the FIRST three tabs, so paths
+    containing tabs survive; session names containing tabs do not (tmux itself
+    barely tolerates those).
+    """
+    try:
+        output = await run_tmux(
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{window_active}\t#{pane_active}\t#{pane_current_path}",
+        )
+    except (RuntimeError, FileNotFoundError):
+        return {}
+
+    paths: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) != 4:
+            continue
+        name, window_active, pane_active, path = parts
+        if window_active != "1" or pane_active != "1":
+            continue
+        if name and path:
+            paths[name] = path
+    return paths
+
+
+# Memoized cwd → git repo name (or None). Bounded: cleared when it grows past
+# _GIT_REPO_CACHE_MAX distinct directories (sessions revisit the same dirs, so
+# in practice this never cycles).
+_git_repo_cache: dict[str, str | None] = {}
+_GIT_REPO_CACHE_MAX = 512
+
+
+def resolve_git_repo(cwd: str) -> str | None:
+    """Return the git repo name for *cwd*, or None when not inside a repo.
+
+    Pure-Python walk-up: the repo root is the first ancestor of *cwd*
+    (inclusive) containing a `.git` entry (directory for normal clones, file
+    for linked worktrees — which therefore yield the worktree directory's
+    name). No `git` subprocess. Memoized per directory.
+    """
+    if not cwd:
+        return None
+    if cwd in _git_repo_cache:
+        return _git_repo_cache[cwd]
+
+    if len(_git_repo_cache) >= _GIT_REPO_CACHE_MAX:
+        _git_repo_cache.clear()
+
+    repo: str | None = None
+    path = os.path.abspath(cwd)
+    while True:
+        if os.path.exists(os.path.join(path, ".git")):
+            repo = os.path.basename(path) or None
+            break
+        parent = os.path.dirname(path)
+        if parent == path:  # filesystem root
+            break
+        path = parent
+
+    _git_repo_cache[cwd] = repo
+    return repo
 
 
 async def snapshot_all(names: list[str]) -> dict[str, str]:

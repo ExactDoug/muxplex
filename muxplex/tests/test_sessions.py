@@ -260,3 +260,94 @@ def test_update_session_cache_empty_names_clears_caches():
 
     assert get_session_list() == []
     assert get_snapshots() == {}
+
+
+# ---------------------------------------------------------------------------
+# list_session_paths (universal search metadata)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_session_paths_keeps_only_active_window_and_pane(mock_subprocess):
+    out = (
+        "work\t1\t1\t/home/u/projects/work\n"
+        "work\t1\t0\t/home/u/elsewhere\n"      # inactive pane
+        "work\t0\t1\t/home/u/other-window\n"   # inactive window
+        "play\t1\t1\t/srv/play\n"
+    )
+    with mock_subprocess(stdout=out):
+        paths = await sessions_mod.list_session_paths()
+    assert paths == {"work": "/home/u/projects/work", "play": "/srv/play"}
+
+
+@pytest.mark.asyncio
+async def test_list_session_paths_survives_tabs_in_path(mock_subprocess):
+    out = "odd\t1\t1\t/home/u/dir\twith\ttabs\n"
+    with mock_subprocess(stdout=out):
+        paths = await sessions_mod.list_session_paths()
+    assert paths == {"odd": "/home/u/dir\twith\ttabs"}
+
+
+@pytest.mark.asyncio
+async def test_list_session_paths_returns_empty_when_tmux_unavailable(mock_subprocess):
+    with mock_subprocess(stdout="", stderr="no server running", returncode=1):
+        paths = await sessions_mod.list_session_paths()
+    assert paths == {}
+
+
+@pytest.mark.asyncio
+async def test_list_session_paths_skips_malformed_lines(mock_subprocess):
+    out = "broken-line-without-tabs\nok\t1\t1\t/srv/ok\n"
+    with mock_subprocess(stdout=out):
+        paths = await sessions_mod.list_session_paths()
+    assert paths == {"ok": "/srv/ok"}
+
+
+# ---------------------------------------------------------------------------
+# resolve_git_repo (universal search metadata)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_git_repo_finds_repo_root(tmp_path):
+    sessions_mod._git_repo_cache.clear()
+    repo = tmp_path / "myrepo"
+    (repo / ".git").mkdir(parents=True)
+    nested = repo / "src" / "deep"
+    nested.mkdir(parents=True)
+    assert sessions_mod.resolve_git_repo(str(nested)) == "myrepo"
+    assert sessions_mod.resolve_git_repo(str(repo)) == "myrepo"
+
+
+def test_resolve_git_repo_handles_git_file_worktree(tmp_path):
+    sessions_mod._git_repo_cache.clear()
+    wt = tmp_path / "myrepo-wt1"
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt1\n")
+    assert sessions_mod.resolve_git_repo(str(wt)) == "myrepo-wt1"
+
+
+def test_resolve_git_repo_returns_none_outside_repo(tmp_path):
+    sessions_mod._git_repo_cache.clear()
+    plain = tmp_path / "no-repo-here"
+    plain.mkdir()
+    assert sessions_mod.resolve_git_repo(str(plain)) is None
+    assert sessions_mod.resolve_git_repo("") is None
+
+
+def test_resolve_git_repo_memoizes(tmp_path):
+    sessions_mod._git_repo_cache.clear()
+    repo = tmp_path / "cached"
+    (repo / ".git").mkdir(parents=True)
+    assert sessions_mod.resolve_git_repo(str(repo)) == "cached"
+    # Remove .git — the memoized answer must persist (no re-walk)
+    (repo / ".git").rmdir()
+    assert sessions_mod.resolve_git_repo(str(repo)) == "cached"
+
+
+def test_session_paths_cache_roundtrip():
+    sessions_mod.update_session_paths({"a": "/x"})
+    assert sessions_mod.get_session_paths() == {"a": "/x"}
+    got = sessions_mod.get_session_paths()
+    got["b"] = "/y"  # mutating the copy must not affect the cache
+    assert sessions_mod.get_session_paths() == {"a": "/x"}
+    sessions_mod.update_session_paths({})

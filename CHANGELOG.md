@@ -32,6 +32,24 @@
   name returns (mobile keeps the bottom-sheet switcher). Switching via pills does not
   change the active view. Design: `docs/plans/2026-06-04-expanded-header-session-pills-design.md`.
 
+## v0.7.2 (2026-06-04)
+
+### Features
+
+- **Universal session search** — a 🔍 control in both headers (right of the wordmark on
+  the main page; right of the sidebar toggle in the terminal view). Typing drops down
+  sessions matching — partially, case-insensitively — the **session name**, the **cwd
+  top-leaf directory**, the **git repo name**, or a **view/tag name** (a matching view
+  expands to its member sessions, each shown with the view as a tag chip). Hidden
+  sessions are included with a `hidden` badge; rows show match badges (`dir:`, `repo:`),
+  device badges, and activity dots. `/` focuses search on the main page (never
+  intercepted inside the terminal); ArrowUp/Down + Enter navigate, Escape closes. One
+  click switches to the session.
+- **Session metadata for search** — `/api/sessions` (and federation payloads) now carry
+  `cwd`, `cwdLeaf`, and `gitRepo` per session: the active pane's working directory is
+  read with a single `tmux list-panes` call per poll cycle, and the repo name resolves
+  via a memoized pure-Python `.git` walk-up (no git subprocess).
+
 ## v0.7.1 (2026-06-04)
 
 ### Features

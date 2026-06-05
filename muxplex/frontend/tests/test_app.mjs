@@ -4271,8 +4271,8 @@ test('updatePageTitle function exists and uses activity count', () => {
 
 test('updatePageTitle is called from pollSessions', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
-  // Use 700 chars — the call is ~562 chars into the function after comments/whitespace
-  const pollFn = source.substring(source.indexOf('async function pollSessions'), source.indexOf('async function pollSessions') + 700);
+  // Window sized to cover the render-call block (expanded pills + search refresh added in v0.7.x)
+  const pollFn = source.substring(source.indexOf('async function pollSessions'), source.indexOf('async function pollSessions') + 1200);
   assert.ok(pollFn.includes('updatePageTitle'), 'pollSessions must call updatePageTitle');
 });
 
@@ -6279,4 +6279,108 @@ test('both new-session flows pass the picker selection to createNewSession', () 
     assert.ok(snippet.includes('createNewSession(name, remoteId, viewNames)'),
       marker + ' must forward the selection to createNewSession');
   }
+});
+
+// ============================================================================
+// Universal session search (v0.7.x)
+// docs/plans/2026-06-04-universal-session-search-design.md
+// ============================================================================
+
+const ussSessions = [
+  { name: 'muxplex',  cwdLeaf: 'muxplex',  gitRepo: 'muxplex',  snapshot: '' },
+  { name: 'apiwork',  cwdLeaf: 'cw-manage-api', gitRepo: 'cw-manage-api', snapshot: '' },
+  { name: 'scratch',  cwdLeaf: 'tmp', gitRepo: null, snapshot: '' },
+  { name: 'firewall', cwdLeaf: 'arista', gitRepo: 'arista-ngfw', snapshot: '' },
+  { name: 'ghost',    status: 'unreachable' },
+];
+const ussSettings = {
+  hidden_sessions: ['scratch'],
+  views: [
+    { name: 'SecOps', sessions: ['firewall'] },
+    { name: 'WebApps', sessions: ['apiwork', 'muxplex'] },
+  ],
+};
+
+test('searchSessions returns [] for empty/whitespace query', () => {
+  assert.deepStrictEqual(app.searchSessions('', ussSessions, ussSettings), []);
+  assert.deepStrictEqual(app.searchSessions('   ', ussSessions, ussSettings), []);
+});
+
+test('searchSessions matches name partially and case-insensitively', () => {
+  const r = app.searchSessions('MUX', ussSessions, ussSettings);
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].session.name, 'muxplex');
+  assert.ok(r[0].matchedFields.includes('name'));
+});
+
+test('searchSessions matches cwd leaf and git repo', () => {
+  const byDir = app.searchSessions('cw-manage', ussSessions, ussSettings);
+  assert.strictEqual(byDir[0].session.name, 'apiwork');
+  assert.ok(byDir[0].matchedFields.includes('dir'));
+  assert.ok(byDir[0].matchedFields.includes('repo'));
+
+  const byRepo = app.searchSessions('ngfw', ussSessions, ussSettings);
+  assert.strictEqual(byRepo[0].session.name, 'firewall');
+  assert.deepStrictEqual(byRepo[0].matchedFields, ['repo']);
+});
+
+test('searchSessions expands view-name (tag) matches to member sessions', () => {
+  const r = app.searchSessions('secops', ussSessions, ussSettings);
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].session.name, 'firewall');
+  assert.ok(r[0].matchedFields.includes('tag'));
+  assert.deepStrictEqual(r[0].tags, ['SecOps']);
+});
+
+test('searchSessions includes hidden sessions flagged, excludes status sentinels', () => {
+  const r = app.searchSessions('scratch', ussSessions, ussSettings);
+  assert.strictEqual(r.length, 1);
+  assert.strictEqual(r[0].hidden, true, 'hidden session is returned, flagged');
+  assert.deepStrictEqual(app.searchSessions('ghost', ussSessions, ussSettings), [],
+    'status sentinel must never match');
+});
+
+test('searchSessions ranks name-prefix > name-substring > dir > repo > tag', () => {
+  const sessions = [
+    { name: 'zz-api',   cwdLeaf: 'x', gitRepo: 'x', snapshot: '' },       // name substring
+    { name: 'apifirst', cwdLeaf: 'x', gitRepo: 'x', snapshot: '' },       // name prefix
+    { name: 'bydir',    cwdLeaf: 'api-dir', gitRepo: 'x', snapshot: '' }, // dir
+    { name: 'byrepo',   cwdLeaf: 'x', gitRepo: 'api-repo', snapshot: '' },// repo
+    { name: 'bytag',    cwdLeaf: 'x', gitRepo: 'x', snapshot: '' },       // tag only
+  ];
+  const settings = { hidden_sessions: [], views: [{ name: 'api-team', sessions: ['bytag'] }] };
+  const r = app.searchSessions('api', sessions, settings);
+  assert.deepStrictEqual(r.map(x => x.session.name),
+    ['apifirst', 'zz-api', 'bydir', 'byrepo', 'bytag']);
+});
+
+test('searchSessions dedups multi-field matches into one row', () => {
+  const r = app.searchSessions('muxplex', ussSessions, ussSettings);
+  assert.strictEqual(r.length, 1, 'name+dir+repo match must yield one row');
+  assert.deepStrictEqual(r[0].matchedFields.sort(), ['dir', 'name', 'repo']);
+});
+
+test('searchSessions tolerates sessions without cwd/git metadata (old remotes)', () => {
+  const r = app.searchSessions('legacy', [{ name: 'legacy-box', snapshot: '' }], { views: [] });
+  assert.strictEqual(r.length, 1);
+  assert.deepStrictEqual(r[0].matchedFields, ['name']);
+});
+
+test('handleGlobalKeydown: "/" opens overview search only outside inputs and only in grid mode', () => {
+  const source = appSource;
+  const start = source.indexOf('function handleGlobalKeydown(');
+  const snippet = source.slice(start, start + 2200);
+  assert.ok(snippet.includes("e.key === '/'"), 'must handle the / key');
+  assert.ok(snippet.indexOf("e.key === '/'") > snippet.indexOf("_viewMode === 'grid' && !inInput"),
+    '/ handling must be inside the grid-only, not-in-input guard');
+  assert.ok(snippet.includes("openSearch('session-search-overview')"),
+    '/ must open the overview search box');
+});
+
+test('search containers exist in both headers and results menu is shared', () => {
+  const idx = fs.readFileSync(join(__dirname, '..', 'index.html'), 'utf8');
+  assert.ok(idx.includes('id="session-search-overview"'), 'overview header search container');
+  assert.ok(idx.includes('id="session-search-expanded"'), 'expanded header search container');
+  assert.strictEqual((idx.match(/id="session-search-results"/g) || []).length, 1,
+    'exactly one shared results dropdown');
 });

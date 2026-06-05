@@ -19,6 +19,10 @@
   <div id="view-overview" class="view view--active">
     <header class="app-header">
       <h1 class="app-wordmark"><img src="/wordmark-on-dark.svg" alt="muxplex" height="24" /></h1>
+      <div class="session-search" id="session-search-overview">
+        <button class="header-btn session-search__btn" aria-label="Search sessions" title="Search sessions (/)">&#128269;</button>
+        <input type="text" class="session-search__input hidden" placeholder="Search sessions&#8230;" aria-label="Search sessions" autocomplete="off" spellcheck="false" />
+      </div>
       <div class="header-views">
         <nav id="view-pills" class="view-pills" aria-label="Views"></nav>
         <div class="view-dropdown" id="view-dropdown">
@@ -47,6 +51,10 @@
     <header class="expanded-header">
       <button id="back-btn" class="back-btn" aria-label="Back">&#8592;</button>
       <button id="sidebar-toggle-btn" class="sidebar-toggle-btn" aria-label="Toggle session list">&#9776;</button>
+      <div class="session-search" id="session-search-expanded">
+        <button class="header-btn session-search__btn" aria-label="Search sessions" title="Search sessions">&#128269;</button>
+        <input type="text" class="session-search__input hidden" placeholder="Search sessions&#8230;" aria-label="Search sessions" autocomplete="off" spellcheck="false" />
+      </div>
       <span id="expanded-session-name" class="expanded-session-name"></span>
       <nav id="expanded-pills" class="expanded-pills" aria-label="Session navigation"></nav>
       <button id="new-session-btn-expanded" class="header-btn" aria-label="New session">+</button>
@@ -85,6 +93,9 @@
 
   <!-- ── Expanded-header pill dropdown (shared, fixed-positioned) ───────── -->
   <div id="expanded-pill-menu" class="view-dropdown__menu expanded-pill-menu hidden" role="menu" aria-label="Sessions"></div>
+
+  <!-- ── Universal search results (shared, fixed-positioned) ────────────── -->
+  <div id="session-search-results" class="view-dropdown__menu session-search-results hidden" role="listbox" aria-label="Search results"></div>
 
   <!-- ── Bottom sheet (session switcher) ────────────────────────────────── -->
   <div id="bottom-sheet" class="bottom-sheet hidden" role="dialog" aria-modal="true" aria-label="Switch session">

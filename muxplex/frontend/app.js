@@ -357,6 +357,7 @@ async function pollSessions() {
     renderViewPills();
     renderSidebar(sessions, _viewingSession, _viewingRemoteId);
     renderExpandedHeaderPills();
+    if (_searchOpenFor) renderSearchResults(); // keep open results live
     handleBellTransitions(prev, sessions);
     updateSessionPill(sessions);
     updateFaviconBadge();
@@ -3593,6 +3594,262 @@ function _epCloseMenu() {
   }
 }
 
+// ─── Universal session search ────────────────────────────────────────────────
+// Compact search control in both headers. Matches session name, cwd leaf
+// directory, git repo name, and view (tag) names — partial, case-insensitive.
+// Design: docs/plans/2026-06-04-universal-session-search-design.md
+
+var _searchOpenFor = null;     // 'session-search-overview' | 'session-search-expanded' | null
+var _searchResults = [];       // last searchSessions() output
+var _searchActiveIndex = -1;   // keyboard-highlighted row
+
+// Match ranks: lower = better. Grouped ordering in the dropdown.
+var SEARCH_RANKS = { namePrefix: 0, name: 1, dir: 2, repo: 3, tag: 4 };
+
+/**
+ * Pure search over the in-memory session list. No network, no DOM.
+ *
+ * @param {string} query - raw input value
+ * @param {object[]} sessions - poll payload sessions
+ * @param {object} settings - server settings (views, hidden_sessions)
+ * @returns {Array<{session: object, matchedFields: string[], tags: string[],
+ *   hidden: boolean, rank: number}>} sorted by rank then name. A session
+ *   matching several fields appears ONCE with all its match badges. Hidden
+ *   sessions are INCLUDED (flagged via .hidden); status sentinels never match.
+ */
+function searchSessions(query, sessions, settings) {
+  var q = (query || '').trim().toLowerCase();
+  if (!q) return [];
+
+  var hiddenList = (settings && settings.hidden_sessions) || [];
+  var views = (settings && settings.views) || [];
+  function keyOf(s) { return s.sessionKey || s.name; }
+  function isHiddenS(s) {
+    return hiddenList.indexOf(keyOf(s)) !== -1 || hiddenList.indexOf(s.name) !== -1;
+  }
+  function inView(v, s) {
+    var members = v.sessions || [];
+    return members.indexOf(keyOf(s)) !== -1 || members.indexOf(s.name) !== -1;
+  }
+
+  // Views whose NAME matches the query — their members match via 'tag'
+  var matchingViews = views.filter(function (v) {
+    return (v.name || '').toLowerCase().indexOf(q) !== -1;
+  });
+
+  var out = [];
+  var live = (sessions || []).filter(function (s) { return !s.status; });
+  for (var i = 0; i < live.length; i++) {
+    var s = live[i];
+    var name = (s.name || '').toLowerCase();
+    var dir = (s.cwdLeaf || '').toLowerCase();
+    var repo = (s.gitRepo || '').toLowerCase();
+
+    var matchedFields = [];
+    var rank = Infinity;
+    if (name.indexOf(q) === 0) {
+      matchedFields.push('name');
+      rank = SEARCH_RANKS.namePrefix;
+    } else if (name.indexOf(q) !== -1) {
+      matchedFields.push('name');
+      rank = SEARCH_RANKS.name;
+    }
+    if (dir && dir.indexOf(q) !== -1) {
+      matchedFields.push('dir');
+      rank = Math.min(rank, SEARCH_RANKS.dir);
+    }
+    if (repo && repo.indexOf(q) !== -1) {
+      matchedFields.push('repo');
+      rank = Math.min(rank, SEARCH_RANKS.repo);
+    }
+    var tags = [];
+    for (var vi = 0; vi < matchingViews.length; vi++) {
+      if (inView(matchingViews[vi], s)) tags.push(matchingViews[vi].name);
+    }
+    if (tags.length > 0) {
+      matchedFields.push('tag');
+      rank = Math.min(rank, SEARCH_RANKS.tag);
+    }
+
+    if (matchedFields.length === 0) continue;
+    out.push({
+      session: {
+        name: s.name,
+        remoteId: s.remoteId != null ? String(s.remoteId) : '',
+        deviceName: s.deviceName || '',
+        bell: !!(s.bell && s.bell.unseen_count > 0),
+        cwdLeaf: s.cwdLeaf || '',
+        gitRepo: s.gitRepo || '',
+      },
+      matchedFields: matchedFields,
+      tags: tags,
+      hidden: isHiddenS(s),
+      rank: rank,
+    });
+  }
+
+  out.sort(function (a, b) {
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    var an = a.session.name.toLowerCase(), bn = b.session.name.toLowerCase();
+    if (an < bn) return -1;
+    if (an > bn) return 1;
+    return a.session.deviceName < b.session.deviceName ? -1 : 1;
+  });
+  return out;
+}
+
+/** Build one search-result row. */
+function _searchItemHTML(r, index) {
+  var s = r.session;
+  var ds = getDisplaySettings();
+  var cls = 'view-dropdown__item session-search-results__item';
+  if (index === _searchActiveIndex) cls += ' session-search-results__item--active';
+  if (r.hidden) cls += ' session-search-results__item--hidden';
+
+  var badges = '';
+  if (r.matchedFields.indexOf('dir') !== -1) {
+    badges += ' <span class="search-badge">dir:' + escapeHtml(s.cwdLeaf) + '</span>';
+  }
+  if (r.matchedFields.indexOf('repo') !== -1) {
+    badges += ' <span class="search-badge">repo:' + escapeHtml(s.gitRepo) + '</span>';
+  }
+  for (var t = 0; t < r.tags.length; t++) {
+    badges += ' <span class="search-tag">' + escapeHtml(r.tags[t]) + '</span>';
+  }
+  if (r.hidden) badges += ' <span class="search-badge search-badge--hidden">hidden</span>';
+
+  var deviceBadge = '';
+  if (_serverSettings && _serverSettings.multi_device_enabled && s.deviceName && ds.showDeviceBadges !== false) {
+    deviceBadge = ' <span class="device-badge">' + escapeHtml(s.deviceName) + '</span>';
+  }
+  var bell = s.bell && ds.activityIndicator !== 'none'
+    ? '<span class="nav-pill__bell" aria-hidden="true"></span>' : '';
+
+  return '<button class="' + cls + '" role="option" data-index="' + index +
+    '" data-session="' + escapeHtml(s.name) + '" data-remote-id="' + escapeHtml(s.remoteId) + '">' +
+    escapeHtml(s.name) + bell + deviceBadge + badges + '</button>';
+}
+
+/** Re-render the shared results dropdown for the currently-open search box. */
+function renderSearchResults() {
+  if (!_searchOpenFor) return;
+  var menu = $('session-search-results');
+  var box = $(_searchOpenFor);
+  if (!menu || !box || typeof box.querySelector !== 'function') return;
+  var input = box.querySelector('.session-search__input');
+  if (!input) return;
+
+  _searchResults = searchSessions(input.value, _currentSessions, _serverSettings);
+  if (_searchActiveIndex >= _searchResults.length) _searchActiveIndex = _searchResults.length - 1;
+
+  if ((input.value || '').trim() === '') {
+    menu.classList.add('hidden');
+    menu.innerHTML = '';
+    return;
+  }
+
+  var html = '';
+  for (var i = 0; i < _searchResults.length; i++) html += _searchItemHTML(_searchResults[i], i);
+  if (!html) html = '<div class="view-dropdown__item" aria-disabled="true">No matches</div>';
+  menu.innerHTML = html;
+  menu.classList.remove('hidden');
+
+  // Fixed-position under the input (shared menu escapes header overflow)
+  if (menu.style && typeof input.getBoundingClientRect === 'function') {
+    var rect = input.getBoundingClientRect();
+    var left = rect.left;
+    if (window.innerWidth) left = Math.min(left, Math.max(0, window.innerWidth - 330));
+    menu.style.top = (rect.bottom + 4) + 'px';
+    menu.style.left = left + 'px';
+  }
+}
+
+/** Open the search box inside the given container id and focus its input. */
+function openSearch(containerId) {
+  var box = $(containerId);
+  if (!box || typeof box.querySelector !== 'function') return;
+  if (_searchOpenFor && _searchOpenFor !== containerId) closeSearch();
+  _searchOpenFor = containerId;
+  _searchActiveIndex = -1;
+  var input = box.querySelector('.session-search__input');
+  if (input) {
+    input.classList.remove('hidden');
+    if (input.focus) input.focus();
+  }
+  renderSearchResults();
+}
+
+/** Close the search box (if open), clearing input and results. */
+function closeSearch() {
+  if (!_searchOpenFor) return;
+  var box = $(_searchOpenFor);
+  _searchOpenFor = null;
+  _searchActiveIndex = -1;
+  _searchResults = [];
+  if (box && typeof box.querySelector === 'function') {
+    var input = box.querySelector('.session-search__input');
+    if (input) {
+      input.value = '';
+      input.classList.add('hidden');
+    }
+  }
+  var menu = $('session-search-results');
+  if (menu) {
+    menu.classList.add('hidden');
+    menu.innerHTML = '';
+  }
+}
+
+/** Open the result at *index* (or the first when index is out of range). */
+function _searchOpenResult(index) {
+  if (_searchResults.length === 0) return;
+  var i = (index >= 0 && index < _searchResults.length) ? index : 0;
+  var s = _searchResults[i].session;
+  closeSearch();
+  if (s.name !== _viewingSession || (s.remoteId || '') !== (_viewingRemoteId || '')) {
+    openSession(s.name, { remoteId: s.remoteId });
+  }
+}
+
+/** Keydown handling for the search input (arrows / Enter / Escape). */
+function _searchInputKeydown(e) {
+  if (e.key === 'ArrowDown') {
+    if (e.preventDefault) e.preventDefault();
+    if (_searchActiveIndex < _searchResults.length - 1) _searchActiveIndex++;
+    renderSearchResults();
+  } else if (e.key === 'ArrowUp') {
+    if (e.preventDefault) e.preventDefault();
+    if (_searchActiveIndex > -1) _searchActiveIndex--;
+    renderSearchResults();
+  } else if (e.key === 'Enter') {
+    _searchOpenResult(_searchActiveIndex);
+  } else if (e.key === 'Escape') {
+    closeSearch();
+  }
+}
+
+/** Attach-once wiring for one search container (called once from the
+ *  static-listener binder — containers are static, contract #3). */
+function _bindSearchBox(containerId) {
+  var box = $(containerId);
+  if (!box || typeof box.querySelector !== 'function') return;
+  var btn = box.querySelector('.session-search__btn');
+  var input = box.querySelector('.session-search__input');
+  if (btn) {
+    btn.addEventListener('click', function () {
+      if (_searchOpenFor === containerId) closeSearch();
+      else openSearch(containerId);
+    });
+  }
+  if (input) {
+    input.addEventListener('input', function () {
+      _searchActiveIndex = -1;
+      renderSearchResults();
+    });
+    input.addEventListener('keydown', _searchInputKeydown);
+  }
+}
+
 // ─── Server settings ─────────────────────────────────────────────────────────
 
 /**
@@ -4102,6 +4359,13 @@ function handleGlobalKeydown(e) {
   }
   // View dropdown shortcuts — grid overview only, not in input, no ctrl/meta
   if (_viewMode === 'grid' && !inInput && !e.ctrlKey && !e.metaKey) {
+    // '/' focuses the universal session search (overview only — never
+    // intercepted in the terminal view, where keys belong to the terminal)
+    if (e.key === '/') {
+      e.preventDefault();
+      openSearch('session-search-overview');
+      return;
+    }
     // Backtick toggles the view dropdown
     if (e.code === 'Backquote') {
       e.preventDefault();
@@ -4760,6 +5024,24 @@ function bindStaticEventListeners() {
     if (e.key === 'Escape' && _expandedPillMenuFor) _epCloseMenu();
   });
 
+  // Universal session search — both header containers + shared results menu
+  _bindSearchBox('session-search-overview');
+  _bindSearchBox('session-search-expanded');
+  var searchResultsMenu = $('session-search-results');
+  if (searchResultsMenu) {
+    searchResultsMenu.addEventListener('click', function (e) {
+      var item = e.target.closest && e.target.closest('[data-session]');
+      if (!item) return;
+      _searchOpenResult(parseInt(item.dataset.index, 10));
+    });
+  }
+  // Click-outside closes the search (anywhere outside the box + results)
+  document.addEventListener('click', function (e) {
+    if (!_searchOpenFor) return;
+    if (e.target.closest && (e.target.closest('.session-search') || e.target.closest('#session-search-results'))) return;
+    closeSearch();
+  });
+
   // Sidebar view dropdown — trigger opens/closes, delegated item clicks switch view
   var sidebarViewTrigger = $('sidebar-view-dropdown-trigger');
   if (sidebarViewTrigger) on(sidebarViewTrigger, 'click', toggleSidebarViewDropdown);
@@ -5267,6 +5549,11 @@ if (typeof module !== 'undefined' && module.exports) {
     _epToggleMenu,
     _epCloseMenu,
     _setViewingRemoteId,
+    // Universal session search
+    searchSessions,
+    renderSearchResults,
+    openSearch,
+    closeSearch,
     // Manage Views settings tab
     renderViewsSettingsTab,
     _saveViewsAndRerender,
