@@ -5624,6 +5624,12 @@ function bindStaticEventListeners() {
   // Click-outside closes the search (anywhere outside the box + results)
   document.addEventListener('click', function (e) {
     if (!_searchOpenFor) return;
+    // Checkbox clicks re-render the results dropdown synchronously (the menu's
+    // own click handler runs before this bubble listener), detaching e.target —
+    // closest() can then no longer reach the container and the click would be
+    // misread as "outside". A detached target can only have come from inside a
+    // re-rendered dropdown, so never treat it as outside.
+    if (e.target && e.target.isConnected === false) return;
     if (e.target.closest && (e.target.closest('.session-search') || e.target.closest('#session-search-results'))) return;
     closeSearch();
   });

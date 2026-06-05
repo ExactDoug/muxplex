@@ -6835,3 +6835,25 @@ test('_viewDisplayName maps every identity form', () => {
   assert.strictEqual(app._viewDisplayName('dir:proj'), 'proj');
   assert.strictEqual(app._viewDisplayName('Work'), 'Work');
 });
+
+// ============================================================================
+// v0.8.1 — search checkbox click must not close the dropdown
+// ============================================================================
+
+test('search click-outside guard ignores detached targets (source contract)', () => {
+  // Checkbox clicks toggle _searchSelected and synchronously re-render the
+  // dropdown (innerHTML replace) in the menu's own click handler. The
+  // document-level close-outside listener runs AFTER that on the same bubble,
+  // with e.target now detached — closest() can't reach the container, so
+  // without this guard the click is misread as outside and closeSearch()
+  // wipes the results + selection (the v0.8.0 "checkbox closes search" bug).
+  const start = appSource.indexOf('// Click-outside closes the search');
+  assert.ok(start !== -1, 'search close-outside handler must exist');
+  const snippet = appSource.slice(start, start + 900);
+  assert.ok(snippet.includes('isConnected === false'),
+    'close-outside handler must bail on detached targets before closest() checks');
+  const guardIdx = snippet.indexOf('isConnected === false');
+  const closeIdx = snippet.indexOf('closeSearch()');
+  assert.ok(guardIdx !== -1 && guardIdx < closeIdx,
+    'detached-target guard must run before closeSearch()');
+});

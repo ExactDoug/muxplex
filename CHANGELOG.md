@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.8.1 (2026-06-05)
+
+### Fixes
+
+- **Search multi-select checkboxes work again** — clicking a checkbox in the
+  universal-search results closed the dropdown instead of toggling the selection.
+  The checkbox click re-renders the results synchronously, detaching the clicked
+  node before the document-level "click outside closes search" listener ran — which
+  then couldn't see the click was inside the dropdown. Detached targets are now
+  never treated as outside. (Bug shipped with the v0.7.3 search multi-select.)
+
 ## v0.8.0 (2026-06-05)
 
 ### Features
