@@ -887,7 +887,10 @@ body {
     height: 44px;
   }
   .session-tile--tier-idle .tile-name {
-    color: var(--text-dim);
+    /* Secondary, not disabled: --text-dim (#4A5060) on the header bg is only
+       ~2.3:1 contrast — unreadable. --text-muted (~6:1) reads comfortably in
+       the narrow-viewport list without the harsh glare of full --text. */
+    color: var(--text-muted);
   }
 }
 

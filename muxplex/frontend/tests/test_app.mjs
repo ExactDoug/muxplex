@@ -4621,6 +4621,17 @@ test('CSS has new-session-device-select styling', () => {
   );
 });
 
+test('mobile idle tile-name uses readable --text-muted, not the unreadable --text-dim', () => {
+  // Stage 4 (v0.9): --text-dim on the header bg is ~2.3:1 contrast — unreadable
+  // in the narrow-viewport session list. Must not regress.
+  const source = fs.readFileSync(new URL('../style.css', import.meta.url), 'utf8');
+  const idx = source.indexOf('.session-tile--tier-idle .tile-name');
+  assert.ok(idx !== -1, 'tier-idle tile-name rule must exist');
+  const rule = source.slice(idx, source.indexOf('}', idx));
+  assert.ok(rule.includes('var(--text-muted)'), 'idle tile-name must use --text-muted');
+  assert.ok(!/color:\s*var\(--text-dim\)/.test(rule), 'idle tile-name must not use --text-dim');
+});
+
 // --- Fix: blur handler guards against closing when clicking device select ---
 
 test('showNewSessionInput blur does not close when clicking device select', () => {
