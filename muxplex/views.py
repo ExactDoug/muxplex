@@ -257,6 +257,44 @@ def remove_from_all_views(settings: dict, key: str) -> dict:
     return settings
 
 
+def rename_session_key(
+    settings: dict,
+    old_key: str,
+    new_key: str,
+    old_name: str | None = None,
+) -> dict:
+    """Rewrite a renamed session's identifiers across views + hidden_sessions.
+
+    A session is referenced by its canonical ``device_id:name`` key, but legacy
+    stored data may still hold the bare ``name``. Renaming a session changes the
+    name, so this replaces both the old canonical ``old_key`` AND any legacy
+    bare ``old_name`` with the new canonical ``new_key`` (legacy entries are
+    thereby healed to canonical form, same as ``normalize_session_keys``) in
+    ``hidden_sessions`` and every ``view.sessions`` list. Order-preserving and
+    dedup-safe (collapses to the first occurrence, so a list already holding the
+    new key doesn't gain a duplicate). Mutates and returns *settings*.
+    """
+
+    def rewrite(entries: list[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if entry == old_key or (old_name is not None and entry == old_name):
+                entry = new_key
+            if entry in seen:
+                continue
+            seen.add(entry)
+            result.append(entry)
+        return result
+
+    if isinstance(settings.get("hidden_sessions"), list):
+        settings["hidden_sessions"] = rewrite(settings["hidden_sessions"])
+    for view in settings.get("views") or []:
+        if isinstance(view.get("sessions"), list):
+            view["sessions"] = rewrite(view["sessions"])
+    return settings
+
+
 def hide(settings: dict, key: str) -> dict:
     """Append `key` to hidden_sessions if absent."""
     hidden = settings.setdefault("hidden_sessions", [])

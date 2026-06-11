@@ -59,6 +59,7 @@ from muxplex.sessions import (
     snapshot_all,
     update_session_cache,
     update_session_paths,
+    validate_session_name,
 )
 from muxplex.state import (
     empty_bell,
@@ -78,7 +79,7 @@ from muxplex.settings import (
     save_settings,
 )
 from muxplex.pruning import load_pruning_state, save_pruning_state
-from muxplex.views import normalize_session_keys, prune_stale_keys
+from muxplex.views import normalize_session_keys, prune_stale_keys, rename_session_key
 from muxplex.identity import load_device_id
 from muxplex.ttyd import kill_orphan_ttyd, kill_ttyd, spawn_ttyd, TTYD_PORT
 
@@ -523,6 +524,18 @@ class CreateSessionPayload(BaseModel):
         return stripped
 
 
+class RenameSessionPayload(BaseModel):
+    new_name: str
+
+    @field_validator("new_name")
+    @classmethod
+    def new_name_must_not_be_blank(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("new_name must not be empty or whitespace")
+        return stripped
+
+
 class SettingsSyncPayload(BaseModel):
     settings: dict
     settings_updated_at: float
@@ -819,6 +832,91 @@ async def delete_session(name: str) -> dict:
         _log.warning("Delete command failed: %r", command)
 
     return {"ok": True, "name": name}
+
+
+@app.post("/api/sessions/{name}/rename")
+async def rename_session(name: str, payload: RenameSessionPayload) -> dict:
+    """Rename a local tmux session and cascade the new name everywhere it's stored.
+
+    Local-only in v0.9: renaming is offered only for sessions on this device.
+    A federated rename would leave peers' view-membership keys (device_id:name)
+    stale until the 24h stale-key prune, so it is intentionally out of scope —
+    the frontend hides Rename for remote sessions.
+
+    Steps:
+      1. Validate the new name (tmux-illegal chars, reserved 'dir:' prefix,
+         duplicate of an existing session).
+      2. ``tmux rename-session`` — an existing ttyd attach survives the rename
+         (same tmux session id), so no ttyd respawn is needed.
+      3. Cascade the canonical key (device_id:name) and bare name through
+         view.sessions + hidden_sessions (persisted via patch_settings so it
+         syncs), and through persistent state (active_session, session_order,
+         per-session bell, this device's viewing_session).
+
+    Returns {ok: True, name: new_name, old_name: old_name}.
+    404 if the session is unknown; 400 if the new name is invalid.
+    """
+    old_name = name
+    new_name = payload.new_name  # already trimmed by the validator
+
+    known = get_session_list()
+    if known and old_name not in known:
+        raise HTTPException(status_code=404, detail=f"Session '{old_name}' not found")
+
+    if new_name == old_name:
+        return {"ok": True, "name": new_name, "old_name": old_name}
+
+    err = validate_session_name(new_name, existing=known)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+
+    _log.info("Renaming session '%s' -> '%s'", old_name, new_name)
+    try:
+        await run_tmux("rename-session", "-t", old_name, new_name)
+    except (RuntimeError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=500, detail=f"tmux rename failed: {exc}")
+
+    device_id = load_device_id()
+    old_key = f"{device_id}:{old_name}"
+    new_key = f"{device_id}:{new_name}"
+
+    # Cascade 1: view membership + hidden state (syncable -> propagates to peers).
+    settings = load_settings()
+    rename_session_key(settings, old_key, new_key, old_name)
+    patch_settings(
+        {
+            "views": settings.get("views", []),
+            "hidden_sessions": settings.get("hidden_sessions", []),
+        }
+    )
+
+    # Cascade 2: persistent state.
+    async with state_lock:
+        state = load_state()
+        if state.get("active_session") == old_name and not state.get(
+            "active_remote_id"
+        ):
+            state["active_session"] = new_name
+        order = state.get("session_order")
+        if isinstance(order, list):
+            state["session_order"] = [new_name if n == old_name else n for n in order]
+        sessions_state = state.get("sessions")
+        if isinstance(sessions_state, dict) and old_name in sessions_state:
+            sessions_state[new_name] = sessions_state.pop(old_name)
+        dev = (state.get("devices") or {}).get(device_id)
+        if isinstance(dev, dict) and dev.get("viewing_session") == old_name:
+            dev["viewing_session"] = new_name
+        save_state(state)
+
+    # Refresh the in-memory name cache so an immediate re-connect to the new
+    # name doesn't 404 before the next poll cycle updates it.
+    try:
+        names = await enumerate_sessions()
+        update_session_cache(names, get_snapshots())
+    except Exception:  # noqa: BLE001 — cache refresh is best-effort
+        pass
+
+    return {"ok": True, "name": new_name, "old_name": old_name}
 
 
 @app.post("/api/heartbeat")

@@ -12,6 +12,7 @@ from muxplex.views import (
     prune_stale_keys,
     remove_from_all_views,
     remove_membership,
+    rename_session_key,
     unhide,
     validate_view_name,
     visible_count,
@@ -1018,3 +1019,48 @@ def test_normalize_dedupe_preserves_order_and_unmatched_entries():
     # 'a' upgrades to dev1:a (first occurrence kept at its position);
     # the later literal dev1:a and the repeated ghost are dropped.
     assert result["views"][0]["sessions"] == ["ghost", "dev1:a"]
+
+
+# ---------------------------------------------------------------------------
+# rename_session_key — cascade a renamed session through views + hidden
+# ---------------------------------------------------------------------------
+
+
+def test_rename_session_key_rewrites_canonical_key_in_views_and_hidden():
+    settings = {
+        "views": [{"name": "V", "sessions": ["dev1:old", "dev1:other"]}],
+        "hidden_sessions": ["dev1:old"],
+    }
+    rename_session_key(settings, "dev1:old", "dev1:new", "old")
+    assert settings["views"][0]["sessions"] == ["dev1:new", "dev1:other"]
+    assert settings["hidden_sessions"] == ["dev1:new"]
+
+
+def test_rename_session_key_rewrites_legacy_bare_name():
+    settings = {"views": [{"name": "V", "sessions": ["old"]}], "hidden_sessions": ["old"]}
+    rename_session_key(settings, "dev1:old", "dev1:new", "old")
+    assert settings["views"][0]["sessions"] == ["dev1:new"]
+    assert settings["hidden_sessions"] == ["dev1:new"]
+
+
+def test_rename_session_key_collapses_when_new_key_already_present():
+    settings = {"views": [{"name": "V", "sessions": ["dev1:new", "dev1:old"]}]}
+    rename_session_key(settings, "dev1:old", "dev1:new", "old")
+    assert settings["views"][0]["sessions"] == ["dev1:new"]
+
+
+def test_rename_session_key_preserves_order_and_unrelated_keys():
+    settings = {
+        "views": [{"name": "V", "sessions": ["dev1:a", "dev1:old", "dev1:b"]}],
+        "hidden_sessions": ["dev1:z"],
+    }
+    rename_session_key(settings, "dev1:old", "dev1:new", "old")
+    assert settings["views"][0]["sessions"] == ["dev1:a", "dev1:new", "dev1:b"]
+    assert settings["hidden_sessions"] == ["dev1:z"]
+
+
+def test_rename_session_key_is_noop_for_unreferenced_session():
+    settings = {"views": [{"name": "V", "sessions": ["dev1:a"]}], "hidden_sessions": []}
+    rename_session_key(settings, "dev1:old", "dev1:new", "old")
+    assert settings["views"][0]["sessions"] == ["dev1:a"]
+    assert settings["hidden_sessions"] == []

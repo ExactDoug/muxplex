@@ -1116,6 +1116,110 @@ test('createNewSession calls openSession on poll success', () => {
   );
 });
 
+// --- Session rename (Stage 3, v0.9 — local-only) ---
+
+test('renameSession is exported and POSTs to /api/sessions/{old}/rename', async () => {
+  let captured = null;
+  // URL-aware stub: capture the rename POST; the follow-up pollSessions GET
+  // gets an empty list so it doesn't pollute _currentSessions.
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).includes('/rename')) {
+      captured = { url: String(url), opts };
+      return { ok: true, status: 200, json: async () => ({ ok: true, name: 'new', old_name: 'old' }) };
+    }
+    return { ok: true, status: 200, json: async () => [] };
+  };
+  app._setServerSettings({ views: [], hidden_sessions: [] });
+  app._setCurrentSessions([]);
+  await app.renameSession('old', '', 'new');
+  globalThis.fetch = undefined;
+  app._setServerSettings(null);
+  app._setCurrentSessions([]);
+  assert.ok(captured, 'renameSession must call fetch for the rename');
+  assert.strictEqual(captured.url, '/api/sessions/old/rename');
+  assert.strictEqual(captured.opts.method, 'POST');
+  assert.deepStrictEqual(JSON.parse(captured.opts.body), { new_name: 'new' });
+});
+
+test('renameSession is a no-op for empty/unchanged names and never fetches', async () => {
+  let called = false;
+  globalThis.fetch = async () => { called = true; return { ok: true, json: async () => ({}) }; };
+  await app.renameSession('old', '', '');       // empty
+  await app.renameSession('old', '', '   ');    // whitespace
+  await app.renameSession('old', '', 'old');    // unchanged
+  globalThis.fetch = undefined;
+  assert.strictEqual(called, false, 'no fetch for empty/unchanged renames');
+});
+
+test('renameSession refuses remote sessions (local-only in v0.9) without fetching', async () => {
+  let called = false;
+  globalThis.fetch = async () => { called = true; return { ok: true, json: async () => ({}) }; };
+  await app.renameSession('old', 'remote-dev', 'new');
+  globalThis.fetch = undefined;
+  assert.strictEqual(called, false, 'remote rename must not hit the API');
+});
+
+test('_validateSessionNameClient mirrors the backend rules', () => {
+  assert.strictEqual(app._validateSessionNameClient('good-name', []), null);
+  assert.ok(app._validateSessionNameClient('', []));
+  assert.ok(app._validateSessionNameClient('   ', []));
+  assert.ok(app._validateSessionNameClient('a.b', []), 'rejects dot');
+  assert.ok(app._validateSessionNameClient('a:b', []), 'rejects colon');
+  assert.ok(app._validateSessionNameClient('dir:x', []), 'rejects dir: prefix');
+  assert.ok(app._validateSessionNameClient('taken', ['taken', 'other']), 'rejects duplicate');
+});
+
+test('_applyRenameToLocalSettings rewrites canonical key + legacy bare name in views + hidden', () => {
+  app._setLocalDeviceId('dev1');
+  // _setServerSettings stores by reference, so we can assert on this object.
+  const ss = {
+    views: [
+      { name: 'Work', sessions: ['dev1:old', 'dev1:keep'] },
+      { name: 'Legacy', sessions: ['old'] },        // bare-name legacy entry
+      { name: 'Dup', sessions: ['dev1:new', 'dev1:old'] },  // collapse, no dup
+    ],
+    hidden_sessions: ['dev1:old'],
+  };
+  app._setServerSettings(ss);
+  app._applyRenameToLocalSettings('old', 'new');
+  assert.deepStrictEqual(ss.views[0].sessions, ['dev1:new', 'dev1:keep']);
+  assert.deepStrictEqual(ss.views[1].sessions, ['dev1:new'], 'legacy bare name upgraded to canonical');
+  assert.deepStrictEqual(ss.views[2].sessions, ['dev1:new'], 'no duplicate when new key already present');
+  assert.deepStrictEqual(ss.hidden_sessions, ['dev1:new']);
+  app._setLocalDeviceId(null);
+  app._setServerSettings(null);
+});
+
+test('_epMenuItemHTML adds a Rename control for local sessions, omits it for remote', () => {
+  const localHtml = app._epMenuItemHTML({ name: 'work', remoteId: '', bell: false });
+  assert.ok(localHtml.includes('data-rename'), 'local session item has a rename control');
+  assert.ok(localHtml.includes('ep-menu-row'), 'local session item wraps open + rename in a row');
+
+  const remoteHtml = app._epMenuItemHTML({ name: 'work', remoteId: 'dev2', bell: false });
+  assert.ok(!remoteHtml.includes('data-rename'), 'remote session item has no rename control');
+});
+
+test('flyout menu wiring: Rename is a localOnly action, filtered for remote, and dispatched', () => {
+  const src = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  // The map carries a localOnly rename action and a remote filter helper.
+  assert.ok(/action:\s*'rename',\s*localOnly:\s*true/.test(src),
+    'FLYOUT_MENU_MAP must define a localOnly rename action');
+  assert.ok(/_flyoutItemsFor[\s\S]{0,200}localOnly/.test(src),
+    '_flyoutItemsFor must drop localOnly items for remote sessions');
+  // Both flyout builders run items through the filter.
+  assert.strictEqual((src.match(/_flyoutItemsFor\(FLYOUT_MENU_MAP/g) || []).length, 2,
+    'both desktop + mobile flyout builders must filter items');
+  // Desktop dispatch routes the rename action to the inline input.
+  assert.ok(/case 'rename':[\s\S]{0,260}_openRenameSessionInput/.test(src),
+    "_handleFlyoutClick must handle the 'rename' action");
+});
+
+test('expanded-header pill dropdown handles the data-rename control', () => {
+  const src = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  assert.ok(/closest\('\[data-rename\]'\)[\s\S]{0,200}_openRenameSessionInput/.test(src),
+    'the expanded-pill-menu click handler must open rename for [data-rename]');
+});
+
 // --- openSession ---
 
 test('openSession is exported', () => {

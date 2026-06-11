@@ -150,12 +150,14 @@ let _flyoutRemoteId = null;
 const FLYOUT_MENU_MAP = {
   'all': [
     { label: 'Add to View\u2026', action: 'add-to-view', className: 'flyout-menu__item--has-submenu' },
+    { label: 'Rename\u2026', action: 'rename', localOnly: true },
     { label: 'Hide', action: 'hide' },
     { separator: true },
     { label: 'Kill Session', action: 'kill', className: 'flyout-menu__item--danger' },
   ],
   'user': [
     { label: 'Add to View\u2026', action: 'add-to-view', className: 'flyout-menu__item--has-submenu' },
+    { label: 'Rename\u2026', action: 'rename', localOnly: true },
     { label: 'Hide', action: 'hide' },
     { separator: true },
     { label: 'Kill Session', action: 'kill', className: 'flyout-menu__item--danger' },
@@ -163,10 +165,18 @@ const FLYOUT_MENU_MAP = {
   'hidden': [
     { label: 'Unhide', action: 'unhide' },
     { label: 'Unhide & Add to View\u2026', action: 'unhide-add-to-view', className: 'flyout-menu__item--has-submenu' },
+    { label: 'Rename\u2026', action: 'rename', localOnly: true },
     { separator: true },
     { label: 'Kill Session', action: 'kill', className: 'flyout-menu__item--danger' },
   ],
 };
+
+/** Filter flyout items to those valid for the current target. localOnly items
+ *  (e.g. Rename \u2014 v0.9 local-only) are dropped for remote sessions. */
+function _flyoutItemsFor(items) {
+  if (!_flyoutRemoteId) return items;
+  return items.filter(function (it) { return !it.localOnly; });
+}
 
 /**
  * Build the flyout menu HTML string based on the active view type.
@@ -180,7 +190,7 @@ function _buildFlyoutMenuItems() {
     viewType = 'user';
   }
 
-  var items = FLYOUT_MENU_MAP[viewType] || FLYOUT_MENU_MAP['all'];
+  var items = _flyoutItemsFor(FLYOUT_MENU_MAP[viewType] || FLYOUT_MENU_MAP['all']);
   var html = '';
 
   for (var i = 0; i < items.length; i++) {
@@ -2236,7 +2246,7 @@ function _openFlyoutSheet() {
   var viewType = _activeView;
   if (viewType !== 'all' && viewType !== 'hidden') viewType = 'user';
 
-  var items = FLYOUT_MENU_MAP[viewType] || FLYOUT_MENU_MAP['all'];
+  var items = _flyoutItemsFor(FLYOUT_MENU_MAP[viewType] || FLYOUT_MENU_MAP['all']);
 
   var html = '<div class="flyout-sheet__backdrop"></div>';
   html += '<div class="flyout-sheet__panel" aria-label="Session options" role="menu">';
@@ -2471,6 +2481,14 @@ function _handleFlyoutClick(e) {
     case 'unhide':
       _doUnhideSession();
       break;
+    case 'rename': {
+      // Capture before closeFlyoutMenu() nulls the flyout target state.
+      var renameName = _flyoutSessionName;
+      var renameRemoteId = _flyoutRemoteId;
+      closeFlyoutMenu();
+      _openRenameSessionInput(renameName, renameRemoteId);
+      break;
+    }
     case 'kill':
       _doKillSessionInline(item);
       break;
@@ -3812,15 +3830,22 @@ function _epMenuPillHTML(menuKey, label, countText, extraClass) {
     '<span class="nav-pill__caret" aria-hidden="true">▾</span></button>';
 }
 
-/** Dropdown menu item HTML for a slim session. */
+/** Dropdown menu item HTML for a slim session. Local sessions get a trailing
+ *  Rename (✎) control (v0.9, local-only); the click handler distinguishes it
+ *  from the open-on-click button via the data-rename attribute. */
 function _epMenuItemHTML(s) {
   var ds = getDisplaySettings();
   var badge = '';
   if (_serverSettings && _serverSettings.multi_device_enabled && s.deviceName && ds.showDeviceBadges !== false) {
     badge = ' <span class="device-badge">' + escapeHtml(s.deviceName) + '</span>';
   }
-  return '<button class="view-dropdown__item" role="menuitem" data-session="' + escapeHtml(s.name) +
-    '" data-remote-id="' + escapeHtml(s.remoteId) + '">' + escapeHtml(s.name) + badge + _epBellHTML(s) + '</button>';
+  var openBtn = '<button class="view-dropdown__item ep-menu-row__open" role="menuitem" data-session="' +
+    escapeHtml(s.name) + '" data-remote-id="' + escapeHtml(s.remoteId) + '">' +
+    escapeHtml(s.name) + badge + _epBellHTML(s) + '</button>';
+  if (s.remoteId) return openBtn;  // remote sessions: open only, no rename
+  var renameBtn = '<button class="ep-menu-row__rename" data-rename="1" data-session="' +
+    escapeHtml(s.name) + '" data-remote-id="" title="Rename session" aria-label="Rename session">✎</button>';
+  return '<div class="ep-menu-row">' + openBtn + renameBtn + '</div>';
 }
 
 /**
@@ -5547,6 +5572,133 @@ async function createNewSession(name, remoteId, viewNames) {
   }
 }
 
+// ─── Session rename (v0.9 — local sessions only) ───────────────────────────
+
+/**
+ * Client-side mirror of the backend session-name rules
+ * (sessions.validate_session_name) for instant feedback. The server
+ * re-validates and remains the authority.
+ * @returns {string|null} an error message, or null when valid.
+ */
+function _validateSessionNameClient(name, existingNames) {
+  var n = (name || '').trim();
+  if (!n) return 'Session name cannot be empty';
+  if (n.toLowerCase().indexOf('dir:') === 0) return 'Names starting with \'dir:\' are reserved';
+  if (n.indexOf('.') !== -1 || n.indexOf(':') !== -1) return 'Session name cannot contain \'.\' or \':\'';
+  if (existingNames && existingNames.indexOf(n) !== -1) return 'A session named \'' + n + '\' already exists';
+  return null;
+}
+
+/**
+ * Rewrite a renamed local session's keys in the in-memory _serverSettings copy
+ * so the grid/pills reflect the rename immediately (mirrors the backend cascade
+ * in views.rename_session_key, which the server has already persisted).
+ */
+function _applyRenameToLocalSettings(oldName, newName) {
+  if (!_serverSettings) return;
+  var oldKey = _localDeviceId ? _localDeviceId + ':' + oldName : oldName;
+  var newKey = _localDeviceId ? _localDeviceId + ':' + newName : newName;
+  function rw(list) {
+    if (!Array.isArray(list)) return list;
+    var seen = {}, out = [];
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      if (e === oldKey || e === oldName) e = newKey;
+      if (seen[e]) continue;
+      seen[e] = true; out.push(e);
+    }
+    return out;
+  }
+  if (Array.isArray(_serverSettings.hidden_sessions)) {
+    _serverSettings.hidden_sessions = rw(_serverSettings.hidden_sessions);
+  }
+  var views = _serverSettings.views || [];
+  for (var i = 0; i < views.length; i++) {
+    if (Array.isArray(views[i].sessions)) views[i].sessions = rw(views[i].sessions);
+  }
+}
+
+/**
+ * Rename a local tmux session via POST /api/sessions/{old}/rename, then mirror
+ * the cascade locally and refresh. Remote sessions are out of scope in v0.9
+ * (a federated rename would leave peers' membership keys stale until the prune).
+ * @param {string} oldName
+ * @param {string} [remoteId] - non-empty = remote (rejected with a toast)
+ * @param {string} newName
+ * @returns {Promise<void>}
+ */
+function renameSession(oldName, remoteId, newName) {
+  newName = (newName || '').trim();
+  if (!oldName || !newName || newName === oldName) return Promise.resolve();
+  if (remoteId) { showToast('Renaming remote sessions isn’t supported yet'); return Promise.resolve(); }
+  return api('POST', '/api/sessions/' + encodeURIComponent(oldName) + '/rename', { new_name: newName })
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      var finalName = (data && data.name) || newName;
+      _applyRenameToLocalSettings(oldName, finalName);
+      // Keep the active-session view in sync if we renamed the one we're viewing
+      // (the existing ttyd attach survives the tmux rename — no reconnect needed).
+      if (_viewingSession === oldName && (_viewingRemoteId || '') === '') {
+        _viewingSession = finalName;
+        var nameEl = $('expanded-session-name');
+        if (nameEl) nameEl.textContent = finalName;
+      }
+      showToast('Renamed to ‘' + finalName + '’');
+      return pollSessions();
+    })
+    .catch(function (err) {
+      showToast(err && err.status === 400 ? 'Invalid session name' : ((err && err.message) || 'Failed to rename session'));
+    });
+}
+
+/**
+ * Show a centered inline input to rename a session — Enter commits, Escape
+ * cancels, blur commits if changed (mirrors the View inline-rename UX). Reuses
+ * the FAB overlay + new-session-input styling. Local sessions only.
+ * @param {string} oldName
+ * @param {string} [remoteId]
+ */
+function _openRenameSessionInput(oldName, remoteId) {
+  if (remoteId) { showToast('Renaming remote sessions isn’t supported yet'); return; }
+  if (document.querySelector('.fab-input-overlay')) return;
+
+  var overlay = document.createElement('div');
+  overlay.className = 'fab-input-overlay';
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'new-session-input';
+  input.value = oldName;
+  input.setAttribute('aria-label', 'Rename session');
+  overlay.appendChild(input);
+  document.body.appendChild(overlay);
+  input.focus();
+  input.select();
+
+  var done = false;
+  function cleanup() { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); }
+  function commit() {
+    if (done) return;
+    var newName = input.value.trim();
+    if (!newName || newName === oldName) { done = true; cleanup(); return; }
+    var existing = (_currentSessions || []).map(function (s) { return s.name; });
+    var errMsg = _validateSessionNameClient(newName, existing);
+    if (errMsg) { showToast(errMsg); input.focus(); return; }
+    done = true;
+    cleanup();
+    renameSession(oldName, remoteId || '', newName);
+  }
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { done = true; cleanup(); }
+  });
+  input.addEventListener('blur', function () {
+    setTimeout(function () {
+      if (done || document.activeElement === input) return;
+      commit();
+    }, 150);
+  });
+}
+
 /**
  * Kill a tmux session by name via DELETE /api/sessions/{name}.
  * For remote sessions, proxies through the federation delete route.
@@ -5650,6 +5802,14 @@ function bindStaticEventListeners() {
   var expandedPillMenu = $('expanded-pill-menu');
   if (expandedPillMenu) {
     expandedPillMenu.addEventListener('click', function (e) {
+      var renameBtn = e.target.closest && e.target.closest('[data-rename]');
+      if (renameBtn) {
+        var rName = renameBtn.dataset.session;
+        var rRid = renameBtn.dataset.remoteId || '';
+        _epCloseMenu();
+        _openRenameSessionInput(rName, rRid);
+        return;
+      }
       var item = e.target.closest && e.target.closest('[data-session]');
       if (!item) return;
       var itemRid = item.dataset.remoteId || '';
@@ -6105,6 +6265,9 @@ function _getActiveView() { return _activeView; }
 /** Test-only: set _activeView directly. */
 function _setActiveView(view) { _activeView = view; }
 
+/** Test-only: set _localDeviceId directly. */
+function _setLocalDeviceId(id) { _localDeviceId = id; }
+
 // Recalculate fit layout on window resize
 window.addEventListener('resize', function() {
   var ds = getDisplaySettings();
@@ -6260,6 +6423,11 @@ if (typeof module !== 'undefined' && module.exports) {
     showNewSessionInput,
     showFabSessionInput,
     createNewSession,
+    // Rename session
+    renameSession,
+    _validateSessionNameClient,
+    _applyRenameToLocalSettings,
+    _openRenameSessionInput,
     // Kill session
     killSession,
     // Manage View panel
@@ -6286,6 +6454,7 @@ if (typeof module !== 'undefined' && module.exports) {
     buildExpandedPillsModel,
     allocateExpandedPills,
     renderExpandedHeaderPills,
+    _epMenuItemHTML,
     _epMenuSessions,
     _epToggleMenu,
     _epCloseMenu,
@@ -6317,6 +6486,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _resolveActiveView,
     _viewDisplayName,
     _setAutoViews,
+    _setLocalDeviceId,
     _getAutoViews,
     // Operation layer (Phase 2) — pure data ops
     _opAddMembership,

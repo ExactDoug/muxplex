@@ -68,6 +68,38 @@ def update_session_paths(paths: dict[str, str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Session-name validation
+# ---------------------------------------------------------------------------
+
+# tmux uses '.' and ':' as separators in target specs (session:window.pane), so
+# a session name containing either can't be reliably addressed. 'dir:' would be
+# caught by the ':' rule, but we reject it explicitly for a clearer message
+# (it is the reserved auto-view namespace — see views.AUTO_VIEW_PREFIX).
+_AUTO_VIEW_PREFIX = "dir:"
+
+
+def validate_session_name(name: str, existing: list[str] | None = None) -> str | None:
+    """Validate a tmux session name. Return an error message, or None if valid.
+
+    Rules: non-empty after trimming; no '.' or ':' (tmux target separators); no
+    control characters; not the reserved 'dir:' auto-view prefix; and unique
+    among *existing* session names when provided.
+    """
+    stripped = (name or "").strip()
+    if not stripped:
+        return "Session name cannot be empty"
+    if stripped.lower().startswith(_AUTO_VIEW_PREFIX):
+        return f"Names starting with '{_AUTO_VIEW_PREFIX}' are reserved"
+    if "." in stripped or ":" in stripped:
+        return "Session name cannot contain '.' or ':'"
+    if any(ord(c) < 0x20 for c in stripped):
+        return "Session name cannot contain control characters"
+    if existing and stripped in set(existing):
+        return f"A session named '{stripped}' already exists"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Subprocess helpers
 # ---------------------------------------------------------------------------
 

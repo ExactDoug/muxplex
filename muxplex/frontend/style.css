@@ -2281,6 +2281,35 @@ body {
   margin-left: auto;
 }
 
+/* Dropdown session row: open button (fills the row) + trailing Rename (✎). */
+.ep-menu-row {
+  display: flex;
+  align-items: stretch;
+}
+
+.ep-menu-row__open {
+  flex: 1;
+  min-width: 0;
+}
+
+.ep-menu-row__rename {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0 12px;
+  font-size: 13px;
+  line-height: 1;
+  transition: color 0.15s, background 0.15s;
+}
+
+.ep-menu-row__rename:hover,
+.ep-menu-row__rename:focus-visible {
+  color: var(--text);
+  background: var(--bg-surface);
+}
+
 .expanded-pill-menu .nav-pill__bell {
   margin-left: 6px;
 }
