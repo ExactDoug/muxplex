@@ -5494,19 +5494,40 @@ async function createNewSession(name, remoteId, viewNames) {
       return;
     }
 
-    // Compute expectedKey: for remote sessions, use 'deviceId:sessionName' (sessionKey format)
-    var expectedKey = deviceId ? (deviceId + ':' + sessionName) : sessionName;
+    // Compute expectedKey in the canonical sessionKey form (device_id:name).
+    // Local sessions are ALSO tagged device_id:name by the backend (see main.py
+    // /api/sessions), so a bare name never matches s.sessionKey — use the cached
+    // local device id for local creates.
+    var expectedKey;
+    if (deviceId) {
+      expectedKey = deviceId + ':' + sessionName;
+    } else if (_localDeviceId) {
+      expectedKey = _localDeviceId + ':' + sessionName;
+    } else {
+      expectedKey = sessionName;
+    }
 
-    // Poll until the session appears in _currentSessions (max 30s, every 2s)
+    // Poll until the session appears in _currentSessions, then open it. New
+    // sessions can take several seconds to materialize and become responsive
+    // (setup scripts, repo clones, slow/remote hosts), so wait generously before
+    // giving up — and open the moment it appears, not on a fixed delay. Once
+    // openSession fires, terminal.js handles waiting for ttyd to become ready.
+    // The global poll loop keeps the grid live regardless, so a genuine creation
+    // failure just leaves the user on the grid rather than erroring.
+    function findNewSession() {
+      // Match the canonical key; fall back to bare name for local creates when
+      // _localDeviceId hasn't resolved yet (the open target is local either way).
+      return _currentSessions && _currentSessions.find(function(s) {
+        return (s.sessionKey || s.name) === expectedKey ||
+               (!deviceId && s.name === sessionName);
+      });
+    }
     var attempts = 0;
-    var maxAttempts = 15;
+    var maxAttempts = 60;  // 60 * 2s = up to ~120s before we stop auto-opening
     var pollForSession = setInterval(async function() {
       attempts++;
       await pollSessions();
-      var found = _currentSessions && _currentSessions.find(function(s) {
-        return (s.sessionKey || s.name) === expectedKey;
-      });
-      if (found) {
+      if (findNewSession()) {
         clearInterval(pollForSession);
         removeLoadingTile();
         showToast('Session \'' + sessionName + '\' ready');
@@ -5514,7 +5535,7 @@ async function createNewSession(name, remoteId, viewNames) {
       } else if (attempts >= maxAttempts) {
         clearInterval(pollForSession);
         removeLoadingTile();
-        showToast('Session \'' + sessionName + '\' is taking longer than expected');
+        showToast('Session \'' + sessionName + '\' is taking longer than expected — it will open from the grid once ready');
       }
     }, 2000);
   } catch (err) {

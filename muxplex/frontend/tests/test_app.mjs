@@ -1080,6 +1080,42 @@ test('updatePillBell hides pill bell when no other session has unseen bells', as
   globalThis.fetch = undefined;
 });
 
+// --- createNewSession auto-activate (Stage 1, v0.9) ---
+
+test('createNewSession is exported', () => {
+  assert.strictEqual(typeof app.createNewSession, 'function');
+});
+
+test('createNewSession builds the local expectedKey from _localDeviceId (canonical device_id:name)', () => {
+  // Local sessions are tagged device_id:name by the backend (main.py /api/sessions),
+  // so a bare-name expectedKey never matches s.sessionKey and auto-open silently
+  // never fires. The local branch must namespace with _localDeviceId.
+  const src = app.createNewSession.toString();
+  assert.ok(
+    /_localDeviceId\s*\)\s*\{[\s\S]*?expectedKey\s*=\s*_localDeviceId\s*\+\s*':'\s*\+\s*sessionName/.test(src) ||
+      /expectedKey\s*=\s*_localDeviceId\s*\+\s*':'\s*\+\s*sessionName/.test(src),
+    'createNewSession must build local expectedKey as _localDeviceId + ":" + sessionName',
+  );
+});
+
+test('createNewSession poll matcher tolerates bare-name fallback for local creates', () => {
+  // Guards the window before _localDeviceId resolves: a local create must still
+  // match the new session by bare name so openSession fires.
+  const src = app.createNewSession.toString();
+  assert.ok(
+    /!deviceId\s*&&\s*s\.name\s*===\s*sessionName/.test(src),
+    'createNewSession matcher must fall back to bare-name match for local creates',
+  );
+});
+
+test('createNewSession calls openSession on poll success', () => {
+  const src = app.createNewSession.toString();
+  assert.ok(
+    /openSession\(sessionName,\s*\{\s*remoteId:\s*deviceId\s*\}\)/.test(src),
+    'createNewSession must open the new session once it appears in _currentSessions',
+  );
+});
+
 // --- openSession ---
 
 test('openSession is exported', () => {
@@ -2583,7 +2619,10 @@ test('createNewSession polls for session before auto-opening (not immediate setT
   assert.ok(start !== -1, 'createNewSession function must exist');
   // Updated in v0.6.0: snippet size increased from 2000 to 3500 — function grew with
   // loading tile injection and auto-add-to-view logic; setInterval is now ~2800 chars in.
-  const snippet = source.slice(start, start + 3500);
+  // Updated in v0.9: 3500 -> 5200; expectedKey now namespaces local creates with
+  // _localDeviceId and a findNewSession() helper + generous wait were added
+  // (auto-activate fix), pushing setInterval to ~4600 chars in.
+  const snippet = source.slice(start, start + 5200);
   // Must NOT contain the old immediate-open pattern inside createNewSession
   assert.ok(
     !snippet.includes("setTimeout(() => openSession"),
@@ -4539,7 +4578,10 @@ test('createNewSession passes remoteId through to openSession for auto-open', ()
   assert.ok(fnStart !== -1, 'createNewSession function must exist');
   // Updated in v0.6.0: window increased from 3000 to 4000 — function grew with loading
   // tile injection and auto-add-to-view logic; openSession call is now ~3200 chars in.
-  const fnBody = source.substring(fnStart, fnStart + 4000);
+  // Updated in v0.9: 4000 -> 5400; local-create expectedKey namespacing + a
+  // findNewSession() helper and generous poll wait (auto-activate fix) push the
+  // openSession call to ~4850 chars in.
+  const fnBody = source.substring(fnStart, fnStart + 5400);
   // Must call openSession with remoteId option
   assert.ok(
     fnBody.includes('openSession') && fnBody.includes('remoteId'),
