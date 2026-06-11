@@ -131,6 +131,8 @@ let _previewPopover = null;
 let _previewTimer = null;
 
 var _previewSessionName = null;  // track by NAME, not DOM element
+var _previewRemoteId = '';       // remoteId of the previewed session — disambiguates same-named
+                                 // sessions across federated devices (sessionKey = device_id:name)
 
 // Flyout menu state
 let _flyoutMenuEl = null;
@@ -2066,22 +2068,33 @@ function _previewClickHandler(e) {
   e.preventDefault();
   e.stopPropagation();
   var name = _previewSessionName;
+  var rid = _previewRemoteId || '';
   hidePreview();
   if (name) {
-    var session = _currentSessions && _currentSessions.find(function(s) { return s.name === name; });
-    openSession(name, { remoteId: (session != null && session.remoteId != null) ? session.remoteId : '' });
+    // Resolve by name AND remoteId from _currentSessions — a bare-name lookup attaches the wrong
+    // device's session when two federated devices expose the same session name (sessionKey =
+    // device_id:name). _previewRemoteId is captured from the hovered tile/sidebar item.
+    var session = _currentSessions && _currentSessions.find(function (s) {
+      return s.name === name && (s.remoteId != null ? String(s.remoteId) : '') === rid;
+    });
+    openSession(name, { remoteId: (session != null && session.remoteId != null) ? session.remoteId : rid });
   }
 }
 
-function showPreview(name) {
+function showPreview(name, remoteId) {
   if (!name || !_currentSessions) return;
   var _previewDs = getDisplaySettings();
   if (_previewDs.showHoverPreview === false) return;
-  var session = _currentSessions.find(function (s) { return s.name === name; });
+  var rid = remoteId || '';
+  // Match name + remoteId so the preview (and the click that follows) targets the correct
+  // device's session under federation, not merely the first same-named one.
+  var session = _currentSessions.find(function (s) {
+    return s.name === name && (s.remoteId != null ? String(s.remoteId) : '') === rid;
+  });
   if (!session || !session.snapshot) return;
 
   // If already showing this session, just update content
-  if (_previewPopover && _previewSessionName === name) {
+  if (_previewPopover && _previewSessionName === name && (_previewRemoteId || '') === rid) {
     var pre = _previewPopover.querySelector('pre');
     if (pre) pre.innerHTML = ansiToHtml(session.snapshot);
     return;
@@ -2089,6 +2102,7 @@ function showPreview(name) {
 
   hidePreviewDOM();
   _previewSessionName = name;
+  _previewRemoteId = rid;
 
   // Full-window overlay
   var popover = document.createElement('div');
@@ -2123,6 +2137,7 @@ function hidePreview() {
   }
   hidePreviewDOM();
   _previewSessionName = null;
+  _previewRemoteId = '';
 }
 
 // ── Tile Flyout Menu ──────────────────────────────────────────────────────────
@@ -3336,6 +3351,49 @@ function updatePageTitle() {
 // ─── Session open / close ────────────────────────────────────────────────────
 
 /**
+ * Find the overview grid tile to run the zoom-open animation from.
+ *
+ * MUST be scoped to the grid's <article> tiles and matched on remoteId: `data-session` is
+ * non-unique (also emitted on expanded-header nav-pills, tile-options buttons, view-dropdown
+ * items, and search rows), and a bare name is ambiguous across federated devices
+ * (sessionKey = device_id:name). An unscoped document.querySelector('[data-session=…]') returned
+ * the first match in document order — when the clicked session has no tile in the currently
+ * filtered grid, that was a header nav-pill <button>, which then got position:fixed + 100vw/100vh
+ * slammed onto it and ballooned across the viewport. Returns null when no grid tile matches, so a
+ * header-only pill click simply skips the animation instead of hijacking another element.
+ * @param {string} name
+ * @param {string|null|undefined} remoteId
+ * @returns {Element|null}
+ */
+function _findZoomTile(name, remoteId) {
+  var grid = $('session-grid');
+  if (!grid || typeof grid.querySelectorAll !== 'function') return null;
+  var rid = remoteId != null ? String(remoteId) : '';
+  var cands = grid.querySelectorAll('article[data-session]');
+  for (var i = 0; i < cands.length; i++) {
+    if (cands[i].getAttribute('data-session') === name && (cands[i].dataset.remoteId || '') === rid) {
+      return cands[i];
+    }
+  }
+  return null;
+}
+
+/**
+ * Strip the inline fixed/100vw/100vh zoom styles off a tile (defense-in-depth — the tile is also
+ * rebuilt on the next grid render). No-op for null / non-element values.
+ * @param {Element|null} tile
+ */
+function _clearZoomTileStyles(tile) {
+  if (!tile || !tile.style) return;
+  tile.style.position = '';
+  tile.style.top = '';
+  tile.style.left = '';
+  tile.style.width = '';
+  tile.style.height = '';
+  tile.style.transition = '';
+}
+
+/**
  * Open a session in fullscreen view with a zoom transition.
  * @param {string} name - session name
  * @param {object} [opts]
@@ -3358,9 +3416,8 @@ async function openSession(name, opts = {}) {
   if (nameEl) nameEl.textContent = name;
   renderExpandedHeaderPills();
 
-  // Zoom animation: pin tile at current position, then animate to full viewport
-  // Skipped on restore (skipAnimation:true) — no tile DOM element to zoom from
-  const tile = opts.skipAnimation ? null : document.querySelector(`[data-session="${name}"]`);
+  // Zoom: animate the grid tile to fullscreen. _findZoomTile scopes by name+remoteId (see its doc).
+  let tile = opts.skipAnimation ? null : _findZoomTile(name, opts.remoteId);
   if (tile) {
     const rect = tile.getBoundingClientRect();
     tile.style.position = 'fixed';
@@ -3388,6 +3445,7 @@ async function openSession(name, opts = {}) {
         expanded.classList.remove('hidden');     // must remove class — !important wins over style.display
         expanded.classList.add('view--active');  // makes it display:flex
       }
+      _clearZoomTileStyles(tile);
       // Re-render sidebar after DOM is visible and dimensions are correct
       initSidebar();
       renderSidebar(_currentSessions, name, _viewingRemoteId);
@@ -5767,8 +5825,9 @@ function bindStaticEventListeners() {
       if (!tile) return;
       if (_previewTimer) { clearTimeout(_previewTimer); _previewTimer = null; }
       var name = tile.dataset.session;
+      var rid = tile.dataset.remoteId || '';
       var delay = getDisplaySettings().hoverPreviewDelay;
-      if (delay > 0) _previewTimer = setTimeout(function () { showPreview(name); }, delay);
+      if (delay > 0) _previewTimer = setTimeout(function () { showPreview(name, rid); }, delay);
     }, true);  // useCapture: true for delegation with mouseenter
 
     gridEl.addEventListener('mouseleave', function (e) {
@@ -5786,8 +5845,9 @@ function bindStaticEventListeners() {
       if (!item) return;
       if (_previewTimer) { clearTimeout(_previewTimer); _previewTimer = null; }
       var name = item.dataset.session;
+      var rid = item.dataset.remoteId || '';
       var delay = getDisplaySettings().hoverPreviewDelay;
-      if (delay > 0) _previewTimer = setTimeout(function () { showPreview(name); }, delay);
+      if (delay > 0) _previewTimer = setTimeout(function () { showPreview(name, rid); }, delay);
     }, true);
 
     sidebarListEl.addEventListener('mouseleave', function (e) {
@@ -6135,6 +6195,8 @@ if (typeof module !== 'undefined' && module.exports) {
     updatePillBell,
     openSession,
     closeSession,
+    _findZoomTile,
+    _clearZoomTileStyles,
     _setViewingSession,
     handleGlobalKeydown,
     bindStaticEventListeners,

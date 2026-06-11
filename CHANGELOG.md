@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.8.2 (2026-06-10)
+
+### Fixes
+
+- **Session pill no longer balloons across the viewport** — opening a session ran a
+  FLIP "zoom" animation that pinned a tile `position:fixed` and expanded it to
+  `100vw`/`100vh`. It selected the tile with a document-wide, name-only
+  `querySelector('[data-session="…"]')`, but `data-session` is non-unique (it is also
+  emitted on expanded-header nav-pills, tile-options buttons, view-dropdown items, and
+  search rows). When the clicked session had **no grid tile in the active view**
+  (a cross-view, auto-view, or "Other Sessions" pill), the first match was a header
+  nav-pill `<button>` — which then got the full-viewport styles slammed onto it and
+  was drawn down the left side of the screen (behind other layers, since it had no
+  `z-index`). The lookup is now scoped to `#session-grid article[data-session]` **and**
+  matched on `remoteId`; a header-only pill click leaves no match and the animation is
+  correctly skipped instead of hijacking the pill. Leftover inline zoom styles are also
+  proactively cleared once the overview is hidden. (Regression shipped with v0.7.0
+  expanded-header session pills, which introduced the first header-resident
+  `data-session` elements.)
+- **Hover-preview click attaches the correct federated session** — the desktop
+  hover-preview resolved its target session by bare **name** only
+  (`find(s => s.name === name)`), so when two federated devices exposed sessions with
+  the same name, clicking the preview could attach the **wrong device's** session.
+  The preview now tracks the hovered tile's `remoteId` and resolves by **name +
+  remoteId**, mirroring the unique `sessionKey = device_id:name` identity. The same
+  unscoped name-only selector above also animated the wrong same-named tile,
+  reinforcing the mismatch.
+
 ## v0.8.1 (2026-06-05)
 
 ### Fixes
