@@ -13,7 +13,9 @@
 - **Live session grid** — preview tiles with ANSI-colored terminal snapshots, auto-refreshed
 - **Two view modes** — Auto (scrollable grid) and Fit (all sessions fill the viewport)
 - **Views (tags)** — user-defined session groups with header pills (live counts, one-click switch), a management dropdown, and a Manage View panel with batched Apply
-- **Universal search** — 🔍 in the header (or `/`): partial-match sessions by name, cwd top-leaf directory, git repo name, or view/tag name; hidden sessions flagged; arrow-key + Enter navigation
+- **Directory auto-views** — virtual views synthesized per project directory (git repo name, falling back to cwd leaf) for any directory with 2+ sessions; dashed 📁 pills alongside user views, never persisted, recomputed live; user pills keep priority as the viewport narrows; toggleable in Settings → Display
+- **Group-by-directory grid** — third grid layout (Flat / Group by device / Group by directory) clustering tiles under alphabetical 📁 directory headers, with an Other bucket for sessions without path metadata
+- **Universal search** — 🔍 in the header (or `/`): partial-match sessions by name, cwd top-leaf directory, git repo name, or view/tag name (including auto-views); hidden sessions flagged; arrow-key + Enter navigation
 - **Bulk select mode** — ☑ toggle makes tiles multi-selectable; a floating bar adds the whole selection to a view or hides it in one action (search results offer the same via row checkboxes)
 - **Hover preview** — full-size overlay of session content on tile hover
 - **Activity indicators** — bell notification badges on tiles; amber favicon dot + `(N)` count in browser tab title when sessions have unseen activity
@@ -24,7 +26,7 @@
 ### Terminal
 
 - **Full interactive terminal** — powered by xterm.js + ttyd
-- **Session pills in the header** — current session highlighted; same-view sibling sessions inline (width-aware, grouped per view); dropdown pills reach any other session in 2 clicks
+- **Session pills in the header** — current session highlighted; same-view and same-directory sibling sessions inline (width-aware, grouped per view/directory); dropdown pills reach any other session in 2 clicks
 - **Native clipboard** — Ctrl+V / Cmd+V pastes the browser clipboard (bracketed paste); Ctrl+Shift+C copies; right-click pastes — or completes a copy when text is selected (Windows-terminal style)
 - **Shift+Enter newline** — sends LF so TUI apps (e.g. Claude Code) insert a line instead of submitting
 - **Mouse select auto-copy** — selecting text copies to system clipboard on release
@@ -37,7 +39,7 @@
 ### Settings
 
 - **In-browser settings panel** — gear icon or `,` shortcut
-- **Display** — font size, grid columns, hover delay, view mode, device badges, activity indicator
+- **Display** — font size, grid columns, grid grouping (flat / by device / by directory), directory auto-views toggle, hover delay, view mode, device badges, activity indicator
 - **Sessions** — default session, sort order, hidden sessions, auto-open, bell sound, notifications
 - **Commands** — custom create/delete session templates
 - **Multi-Device** — remote instance federation
@@ -271,7 +273,8 @@ All settings are stored in `~/.config/muxplex/settings.json`.
 | `showDeviceBadges` | `true` | Show device name labels on tiles |
 | `showHoverPreview` | `true` | Show hover preview popover on tile hover |
 | `activityIndicator` | `"both"` | Activity style: `none`, `glow`, `dot`, `both` |
-| `gridViewMode` | `"flat"` | Multi-device grid layout: `flat`, `grouped`, `filtered` |
+| `gridViewMode` | `"flat"` | Grid layout: `flat`, `grouped` (by device), `cwd` (by directory) |
+| `autoViewsEnabled` | `true` | Synthesize virtual auto-views from session directories (git repo / cwd leaf) |
 | `sidebarOpen` | `null` | Sidebar state: `true`, `false`, or `null` (auto-detect from screen width) |
 | `settings_updated_at` | `0.0` | Unix timestamp of last settings write (used for federation sync) |
 

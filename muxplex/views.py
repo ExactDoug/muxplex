@@ -20,6 +20,7 @@ Other invariants:
 import time
 
 RESERVED_VIEW_NAMES = frozenset({"all", "hidden"})
+AUTO_VIEW_PREFIX = "dir:"  # namespace for synthesized auto-views (never persisted)
 MAX_VIEW_NAME_LENGTH = 30
 
 
@@ -279,6 +280,9 @@ def validate_view_name(name: str, existing_views: list[dict]) -> str | None:
     - Non-empty after trimming
     - Max 30 characters after trimming
     - Not a reserved name ("all", "hidden") case-insensitive
+    - Does not start with the auto-view namespace prefix ("dir:")
+      case-insensitive — auto-views are synthesized from session cwd metadata
+      and must never collide with a persisted view
     - Unique among existing views (case-sensitive match)
     """
     trimmed = name.strip()
@@ -288,6 +292,8 @@ def validate_view_name(name: str, existing_views: list[dict]) -> str | None:
         return f"View name must be {MAX_VIEW_NAME_LENGTH} characters or fewer"
     if trimmed.lower() in RESERVED_VIEW_NAMES:
         return f"'{trimmed}' is a reserved name"
+    if trimmed.lower().startswith(AUTO_VIEW_PREFIX):
+        return f"Names starting with '{AUTO_VIEW_PREFIX}' are reserved for auto-views"
     existing_names = {v.get("name", "") for v in existing_views}
     if trimmed in existing_names:
         return f"A view named '{trimmed}' already exists"

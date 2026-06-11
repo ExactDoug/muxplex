@@ -53,7 +53,11 @@ DEFAULT_SETTINGS: dict = {
     "showDeviceBadges": True,
     "showHoverPreview": True,
     "activityIndicator": "both",
-    "gridViewMode": "flat",
+    "gridViewMode": "flat",  # 'flat' | 'grouped' (by device) | 'cwd' (by directory)
+    # Auto-views: virtual views synthesized from session directory metadata
+    # (gitRepo, falling back to cwdLeaf). Never persisted as views — this flag
+    # only enables/disables their synthesis in the frontend.
+    "autoViewsEnabled": True,
     "sidebarOpen": None,
     "settings_updated_at": 0.0,
     "_schema_version": SCHEMA_VERSION,
@@ -76,6 +80,7 @@ SYNCABLE_KEYS: frozenset[str] = frozenset(
         "showHoverPreview",
         "activityIndicator",
         "gridViewMode",
+        "autoViewsEnabled",
         "sidebarOpen",
         # Session behavior
         "sort_order",

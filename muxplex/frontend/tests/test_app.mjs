@@ -4271,8 +4271,9 @@ test('updatePageTitle function exists and uses activity count', () => {
 
 test('updatePageTitle is called from pollSessions', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
-  // Window sized to cover the render-call block (expanded pills + search refresh added in v0.7.x)
-  const pollFn = source.substring(source.indexOf('async function pollSessions'), source.indexOf('async function pollSessions') + 1200);
+  // Window sized to cover the render-call block (expanded pills + search
+  // refresh added in v0.7.x; auto-view recompute + resolve added in v0.8.0)
+  const pollFn = source.substring(source.indexOf('async function pollSessions'), source.indexOf('async function pollSessions') + 1800);
   assert.ok(pollFn.includes('updatePageTitle'), 'pollSessions must call updatePageTitle');
 });
 
@@ -6487,4 +6488,372 @@ test('Escape exits grid select mode (source contract)', () => {
   const snippet = appSource.slice(start, start + 2600);
   assert.ok(snippet.includes("e.key === 'Escape' && _selectMode"),
     'Escape must exit select mode in the grid');
+});
+
+// ============================================================================
+// cwd auto-grouping: auto-views + directory grid mode (v0.8.0)
+// docs/plans/2026-06-05-cwd-auto-grouping-plan.md
+// ============================================================================
+
+test('auto-view helpers are exported', () => {
+  assert.strictEqual(typeof app.buildAutoViews, 'function');
+  assert.strictEqual(typeof app.sessionGroupKey, 'function');
+  assert.strictEqual(typeof app.isAutoViewId, 'function');
+  assert.strictEqual(typeof app.autoViewKey, 'function');
+  assert.strictEqual(typeof app.allocateViewPills, 'function');
+  assert.strictEqual(typeof app.renderCwdGroupedGrid, 'function');
+  assert.strictEqual(typeof app._resolveActiveView, 'function');
+  assert.strictEqual(app.AUTO_VIEW_PREFIX, 'dir:');
+});
+
+test('sessionGroupKey prefers gitRepo, falls back to cwdLeaf, null without metadata', () => {
+  assert.strictEqual(app.sessionGroupKey({ gitRepo: 'myrepo', cwdLeaf: 'src' }), 'myrepo');
+  assert.strictEqual(app.sessionGroupKey({ cwdLeaf: 'scratch' }), 'scratch');
+  assert.strictEqual(app.sessionGroupKey({ gitRepo: null, cwdLeaf: null }), null);
+  assert.strictEqual(app.sessionGroupKey({ name: 'old-remote' }), null);
+  assert.strictEqual(app.sessionGroupKey(null), null);
+});
+
+test('isAutoViewId / autoViewKey round-trip the dir: namespace', () => {
+  assert.strictEqual(app.isAutoViewId('dir:qw-bridge'), true);
+  assert.strictEqual(app.isAutoViewId('qw-bridge'), false);
+  assert.strictEqual(app.isAutoViewId('all'), false);
+  assert.strictEqual(app.autoViewKey('dir:qw-bridge'), 'qw-bridge');
+  assert.strictEqual(app.autoViewKey('plain'), 'plain');
+});
+
+const avSessions = [
+  { name: 'qw-animas', cwdLeaf: 'qw-bridge', gitRepo: 'qw-bridge', snapshot: '' },
+  { name: 'qw-bridge', cwdLeaf: 'qw-bridge', gitRepo: 'qw-bridge', snapshot: '' },
+  { name: 'hello-1', cwdLeaf: 'hello-world', gitRepo: null, snapshot: '' },
+  { name: 'hello-2', cwdLeaf: 'hello-world', snapshot: '' },
+  { name: 'loner', cwdLeaf: 'solo-dir', gitRepo: 'solo-dir', snapshot: '' },
+  { name: 'no-meta', snapshot: '' },
+  { name: 'ghost', status: 'unreachable', deviceName: 'X', cwdLeaf: 'qw-bridge' },
+];
+
+test('buildAutoViews groups by key, requires >=2 members, sorts, namespaces ids', () => {
+  const autos = app.buildAutoViews(avSessions, { hidden_sessions: [] });
+  assert.deepStrictEqual(autos.map(a => a.id), ['dir:hello-world', 'dir:qw-bridge'],
+    'alpha-sorted, namespaced; singleton solo-dir and metadata-less sessions excluded');
+  assert.deepStrictEqual(autos.map(a => a.name), ['hello-world', 'qw-bridge']);
+  assert.deepStrictEqual(autos[1].sessions, ['qw-animas', 'qw-bridge']);
+});
+
+test('buildAutoViews excludes hidden sessions from membership (A6)', () => {
+  const autos = app.buildAutoViews(avSessions, { hidden_sessions: ['qw-animas'] });
+  // qw-bridge drops to 1 visible member -> below the 2-session minimum (A8)
+  assert.deepStrictEqual(autos.map(a => a.id), ['dir:hello-world']);
+});
+
+test('buildAutoViews honors the autoViewsEnabled toggle (A11)', () => {
+  assert.deepStrictEqual(app.buildAutoViews(avSessions, { autoViewsEnabled: false }), []);
+  assert.ok(app.buildAutoViews(avSessions, { autoViewsEnabled: true }).length > 0);
+  assert.ok(app.buildAutoViews(avSessions, {}).length > 0, 'absent key means enabled');
+});
+
+test('buildAutoViews uses sessionKey for membership when present', () => {
+  const autos = app.buildAutoViews([
+    { name: 'a', sessionKey: 'dev1:a', cwdLeaf: 'proj', snapshot: '' },
+    { name: 'b', sessionKey: 'dev2:b', cwdLeaf: 'proj', snapshot: '' },
+  ], { hidden_sessions: [] });
+  assert.deepStrictEqual(autos[0].sessions, ['dev1:a', 'dev2:b']);
+});
+
+test('filterVisible resolves dir: views from live metadata, hidden excluded', () => {
+  const settings = { views: [], hidden_sessions: ['qw-animas'] };
+  const inView = app.filterVisible(avSessions, settings, 'dir:qw-bridge');
+  assert.deepStrictEqual(inView.map(s => s.name), ['qw-bridge'],
+    'group-key members only; hidden member excluded (A6)');
+  assert.deepStrictEqual(app.filterVisible(avSessions, settings, 'dir:nope'), []);
+  // gitRepo precedence: a subdir shell groups under its repo key
+  const sub = [{ name: 's1', gitRepo: 'repo', cwdLeaf: 'src', snapshot: '' },
+               { name: 's2', gitRepo: 'repo', cwdLeaf: 'tests', snapshot: '' }];
+  assert.strictEqual(app.filterVisible(sub, { views: [], hidden_sessions: [] }, 'dir:repo').length, 2);
+});
+
+test('_resolveActiveView validates auto-view ids against the synthesized list', () => {
+  const views = [{ name: 'Work' }];
+  const autos = [{ id: 'dir:qw-bridge', name: 'qw-bridge', sessions: [] }];
+  assert.strictEqual(app._resolveActiveView('dir:qw-bridge', views, autos), 'dir:qw-bridge');
+  assert.strictEqual(app._resolveActiveView('dir:gone', views, autos), 'all',
+    'vanished auto-view falls back to all');
+  assert.strictEqual(app._resolveActiveView('dir:gone', views), 'all',
+    'no autoViews arg = no live auto-views');
+  assert.strictEqual(app._resolveActiveView('Work', views, autos), 'Work');
+  assert.strictEqual(app._resolveActiveView('Gone', views, autos), 'all');
+  assert.strictEqual(app._resolveActiveView('all', [], []), 'all');
+  assert.strictEqual(app._resolveActiveView('hidden', [], []), 'hidden');
+});
+
+test('pollSessions recomputes auto-views and re-resolves the active view (source contract)', () => {
+  const start = appSource.indexOf('async function pollSessions');
+  const snippet = appSource.slice(start, start + 1800);
+  assert.ok(snippet.includes('buildAutoViews'), 'pollSessions must rebuild _autoViews each cycle');
+  assert.ok(snippet.includes('_resolveActiveView'), 'pollSessions must re-validate the active view');
+});
+
+test('allocateViewPills: greedy prefix, stops at first non-fit, forces mustIndex', () => {
+  // gap = 2; widths 10 each; available 36 -> 3 fit (10+2)*3 = 36
+  assert.deepStrictEqual(app.allocateViewPills([10, 10, 10, 10], 36, 2, -1),
+    [true, true, true, false]);
+  // nothing fits
+  assert.deepStrictEqual(app.allocateViewPills([10, 10], 5, 2, -1), [false, false]);
+  // first-fit stop: index 1 too wide ends allocation even though 2 would fit
+  assert.deepStrictEqual(app.allocateViewPills([10, 100, 10], 30, 2, -1),
+    [true, false, false]);
+  // active pill is force-shown even when out of natural reach
+  assert.deepStrictEqual(app.allocateViewPills([10, 10, 10], 14, 2, 2),
+    [false, false, true], 'mustIndex pre-reserves its width');
+  // everything fits in test envs where widths measure 0
+  assert.deepStrictEqual(app.allocateViewPills([0, 0], 0, 0, -1), [true, true]);
+});
+
+test('renderViewPills appends auto-view pills with namespaced ids and bare labels', () => {
+  const pills = { innerHTML: '', clientWidth: 0 };
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => (id === 'view-pills' ? pills : null);
+
+  app._setServerSettings({ views: [{ name: 'Work', sessions: [] }], hidden_sessions: [] });
+  app._setCurrentSessions(avSessions);
+  app._setAutoViews(app.buildAutoViews(avSessions, { hidden_sessions: [] }));
+  app._setActiveView('dir:qw-bridge');
+  app.renderViewPills();
+
+  const html = pills.innerHTML;
+  assert.ok(html.includes('data-view="dir:qw-bridge"'), 'pill identity is the namespaced id');
+  assert.ok(html.includes('view-pill--auto'), 'auto pills carry the --auto modifier');
+  assert.ok(html.includes('view-pill__glyph'), 'auto pills carry the folder glyph');
+  assert.ok(!html.includes('>dir:qw-bridge <'), 'label shows the bare key, not the id');
+  assert.ok(/view-pill--auto view-pill--active|view-pill view-pill--auto view-pill--active/.test(html),
+    'active auto pill is highlighted');
+  assert.ok(html.indexOf('Work') < html.indexOf('dir:hello-world'),
+    'user pills render before auto pills (A7 priority)');
+
+  // No auto-views -> no auto pills, classic output preserved
+  app._setAutoViews([]);
+  app._setActiveView('all');
+  app.renderViewPills();
+  assert.ok(!pills.innerHTML.includes('view-pill--auto'));
+
+  globalThis.document.getElementById = origGetById;
+  app._setServerSettings(null);
+  app._setCurrentSessions([]);
+});
+
+test('renderViewDropdown lists auto-views and suppresses Manage for them (A5)', () => {
+  const menu = { innerHTML: '' };
+  const label = { textContent: '' };
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => {
+    if (id === 'view-dropdown-menu') return menu;
+    if (id === 'view-dropdown-label') return label;
+    return null;
+  };
+
+  app._setServerSettings({ views: [{ name: 'Work', sessions: [] }], hidden_sessions: [] });
+  app._setCurrentSessions(avSessions);
+  app._setAutoViews(app.buildAutoViews(avSessions, { hidden_sessions: [] }));
+  app._setActiveView('dir:qw-bridge');
+  app.renderViewDropdown();
+
+  assert.ok(menu.innerHTML.includes('view-dropdown__item--auto'), 'auto section rendered');
+  assert.ok(menu.innerHTML.includes('data-view="dir:hello-world"'));
+  assert.ok(!menu.innerHTML.includes('data-action="manage-view"'),
+    'Manage "<view>" action suppressed while an auto-view is active');
+  assert.ok(menu.innerHTML.includes('data-action="manage-views"'), 'Manage All Views stays');
+  assert.strictEqual(label.textContent, 'qw-bridge', 'mobile label shows the bare key');
+
+  // User view active -> manage action present again
+  app._setActiveView('Work');
+  app.renderViewDropdown();
+  assert.ok(menu.innerHTML.includes('data-action="manage-view"'));
+  assert.strictEqual(label.textContent, 'Work');
+
+  globalThis.document.getElementById = origGetById;
+  app._setActiveView('all');
+  app._setAutoViews([]);
+  app._setServerSettings(null);
+  app._setCurrentSessions([]);
+});
+
+test('openManageViewPanel rejects auto-view targets (source contract, A5)', () => {
+  const start = appSource.indexOf('function openManageViewPanel(');
+  const snippet = appSource.slice(start, start + 700);
+  assert.ok(snippet.includes('isAutoViewId(_manageViewTarget)'),
+    'the all/hidden reject guard must also reject dir: ids');
+});
+
+test('new-session flows never target auto-views (source contract, A5)', () => {
+  const pickerStart = appSource.indexOf('function _createViewPicker(');
+  const pickerSnippet = appSource.slice(pickerStart, pickerStart + 1200);
+  assert.ok(pickerSnippet.includes('!isAutoViewId(_activeView)'),
+    'picker must not pre-select an active auto-view');
+  const cnsStart = appSource.indexOf('async function createNewSession(');
+  const cnsSnippet = appSource.slice(cnsStart, cnsStart + 3000);
+  assert.ok(cnsSnippet.includes('!isAutoViewId(_activeView)'),
+    'legacy auto-add fallback must skip auto-views');
+});
+
+test('view-name validation rejects the dir: prefix everywhere (source contract, G1)', () => {
+  const sites = appSource.match(/toLowerCase\(\) === 'all' \|\| \w+\.toLowerCase\(\) === 'hidden'[^)]*\)/g) || [];
+  assert.ok(sites.length >= 5, 'expected the 5 view-name validation sites, found ' + sites.length);
+  for (const site of sites) {
+    assert.ok(site.includes('isAutoViewId'),
+      'validation site must reject dir:-prefixed names: ' + site);
+  }
+});
+
+test('searchSessions matches auto-view names as tags (A10), hidden gains no auto tag', () => {
+  const sessions = avSessions.concat([
+    { name: 'hidden-qw', cwdLeaf: 'qw-bridge', gitRepo: 'qw-bridge', snapshot: '' },
+  ]);
+  const settings = { views: [], hidden_sessions: ['hidden-qw'] };
+  const r = app.searchSessions('qw-bridge', sessions, settings);
+  const byName = {};
+  r.forEach(x => { byName[x.session.name] = x; });
+  // qw-animas: name doesn't contain 'qw-bridge' -> matched purely via the auto tag
+  assert.ok(byName['qw-animas'], 'sibling matched via auto-view tag');
+  assert.ok(byName['qw-animas'].matchedFields.includes('tag'));
+  assert.deepStrictEqual(byName['qw-animas'].autoTags, ['qw-bridge']);
+  assert.deepStrictEqual(byName['qw-animas'].tags, [], 'user-view tags untouched');
+  // hidden session still matches its own fields but gains NO auto tag (A6)
+  assert.ok(byName['hidden-qw'], 'hidden session still searchable');
+  assert.strictEqual(byName['hidden-qw'].hidden, true);
+  assert.deepStrictEqual(byName['hidden-qw'].autoTags, [],
+    'hidden sessions are not auto-view members');
+});
+
+test('search bulk chips footer never offers auto-views (source contract, A5)', () => {
+  const start = appSource.indexOf('function _searchFooterHTML(');
+  const snippet = appSource.slice(start, start + 1200);
+  assert.ok(!snippet.includes('_autoViews') && !snippet.includes('buildAutoViews'),
+    'bulk chips operate on persisted membership only');
+});
+
+test('renderCwdGroupedGrid: alpha-sorted dir headers, Other bucket last (B3/B4)', () => {
+  const html = app.renderCwdGroupedGrid([
+    { name: 'z1', cwdLeaf: 'zeta', gitRepo: null, snapshot: '' },
+    { name: 'a1', gitRepo: 'alpha', cwdLeaf: 'src', snapshot: '' },
+    { name: 'm1', cwdLeaf: 'Mid', snapshot: '' },
+    { name: 'lost', snapshot: '' },
+  ], false);
+  assert.ok(html.includes('dir-group-header'), 'directory headers present');
+  const alphaIdx = html.indexOf('alpha');
+  const midIdx = html.indexOf('Mid');
+  const zetaIdx = html.indexOf('zeta');
+  const otherIdx = html.indexOf('Other');
+  assert.ok(alphaIdx < midIdx && midIdx < zetaIdx, 'headers sorted case-insensitively');
+  assert.ok(otherIdx > zetaIdx, 'metadata-less sessions land in a final Other bucket');
+  assert.ok(html.indexOf('lost') > otherIdx, 'ungrouped tile under Other');
+  assert.ok(html.includes('data-session="a1"'), 'tiles render via buildTileHTML');
+});
+
+test('renderGrid routes gridViewMode=cwd to renderCwdGroupedGrid', () => {
+  const collectedHTML = [];
+  const mockGrid = {
+    get innerHTML() { return collectedHTML[0] || ''; },
+    set innerHTML(v) { collectedHTML[0] = v; },
+  };
+  const mockEmpty = { style: {}, classList: { add: () => {}, remove: () => {} } };
+  const origGetById = globalThis.document.getElementById;
+  const origQSA = globalThis.document.querySelectorAll;
+  globalThis.document.getElementById = (id) => {
+    if (id === 'session-grid') return mockGrid;
+    if (id === 'empty-state') return mockEmpty;
+    return null;
+  };
+  globalThis.document.querySelectorAll = () => [];
+
+  app._setServerSettings({ views: [], hidden_sessions: [] });
+  app._setGridViewMode('cwd');
+  app.renderGrid([
+    { name: 'a1', gitRepo: 'alpha', snapshot: '' },
+    { name: 'a2', gitRepo: 'alpha', snapshot: '' },
+    { name: 'dead', status: 'unreachable', deviceName: 'OldBox' },
+  ]);
+
+  const html = mockGrid.innerHTML;
+  assert.ok(html.includes('dir-group-header'), 'cwd mode uses directory headers');
+  assert.ok(html.includes('alpha'));
+  assert.ok(html.indexOf('source-tile--offline') > html.indexOf('data-session="a2"'),
+    'status tiles still append after the grouped grid (B6)');
+
+  app._setGridViewMode('flat');
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelectorAll = origQSA;
+  app._setServerSettings(null);
+});
+
+test('buildExpandedPillsModel adds a same-directory home group after view groups (A9)', () => {
+  const sessions = [
+    { name: 'cur', cwdLeaf: 'proj', gitRepo: 'proj', snapshot: '' },
+    { name: 'sib', cwdLeaf: 'proj', gitRepo: 'proj', snapshot: '' },
+    { name: 'viewmate', snapshot: '' },
+    { name: 'other-a', cwdLeaf: 'lib', gitRepo: 'lib', snapshot: '' },
+    { name: 'other-b', cwdLeaf: 'lib', gitRepo: 'lib', snapshot: '' },
+  ];
+  const settings = { views: [{ name: 'Home', sessions: ['cur', 'viewmate'] }], hidden_sessions: [] };
+  const model = app.buildExpandedPillsModel(sessions, settings, 'cur', '');
+  assert.deepStrictEqual(model.homeGroups.map(g => g.viewName), ['Home', 'proj'],
+    'directory group appended after view home groups');
+  assert.strictEqual(model.homeGroups[1].isAuto, true);
+  assert.deepStrictEqual(model.homeGroups[1].sessions.map(s => s.name), ['sib']);
+  assert.deepStrictEqual(model.otherViews.map(g => g.viewName), ['lib'],
+    'non-current directory groups become other-view dropdown pills (A3)');
+  assert.strictEqual(model.otherViews[0].isAuto, true);
+  assert.deepStrictEqual(model.otherSessions, [],
+    'sessions reachable via a directory pill are not duplicated in Other Sessions');
+});
+
+test('buildExpandedPillsModel dir group dedups siblings already shown in a view group', () => {
+  const sessions = [
+    { name: 'cur', gitRepo: 'proj', snapshot: '' },
+    { name: 'sib', gitRepo: 'proj', snapshot: '' },
+  ];
+  const settings = { views: [{ name: 'Home', sessions: ['cur', 'sib'] }], hidden_sessions: [] };
+  const model = app.buildExpandedPillsModel(sessions, settings, 'cur', '');
+  assert.deepStrictEqual(model.homeGroups.map(g => g.viewName), ['Home'],
+    'dir group dropped entirely when all siblings already render in view groups');
+});
+
+test('buildExpandedPillsModel respects the autoViewsEnabled toggle in the strip', () => {
+  const sessions = [
+    { name: 'cur', gitRepo: 'proj', snapshot: '' },
+    { name: 'sib', gitRepo: 'proj', snapshot: '' },
+  ];
+  const settings = { views: [], hidden_sessions: [], autoViewsEnabled: false };
+  const model = app.buildExpandedPillsModel(sessions, settings, 'cur', '');
+  assert.deepStrictEqual(model.homeGroups, [], 'no dir group when auto-views disabled');
+  assert.deepStrictEqual(model.otherSessions.map(s => s.name), ['sib'],
+    'sessions revert to Other Sessions when auto-views are off');
+});
+
+test('_viewDisplayName maps every identity form', () => {
+  assert.strictEqual(app._viewDisplayName('all'), 'All Sessions');
+  assert.strictEqual(app._viewDisplayName('hidden'), 'Hidden');
+  assert.strictEqual(app._viewDisplayName('dir:proj'), 'proj');
+  assert.strictEqual(app._viewDisplayName('Work'), 'Work');
+});
+
+// ============================================================================
+// v0.8.1 — search checkbox click must not close the dropdown
+// ============================================================================
+
+test('search click-outside guard ignores detached targets (source contract)', () => {
+  // Checkbox clicks toggle _searchSelected and synchronously re-render the
+  // dropdown (innerHTML replace) in the menu's own click handler. The
+  // document-level close-outside listener runs AFTER that on the same bubble,
+  // with e.target now detached — closest() can't reach the container, so
+  // without this guard the click is misread as outside and closeSearch()
+  // wipes the results + selection (the v0.8.0 "checkbox closes search" bug).
+  const start = appSource.indexOf('// Click-outside closes the search');
+  assert.ok(start !== -1, 'search close-outside handler must exist');
+  const snippet = appSource.slice(start, start + 900);
+  assert.ok(snippet.includes('isConnected === false'),
+    'close-outside handler must bail on detached targets before closest() checks');
+  const guardIdx = snippet.indexOf('isConnected === false');
+  const closeIdx = snippet.indexOf('closeSearch()');
+  assert.ok(guardIdx !== -1 && guardIdx < closeIdx,
+    'detached-target guard must run before closeSearch()');
 });

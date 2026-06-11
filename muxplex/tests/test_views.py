@@ -138,6 +138,19 @@ def test_validate_rejects_duplicate():
     assert validate_view_name("Work", existing) is not None
 
 
+def test_validate_rejects_auto_view_prefix():
+    """'dir:' is the auto-view namespace — persisted views must never use it."""
+    assert validate_view_name("dir:qw-bridge", []) is not None
+    assert validate_view_name("DIR:qw-bridge", []) is not None
+    assert validate_view_name("  dir:x  ", []) is not None
+
+
+def test_validate_accepts_dir_without_colon():
+    """Only the 'dir:' prefix is reserved, not the word 'dir' itself."""
+    assert validate_view_name("dir", []) is None
+    assert validate_view_name("directory stuff", []) is None
+
+
 def test_validate_accepts_valid_name():
     assert validate_view_name("My Project", []) is None
 

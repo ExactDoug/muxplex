@@ -1283,13 +1283,21 @@ def test_html_devices_panel_has_add_remote_btn() -> None:
 
 
 def test_html_devices_panel_has_view_mode() -> None:
-    """Multi-Device tab panel must contain #setting-view-mode select."""
+    """Multi-Device tab panel must NOT contain #setting-view-mode.
+
+    Relocated to the Display tab in v0.8.0 (B2): the Grid Grouping select
+    gained a 'Group by directory' option that works without multi-device, so
+    it can no longer live inside #multi-device-fields (which is disabled
+    wholesale when multi-device is off).
+    """
     soup = _SOUP
     devices_panel = soup.find("div", attrs={"data-tab": "devices"})
     assert devices_panel is not None, "Missing devices panel (data-tab='devices')"
     el = devices_panel.find(id="setting-view-mode")
-    assert el is not None, "Missing #setting-view-mode inside devices panel"
-    assert el.name == "select", f"#setting-view-mode must be a <select>, got: {el.name}"
+    assert el is None, (
+        "#setting-view-mode must NOT be in the devices panel "
+        "(moved to Display tab in v0.8.0 — see B2 in the cwd auto-grouping plan)"
+    )
 
 
 def test_html_devices_panel_has_view_scope() -> None:
@@ -1302,14 +1310,31 @@ def test_html_devices_panel_has_view_scope() -> None:
 
 
 def test_html_display_panel_no_view_mode() -> None:
-    """Display panel must NOT contain #setting-view-mode (moved to Multi-Device tab)."""
+    """Display panel must contain the Grid Grouping select with all 3 modes (B2)."""
     soup = _SOUP
     display_panel = soup.find("div", attrs={"data-tab": "display"})
     assert display_panel is not None, "Missing display panel"
     el = display_panel.find(id="setting-view-mode")
-    assert el is None, (
-        "#setting-view-mode must NOT be in the display panel (moved to Multi-Device tab)"
+    assert el is not None, (
+        "#setting-view-mode must be in the display panel (moved from Multi-Device "
+        "in v0.8.0 so 'Group by directory' is reachable without multi-device — B2)"
     )
+    assert el.name == "select", f"#setting-view-mode must be a <select>, got: {el.name}"
+    values = {opt.get("value") for opt in el.find_all("option")}
+    assert values == {"flat", "grouped", "cwd"}, (
+        f"Grid Grouping options must be flat/grouped/cwd, got: {values}"
+    )
+
+
+def test_html_display_panel_has_auto_views_toggle() -> None:
+    """Display panel must contain the directory auto-views checkbox (A11)."""
+    soup = _SOUP
+    display_panel = soup.find("div", attrs={"data-tab": "display"})
+    assert display_panel is not None, "Missing display panel"
+    el = display_panel.find(id="setting-auto-views-enabled")
+    assert el is not None, "Missing #setting-auto-views-enabled in display panel"
+    assert el.get("type") == "checkbox", "#setting-auto-views-enabled must be a checkbox"
+    assert el.has_attr("checked"), "#setting-auto-views-enabled must default to checked (A11)"
 
 
 def test_html_display_panel_no_view_scope() -> None:
