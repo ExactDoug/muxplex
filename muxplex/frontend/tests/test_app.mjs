@@ -6786,6 +6786,42 @@ test('renderViewPills appends auto-view pills with namespaced ids and bare label
   app._setCurrentSessions([]);
 });
 
+// --- View-vs-Session pill distinction (Stage 2, v0.9) ---
+
+test('renderViewPills gives user-view pills the layers glyph (distinct from sessions)', () => {
+  const pills = { innerHTML: '', clientWidth: 0 };
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => (id === 'view-pills' ? pills : null);
+
+  app._setServerSettings({ views: [{ name: 'Work', sessions: [] }], hidden_sessions: [] });
+  app._setCurrentSessions([]);
+  app._setAutoViews([]);
+  app._setActiveView('all');
+  app.renderViewPills();
+
+  const html = pills.innerHTML;
+  // User view pill carries the ⧉ layers glyph and a --user marker class…
+  assert.ok(/view-pill--user/.test(html), 'user-view pill carries the --user modifier');
+  assert.ok(html.includes('⧉'), 'user-view pill carries the ⧉ layers glyph');
+  // …while the All Sessions / Hidden meta pills do NOT get the glyph treatment.
+  const allPill = html.slice(html.indexOf('data-view="all"') - 60, html.indexOf('data-view="all"') + 60);
+  assert.ok(!allPill.includes('⧉'), 'All Sessions pill stays plain (no view glyph)');
+
+  globalThis.document.getElementById = origGetById;
+  app._setServerSettings(null);
+});
+
+test('_epGroupLabel prefixes user views with ⧉ and auto views with 📁', () => {
+  // Not exported — assert via source so session pills stay glyph-free while
+  // every expanded-header view-group pill reads as a view.
+  const appSource = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const start = appSource.indexOf('function _epGroupLabel(');
+  assert.ok(start !== -1, '_epGroupLabel must exist');
+  const body = appSource.slice(start, start + 200);
+  assert.ok(/g\.isAuto\s*\?\s*'📁 '\s*:\s*'⧉ '/.test(body),
+    '_epGroupLabel must use 📁 for auto views and ⧉ for user views');
+});
+
 test('renderViewDropdown lists auto-views and suppresses Manage for them (A5)', () => {
   const menu = { innerHTML: '' };
   const label = { textContent: '' };

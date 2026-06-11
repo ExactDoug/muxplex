@@ -1228,7 +1228,9 @@ function renderViewPills() {
   for (var i = 0; i < views.length && i < 7; i++) {
     var v = views[i];
     var vActive = _activeView === v.name ? ' view-pill--active' : '';
-    fixedHtmls.push('<button class="view-pill' + vActive + '" data-view="' + escapeHtml(v.name) + '" title="' + escapeHtml(v.name) + '">' + escapeHtml(v.name) + ' <span class="view-pill__count">' + visibleCount(_currentSessions, _serverSettings, v.name) + '</span></button>');
+    // Leading ⧉ glyph marks this as a user view (a saved container of sessions);
+    // auto-views use 📁 (_autoViewPillHTML). All Sessions / Hidden stay plain.
+    fixedHtmls.push('<button class="view-pill view-pill--user' + vActive + '" data-view="' + escapeHtml(v.name) + '" title="' + escapeHtml(v.name) + '"><span class="view-pill__glyph" aria-hidden="true">⧉</span>' + escapeHtml(v.name) + ' <span class="view-pill__count">' + visibleCount(_currentSessions, _serverSettings, v.name) + '</span></button>');
   }
 
   // — Hidden: only when it has sessions (or is currently active)
@@ -3793,10 +3795,12 @@ function _epSessionPillHTML(s, isCurrent) {
     escapeHtml(s.name) + _epBellHTML(s) + '</button>';
 }
 
-/** Display label for a strip group — auto (directory) groups get the folder
- *  glyph that marks synthesized views everywhere else. */
+/** Display label for a strip group — every view-group pill carries a leading
+ *  glyph so it reads as a *view* (a container of sessions) rather than a
+ *  session: auto (directory) groups get the folder glyph; user views get the
+ *  layers glyph. Session pills (_epSessionPillHTML) carry no glyph. */
 function _epGroupLabel(g) {
-  return (g.isAuto ? '📁 ' : '') + g.viewName;
+  return (g.isAuto ? '📁 ' : '⧉ ') + g.viewName;
 }
 
 /** Dropdown pill HTML (other view / group overflow / Other Sessions). */
