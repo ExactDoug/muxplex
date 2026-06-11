@@ -2099,6 +2099,109 @@ test('openSession mounts terminal AFTER connect POST, not inside animation timer
     '_openTerminal must appear AFTER the /connect POST in the source');
 });
 
+// --- Zoom-open animation selector (regression: nav-pill viewport hijack, v0.8.2) ---
+//
+// The FLIP zoom MUST find its tile via a grid-scoped + remoteId-matched lookup. A bare,
+// document-wide querySelector('[data-session="…"]') matched the first element in document
+// order — which, when the clicked session had no grid tile in the active view, was an
+// expanded-header nav-pill <button>. The pill then got position:fixed + 100vw/100vh slammed
+// onto it and ballooned across the viewport. Do NOT reintroduce an unscoped selector here.
+
+test('zoom-open selector is grid-scoped and remoteId-matched (no document-wide data-session lookup)', () => {
+  const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+
+  // The unscoped, document-wide selector that caused the hijack must be gone entirely.
+  assert.ok(!source.includes('querySelector(`[data-session'),
+    'must NOT use an unscoped document-wide querySelector(`[data-session…`) for the zoom — ' +
+    'data-session is non-unique (nav-pills, tile-options buttons, dropdown items, search rows)');
+
+  // openSession resolves the zoom tile through the dedicated helper.
+  const fnStart = source.indexOf('async function openSession');
+  const fnBody = source.substring(fnStart, fnStart + 4000);
+  assert.ok(fnBody.includes('_findZoomTile('),
+    'openSession must resolve the zoom tile via _findZoomTile()');
+
+  // _findZoomTile must scope to the overview grid, restrict to <article> tiles, and match remoteId.
+  const helperStart = source.indexOf('function _findZoomTile');
+  assert.ok(helperStart >= 0, '_findZoomTile helper must exist');
+  const helperBody = source.substring(helperStart, source.indexOf('\n}', helperStart) + 2);
+  assert.ok(helperBody.includes("'session-grid'") || helperBody.includes('"session-grid"'),
+    '_findZoomTile must scope the lookup to the #session-grid container');
+  assert.ok(helperBody.includes('article[data-session]'),
+    '_findZoomTile must restrict matches to <article> grid tiles');
+  assert.ok(helperBody.includes('dataset.remoteId'),
+    '_findZoomTile must disambiguate by remoteId (federation same-name sessions)');
+});
+
+test('_findZoomTile returns the matching grid <article>, never a nav-pill, and null when only a pill matches', () => {
+  const orig = globalThis.document.getElementById;
+  // Fake grid tiles: a local and a remote session that share the bare name "claude".
+  const localTile = { tagName: 'ARTICLE', getAttribute: (k) => (k === 'data-session' ? 'claude' : null), dataset: {} };
+  const remoteTile = { tagName: 'ARTICLE', getAttribute: (k) => (k === 'data-session' ? 'claude' : null), dataset: { remoteId: 'devB' } };
+  const mockGrid = {
+    // querySelectorAll('article[data-session]') only ever yields grid <article>s — never the
+    // header nav-pill button, which lives outside #session-grid. That separation is the fix.
+    querySelectorAll: () => [localTile, remoteTile],
+  };
+  globalThis.document.getElementById = (id) => (id === 'session-grid' ? mockGrid : null);
+  try {
+    assert.strictEqual(app._findZoomTile('claude', ''), localTile,
+      'local "claude" (remoteId "") must resolve to the local grid article');
+    assert.strictEqual(app._findZoomTile('claude', 'devB'), remoteTile,
+      'remote "claude" (remoteId "devB") must resolve to the remote grid article, not the first same-named tile');
+    assert.strictEqual(app._findZoomTile('ghost', ''), null,
+      'a session with no grid tile (header-only pill click) must return null — animation is skipped, no hijack');
+  } finally {
+    globalThis.document.getElementById = orig;
+  }
+});
+
+test('_findZoomTile is null-safe when the grid is absent or non-queryable', () => {
+  const orig = globalThis.document.getElementById;
+  try {
+    globalThis.document.getElementById = () => null;
+    assert.strictEqual(app._findZoomTile('claude', ''), null, 'null grid → null (no throw)');
+    globalThis.document.getElementById = () => ({ style: {} });  // no querySelectorAll (test DOM stub)
+    assert.strictEqual(app._findZoomTile('claude', ''), null, 'grid without querySelectorAll → null (no throw)');
+  } finally {
+    globalThis.document.getElementById = orig;
+  }
+});
+
+test('_clearZoomTileStyles resets the inline fixed/100vw/100vh styles and is null-safe', () => {
+  const tile = { style: { position: 'fixed', top: '0', left: '0', width: '100vw', height: '100vh', transition: 'all 250ms ease' } };
+  app._clearZoomTileStyles(tile);
+  assert.strictEqual(tile.style.position, '', 'position cleared');
+  assert.strictEqual(tile.style.width, '', 'width cleared');
+  assert.strictEqual(tile.style.height, '', 'height cleared');
+  assert.strictEqual(tile.style.transition, '', 'transition cleared');
+  assert.doesNotThrow(() => app._clearZoomTileStyles(null), 'null tile is a no-op');
+  assert.doesNotThrow(() => app._clearZoomTileStyles({}), 'tile without .style is a no-op');
+});
+
+// --- Hover-preview federation disambiguation (regression: wrong-session attach, v0.8.2) ---
+
+test('hover-preview resolves session by name AND remoteId (federation same-name attach)', () => {
+  const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+
+  // showPreview must accept a remoteId so it can track which device's session is hovered.
+  assert.ok(/function showPreview\(\s*name\s*,\s*remoteId\s*\)/.test(source),
+    'showPreview must accept (name, remoteId) — a bare name is ambiguous across federated devices');
+  // The hovered remoteId must be tracked for the deferred click handler.
+  assert.ok(source.includes('_previewRemoteId'),
+    'a _previewRemoteId must track the hovered session\'s remoteId for _previewClickHandler');
+
+  // Both the preview lookup and the click handler must match on remoteId, not name alone.
+  const handlerStart = source.indexOf('function _previewClickHandler');
+  const handlerBody = source.substring(handlerStart, source.indexOf('\n}', handlerStart) + 2);
+  assert.ok(/s\.remoteId != null \? String\(s\.remoteId\) : ''\)\s*===\s*rid/.test(handlerBody),
+    '_previewClickHandler must match the session on name AND remoteId (not the first same-named one)');
+
+  // The hover binds (grid tile + sidebar item) must forward the element's data-remote-id.
+  assert.ok((source.match(/showPreview\(name,\s*rid\)/g) || []).length >= 2,
+    'both grid-tile and sidebar hover handlers must pass the hovered remoteId into showPreview');
+});
+
 // --- Hover preview popover ---
 
 test('app.js has hover preview popover with desktop-only guard', () => {
