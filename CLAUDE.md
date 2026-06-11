@@ -5,7 +5,14 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.8.0**.
+improvements. Current version: **0.8.2** (on `main`).
+
+**Next work — branch `feat/v0.9-session-ux`** (off `main` @ v0.8.2): three UI
+improvements, scoped in `docs/plans/2026-06-11-v0.9-session-ux-requirements.md`:
+(1) new session auto-becomes the active session; (2) rename tmux sessions from the
+tile flyout + both header pill dropdowns (⚠ must cascade the rename to `view.sessions`,
+`hidden_sessions`, and active-session state — no backend rename endpoint exists yet);
+(3) style View pills distinctly from session pills in both headers.
 
 ## Running locally (development)
 
@@ -107,3 +114,13 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
   `docs/plans/2026-06-05-cwd-auto-grouping-plan.md` — directory auto-views
   (virtual `dir:` views, user-pill collapse priority) + group-by-directory grid
   mode + Grid Grouping settings relocation
+- Pill zoom-hijack + federated-attach fix (v0.8.2): see `CHANGELOG.md`. The
+  session-open zoom animation must select its tile via `_findZoomTile()`
+  (`#session-grid article[data-session]` scoped + remoteId-matched) — never an
+  unscoped `document.querySelector('[data-session=…]')`, which hijacked header
+  nav-pills into full-viewport elements. Hover-preview resolves sessions by
+  name + remoteId. Enforced by regression tests in `test_app.mjs`.
+- **NEXT — v0.9 session UX (NOT STARTED):**
+  `docs/plans/2026-06-11-v0.9-session-ux-requirements.md` — auto-activate new
+  session, rename tmux sessions (pills + tiles, with view/hidden/state cascade),
+  distinct View-vs-session pill styling. Branch `feat/v0.9-session-ux`.
