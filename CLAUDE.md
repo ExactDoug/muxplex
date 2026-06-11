@@ -5,7 +5,18 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.8.0**.
+improvements. Current version: **0.9.0** (on branch `feat/v0.9-session-ux`).
+
+**v0.9 session UX (DONE on `feat/v0.9-session-ux`)** — see `CHANGELOG.md` v0.9.0:
+(1) new sessions reliably auto-open (createNewSession poll now keys off the canonical
+`device_id:name` sessionKey and waits ~120s); (2) **session rename** —
+`POST /api/sessions/{name}/rename` (`tmux rename-session`) with an atomic cascade
+(`views.rename_session_key` → view membership + `hidden_sessions`; plus state
+`active_session`/`session_order`/bell/`viewing_session`); reachable from the tile
+flyout (grid + sidebar) and the expanded-header session dropdown (✎). **Local-only**
+in v0.9 (remote rename would stale peers' keys); (3) View pills carry a leading ⧉
+glyph (auto-views keep 📁) to read distinctly from session pills. Also: narrow-viewport
+idle session-name contrast bumped `--text-dim`→`--text-muted`.
 
 ## Running locally (development)
 
@@ -107,3 +118,15 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
   `docs/plans/2026-06-05-cwd-auto-grouping-plan.md` — directory auto-views
   (virtual `dir:` views, user-pill collapse priority) + group-by-directory grid
   mode + Grid Grouping settings relocation
+- Pill zoom-hijack + federated-attach fix (v0.8.2): see `CHANGELOG.md`. The
+  session-open zoom animation must select its tile via `_findZoomTile()`
+  (`#session-grid article[data-session]` scoped + remoteId-matched) — never an
+  unscoped `document.querySelector('[data-session=…]')`, which hijacked header
+  nav-pills into full-viewport elements. Hover-preview resolves sessions by
+  name + remoteId. Enforced by regression tests in `test_app.mjs`.
+- v0.9 session UX (DONE, branch `feat/v0.9-session-ux`):
+  requirements `docs/plans/2026-06-11-v0.9-session-ux-requirements.md`; shipped in
+  `CHANGELOG.md` v0.9.0 — reliable new-session auto-open, **local** session rename
+  (`POST /api/sessions/{name}/rename` + `views.rename_session_key` cascade; flyout +
+  expanded-header ✎; remote rename out of scope), ⧉ View-pill glyph, and a
+  narrow-viewport idle-name contrast fix.

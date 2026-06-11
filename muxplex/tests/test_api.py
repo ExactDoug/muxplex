@@ -3714,3 +3714,170 @@ def test_federation_connect_device_id_not_found(client, monkeypatch, tmp_path):
     assert response.status_code == 404, (
         f"Expected 404 for unknown device_id, got {response.status_code}: {response.text}"
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/sessions/{name}/rename — rename + cascade (v0.9, local-only)
+# ---------------------------------------------------------------------------
+
+
+def _rename_mocks(monkeypatch, tmp_path, *, known, device_id="dev1", settings=None):
+    """Wire the common mocks for a rename test and isolate settings to tmp.
+
+    Returns the captured run_tmux AsyncMock so callers can assert tmux args.
+    """
+    import json
+    from unittest.mock import AsyncMock
+
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    if settings is not None:
+        settings_path.write_text(json.dumps(settings))
+
+    mock_run_tmux = AsyncMock(return_value="")
+    monkeypatch.setattr("muxplex.main.run_tmux", mock_run_tmux)
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: list(known))
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {})
+    monkeypatch.setattr("muxplex.main.load_device_id", lambda: device_id)
+
+    async def _mock_enumerate():
+        return list(known)
+
+    monkeypatch.setattr("muxplex.main.enumerate_sessions", _mock_enumerate)
+    monkeypatch.setattr("muxplex.main.update_session_cache", lambda *a, **k: None)
+    return mock_run_tmux, settings_path
+
+
+def test_rename_session_renames_tmux_and_returns_new_name(client, monkeypatch, tmp_path):
+    """Happy path: tmux rename-session is invoked and the new name is returned."""
+    mock_run_tmux, _ = _rename_mocks(
+        monkeypatch, tmp_path, known=["old"], settings={"views": [], "hidden_sessions": []}
+    )
+
+    response = client.post("/api/sessions/old/rename", json={"new_name": "new"})
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["ok"] is True
+    assert data["name"] == "new"
+    assert data["old_name"] == "old"
+    mock_run_tmux.assert_awaited_once_with("rename-session", "-t", "old", "new")
+
+
+def test_rename_session_cascades_view_and_hidden_membership(client, monkeypatch, tmp_path):
+    """The canonical key AND a legacy bare name are rewritten in views + hidden."""
+    import json
+
+    _, settings_path = _rename_mocks(
+        monkeypatch,
+        tmp_path,
+        known=["old"],
+        device_id="dev1",
+        settings={
+            "views": [
+                {"name": "Work", "sessions": ["dev1:old", "dev1:keep"]},
+                {"name": "Legacy", "sessions": ["old"]},  # bare-name legacy entry
+            ],
+            "hidden_sessions": ["dev1:old"],
+        },
+    )
+
+    response = client.post("/api/sessions/old/rename", json={"new_name": "new"})
+    assert response.status_code == 200, response.text
+
+    saved = json.loads(settings_path.read_text())
+    views = {v["name"]: v["sessions"] for v in saved["views"]}
+    assert views["Work"] == ["dev1:new", "dev1:keep"]
+    assert views["Legacy"] == ["dev1:new"]
+    assert saved["hidden_sessions"] == ["dev1:new"]
+
+
+def test_rename_session_no_duplicate_when_new_key_already_present(
+    client, monkeypatch, tmp_path
+):
+    """Renaming into a key a view already holds collapses rather than duplicates."""
+    import json
+
+    _, settings_path = _rename_mocks(
+        monkeypatch,
+        tmp_path,
+        known=["old"],
+        device_id="dev1",
+        settings={
+            "views": [{"name": "V", "sessions": ["dev1:new", "dev1:old"]}],
+            "hidden_sessions": [],
+        },
+    )
+
+    response = client.post("/api/sessions/old/rename", json={"new_name": "new"})
+    assert response.status_code == 200, response.text
+    saved = json.loads(settings_path.read_text())
+    assert saved["views"][0]["sessions"] == ["dev1:new"]
+
+
+def test_rename_session_cascades_active_session_state(client, monkeypatch, tmp_path):
+    """Renaming the active local session updates active_session in state."""
+    _rename_mocks(
+        monkeypatch, tmp_path, known=["old"], settings={"views": [], "hidden_sessions": []}
+    )
+
+    # Mark 'old' as the active local session.
+    assert client.patch("/api/state", json={"active_session": "old"}).status_code == 200
+
+    response = client.post("/api/sessions/old/rename", json={"new_name": "new"})
+    assert response.status_code == 200, response.text
+
+    state = client.get("/api/state").json()
+    assert state["active_session"] == "new"
+
+
+def test_rename_session_404_for_unknown_session(client, monkeypatch, tmp_path):
+    """Renaming a session not in the known list returns 404 and skips tmux."""
+    mock_run_tmux, _ = _rename_mocks(
+        monkeypatch, tmp_path, known=["alpha"], settings={"views": [], "hidden_sessions": []}
+    )
+    response = client.post("/api/sessions/ghost/rename", json={"new_name": "new"})
+    assert response.status_code == 404
+    mock_run_tmux.assert_not_awaited()
+
+
+def test_rename_session_rejects_illegal_chars(client, monkeypatch, tmp_path):
+    """A new name with tmux-illegal '.'/':' is rejected (400) before tmux runs."""
+    mock_run_tmux, _ = _rename_mocks(
+        monkeypatch, tmp_path, known=["old"], settings={"views": [], "hidden_sessions": []}
+    )
+    response = client.post("/api/sessions/old/rename", json={"new_name": "a:b"})
+    assert response.status_code == 400
+    mock_run_tmux.assert_not_awaited()
+
+
+def test_rename_session_rejects_dir_prefix(client, monkeypatch, tmp_path):
+    """The reserved auto-view 'dir:' prefix is rejected (400)."""
+    _rename_mocks(
+        monkeypatch, tmp_path, known=["old"], settings={"views": [], "hidden_sessions": []}
+    )
+    response = client.post("/api/sessions/old/rename", json={"new_name": "dir:foo"})
+    assert response.status_code == 400
+
+
+def test_rename_session_rejects_duplicate_name(client, monkeypatch, tmp_path):
+    """Renaming to an existing session name is rejected (400)."""
+    mock_run_tmux, _ = _rename_mocks(
+        monkeypatch,
+        tmp_path,
+        known=["old", "taken"],
+        settings={"views": [], "hidden_sessions": []},
+    )
+    response = client.post("/api/sessions/old/rename", json={"new_name": "taken"})
+    assert response.status_code == 400
+    mock_run_tmux.assert_not_awaited()
+
+
+def test_rename_session_blank_name_is_422(client, monkeypatch, tmp_path):
+    """A blank/whitespace new_name fails Pydantic validation (422)."""
+    _rename_mocks(
+        monkeypatch, tmp_path, known=["old"], settings={"views": [], "hidden_sessions": []}
+    )
+    response = client.post("/api/sessions/old/rename", json={"new_name": "   "})
+    assert response.status_code == 422

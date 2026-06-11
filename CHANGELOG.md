@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.9.0 (2026-06-11)
+
+Session-UX improvements.
+
+### Features
+
+- **New sessions now open straight into their terminal.** Creating a session from
+  any entry point (header/​sidebar/​FAB "+" buttons) lands you in the new session's
+  fullscreen terminal instead of leaving you on the grid. The previous auto-open
+  silently failed for *local* sessions: the create-poll matched the new session by a
+  bare name, but the backend tags every session (local included) with a canonical
+  `device_id:name` `sessionKey`, so the match never succeeded and the poll always
+  timed out. The poll now builds the local key from the device id (with a bare-name
+  fallback) and waits generously (~120 s) for slow-to-start sessions — opening the
+  moment the session appears rather than on a fixed delay.
+- **Rename tmux sessions from the UI** (local sessions; v0.9 scope). A new
+  `POST /api/sessions/{name}/rename` runs `tmux rename-session` and **atomically
+  cascades** the rename everywhere the old name was stored — every view's membership
+  list, `hidden_sessions` (legacy bare-name entries are healed to canonical form), and
+  persistent state (`active_session`, `session_order`, per-session bell, the device's
+  `viewing_session`). New names are validated (no empty/whitespace, no tmux-illegal
+  `.`/`:`, not the reserved `dir:` auto-view prefix, no duplicates). Reachable from the
+  tile/card flyout (grid **and** sidebar) and from the expanded terminal header's
+  session dropdown (a ✎ control). The existing ttyd attach survives the rename, so the
+  live terminal keeps running. Remote/federated rename is intentionally out of scope
+  (it would leave peers' membership keys stale until the stale-key prune); the UI hides
+  Rename for remote sessions.
+- **View pills are now visually distinct from session pills** in both headers. User
+  views carry a leading ⧉ layers glyph; auto/​directory views keep their 📁 folder
+  glyph; session pills stay glyph-free capsules. Shape/glyph cue (not color) so it
+  reads for color-blind users, and it doesn't disturb the width-aware pill collapse.
+
+### Fixes
+
+- **Readable session names in the narrow-viewport list.** When the grid collapses to a
+  single-column list on very small screens, idle-tier session names were rendered in
+  `--text-dim` (#4A5060) on the header background — only ~2.3:1 contrast, below WCAG AA.
+  They now use `--text-muted` (~6:1): comfortably readable without the harsh glare of
+  full-brightness text.
+
 ## v0.8.2 (2026-06-10)
 
 ### Fixes

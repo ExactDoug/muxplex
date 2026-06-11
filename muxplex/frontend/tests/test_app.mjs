@@ -1080,6 +1080,146 @@ test('updatePillBell hides pill bell when no other session has unseen bells', as
   globalThis.fetch = undefined;
 });
 
+// --- createNewSession auto-activate (Stage 1, v0.9) ---
+
+test('createNewSession is exported', () => {
+  assert.strictEqual(typeof app.createNewSession, 'function');
+});
+
+test('createNewSession builds the local expectedKey from _localDeviceId (canonical device_id:name)', () => {
+  // Local sessions are tagged device_id:name by the backend (main.py /api/sessions),
+  // so a bare-name expectedKey never matches s.sessionKey and auto-open silently
+  // never fires. The local branch must namespace with _localDeviceId.
+  const src = app.createNewSession.toString();
+  assert.ok(
+    /_localDeviceId\s*\)\s*\{[\s\S]*?expectedKey\s*=\s*_localDeviceId\s*\+\s*':'\s*\+\s*sessionName/.test(src) ||
+      /expectedKey\s*=\s*_localDeviceId\s*\+\s*':'\s*\+\s*sessionName/.test(src),
+    'createNewSession must build local expectedKey as _localDeviceId + ":" + sessionName',
+  );
+});
+
+test('createNewSession poll matcher tolerates bare-name fallback for local creates', () => {
+  // Guards the window before _localDeviceId resolves: a local create must still
+  // match the new session by bare name so openSession fires.
+  const src = app.createNewSession.toString();
+  assert.ok(
+    /!deviceId\s*&&\s*s\.name\s*===\s*sessionName/.test(src),
+    'createNewSession matcher must fall back to bare-name match for local creates',
+  );
+});
+
+test('createNewSession calls openSession on poll success', () => {
+  const src = app.createNewSession.toString();
+  assert.ok(
+    /openSession\(sessionName,\s*\{\s*remoteId:\s*deviceId\s*\}\)/.test(src),
+    'createNewSession must open the new session once it appears in _currentSessions',
+  );
+});
+
+// --- Session rename (Stage 3, v0.9 — local-only) ---
+
+test('renameSession is exported and POSTs to /api/sessions/{old}/rename', async () => {
+  let captured = null;
+  // URL-aware stub: capture the rename POST; the follow-up pollSessions GET
+  // gets an empty list so it doesn't pollute _currentSessions.
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).includes('/rename')) {
+      captured = { url: String(url), opts };
+      return { ok: true, status: 200, json: async () => ({ ok: true, name: 'new', old_name: 'old' }) };
+    }
+    return { ok: true, status: 200, json: async () => [] };
+  };
+  app._setServerSettings({ views: [], hidden_sessions: [] });
+  app._setCurrentSessions([]);
+  await app.renameSession('old', '', 'new');
+  globalThis.fetch = undefined;
+  app._setServerSettings(null);
+  app._setCurrentSessions([]);
+  assert.ok(captured, 'renameSession must call fetch for the rename');
+  assert.strictEqual(captured.url, '/api/sessions/old/rename');
+  assert.strictEqual(captured.opts.method, 'POST');
+  assert.deepStrictEqual(JSON.parse(captured.opts.body), { new_name: 'new' });
+});
+
+test('renameSession is a no-op for empty/unchanged names and never fetches', async () => {
+  let called = false;
+  globalThis.fetch = async () => { called = true; return { ok: true, json: async () => ({}) }; };
+  await app.renameSession('old', '', '');       // empty
+  await app.renameSession('old', '', '   ');    // whitespace
+  await app.renameSession('old', '', 'old');    // unchanged
+  globalThis.fetch = undefined;
+  assert.strictEqual(called, false, 'no fetch for empty/unchanged renames');
+});
+
+test('renameSession refuses remote sessions (local-only in v0.9) without fetching', async () => {
+  let called = false;
+  globalThis.fetch = async () => { called = true; return { ok: true, json: async () => ({}) }; };
+  await app.renameSession('old', 'remote-dev', 'new');
+  globalThis.fetch = undefined;
+  assert.strictEqual(called, false, 'remote rename must not hit the API');
+});
+
+test('_validateSessionNameClient mirrors the backend rules', () => {
+  assert.strictEqual(app._validateSessionNameClient('good-name', []), null);
+  assert.ok(app._validateSessionNameClient('', []));
+  assert.ok(app._validateSessionNameClient('   ', []));
+  assert.ok(app._validateSessionNameClient('a.b', []), 'rejects dot');
+  assert.ok(app._validateSessionNameClient('a:b', []), 'rejects colon');
+  assert.ok(app._validateSessionNameClient('dir:x', []), 'rejects dir: prefix');
+  assert.ok(app._validateSessionNameClient('taken', ['taken', 'other']), 'rejects duplicate');
+});
+
+test('_applyRenameToLocalSettings rewrites canonical key + legacy bare name in views + hidden', () => {
+  app._setLocalDeviceId('dev1');
+  // _setServerSettings stores by reference, so we can assert on this object.
+  const ss = {
+    views: [
+      { name: 'Work', sessions: ['dev1:old', 'dev1:keep'] },
+      { name: 'Legacy', sessions: ['old'] },        // bare-name legacy entry
+      { name: 'Dup', sessions: ['dev1:new', 'dev1:old'] },  // collapse, no dup
+    ],
+    hidden_sessions: ['dev1:old'],
+  };
+  app._setServerSettings(ss);
+  app._applyRenameToLocalSettings('old', 'new');
+  assert.deepStrictEqual(ss.views[0].sessions, ['dev1:new', 'dev1:keep']);
+  assert.deepStrictEqual(ss.views[1].sessions, ['dev1:new'], 'legacy bare name upgraded to canonical');
+  assert.deepStrictEqual(ss.views[2].sessions, ['dev1:new'], 'no duplicate when new key already present');
+  assert.deepStrictEqual(ss.hidden_sessions, ['dev1:new']);
+  app._setLocalDeviceId(null);
+  app._setServerSettings(null);
+});
+
+test('_epMenuItemHTML adds a Rename control for local sessions, omits it for remote', () => {
+  const localHtml = app._epMenuItemHTML({ name: 'work', remoteId: '', bell: false });
+  assert.ok(localHtml.includes('data-rename'), 'local session item has a rename control');
+  assert.ok(localHtml.includes('ep-menu-row'), 'local session item wraps open + rename in a row');
+
+  const remoteHtml = app._epMenuItemHTML({ name: 'work', remoteId: 'dev2', bell: false });
+  assert.ok(!remoteHtml.includes('data-rename'), 'remote session item has no rename control');
+});
+
+test('flyout menu wiring: Rename is a localOnly action, filtered for remote, and dispatched', () => {
+  const src = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  // The map carries a localOnly rename action and a remote filter helper.
+  assert.ok(/action:\s*'rename',\s*localOnly:\s*true/.test(src),
+    'FLYOUT_MENU_MAP must define a localOnly rename action');
+  assert.ok(/_flyoutItemsFor[\s\S]{0,200}localOnly/.test(src),
+    '_flyoutItemsFor must drop localOnly items for remote sessions');
+  // Both flyout builders run items through the filter.
+  assert.strictEqual((src.match(/_flyoutItemsFor\(FLYOUT_MENU_MAP/g) || []).length, 2,
+    'both desktop + mobile flyout builders must filter items');
+  // Desktop dispatch routes the rename action to the inline input.
+  assert.ok(/case 'rename':[\s\S]{0,260}_openRenameSessionInput/.test(src),
+    "_handleFlyoutClick must handle the 'rename' action");
+});
+
+test('expanded-header pill dropdown handles the data-rename control', () => {
+  const src = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  assert.ok(/closest\('\[data-rename\]'\)[\s\S]{0,200}_openRenameSessionInput/.test(src),
+    'the expanded-pill-menu click handler must open rename for [data-rename]');
+});
+
 // --- openSession ---
 
 test('openSession is exported', () => {
@@ -2583,7 +2723,10 @@ test('createNewSession polls for session before auto-opening (not immediate setT
   assert.ok(start !== -1, 'createNewSession function must exist');
   // Updated in v0.6.0: snippet size increased from 2000 to 3500 — function grew with
   // loading tile injection and auto-add-to-view logic; setInterval is now ~2800 chars in.
-  const snippet = source.slice(start, start + 3500);
+  // Updated in v0.9: 3500 -> 5200; expectedKey now namespaces local creates with
+  // _localDeviceId and a findNewSession() helper + generous wait were added
+  // (auto-activate fix), pushing setInterval to ~4600 chars in.
+  const snippet = source.slice(start, start + 5200);
   // Must NOT contain the old immediate-open pattern inside createNewSession
   assert.ok(
     !snippet.includes("setTimeout(() => openSession"),
@@ -4539,7 +4682,10 @@ test('createNewSession passes remoteId through to openSession for auto-open', ()
   assert.ok(fnStart !== -1, 'createNewSession function must exist');
   // Updated in v0.6.0: window increased from 3000 to 4000 — function grew with loading
   // tile injection and auto-add-to-view logic; openSession call is now ~3200 chars in.
-  const fnBody = source.substring(fnStart, fnStart + 4000);
+  // Updated in v0.9: 4000 -> 5400; local-create expectedKey namespacing + a
+  // findNewSession() helper and generous poll wait (auto-activate fix) push the
+  // openSession call to ~4850 chars in.
+  const fnBody = source.substring(fnStart, fnStart + 5400);
   // Must call openSession with remoteId option
   assert.ok(
     fnBody.includes('openSession') && fnBody.includes('remoteId'),
@@ -4577,6 +4723,17 @@ test('CSS has new-session-device-select styling', () => {
     source.includes('.new-session-device-select'),
     'style.css must have .new-session-device-select rule',
   );
+});
+
+test('mobile idle tile-name uses readable --text-muted, not the unreadable --text-dim', () => {
+  // Stage 4 (v0.9): --text-dim on the header bg is ~2.3:1 contrast — unreadable
+  // in the narrow-viewport session list. Must not regress.
+  const source = fs.readFileSync(new URL('../style.css', import.meta.url), 'utf8');
+  const idx = source.indexOf('.session-tile--tier-idle .tile-name');
+  assert.ok(idx !== -1, 'tier-idle tile-name rule must exist');
+  const rule = source.slice(idx, source.indexOf('}', idx));
+  assert.ok(rule.includes('var(--text-muted)'), 'idle tile-name must use --text-muted');
+  assert.ok(!/color:\s*var\(--text-dim\)/.test(rule), 'idle tile-name must not use --text-dim');
 });
 
 // --- Fix: blur handler guards against closing when clicking device select ---
@@ -6742,6 +6899,42 @@ test('renderViewPills appends auto-view pills with namespaced ids and bare label
   globalThis.document.getElementById = origGetById;
   app._setServerSettings(null);
   app._setCurrentSessions([]);
+});
+
+// --- View-vs-Session pill distinction (Stage 2, v0.9) ---
+
+test('renderViewPills gives user-view pills the layers glyph (distinct from sessions)', () => {
+  const pills = { innerHTML: '', clientWidth: 0 };
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => (id === 'view-pills' ? pills : null);
+
+  app._setServerSettings({ views: [{ name: 'Work', sessions: [] }], hidden_sessions: [] });
+  app._setCurrentSessions([]);
+  app._setAutoViews([]);
+  app._setActiveView('all');
+  app.renderViewPills();
+
+  const html = pills.innerHTML;
+  // User view pill carries the ⧉ layers glyph and a --user marker class…
+  assert.ok(/view-pill--user/.test(html), 'user-view pill carries the --user modifier');
+  assert.ok(html.includes('⧉'), 'user-view pill carries the ⧉ layers glyph');
+  // …while the All Sessions / Hidden meta pills do NOT get the glyph treatment.
+  const allPill = html.slice(html.indexOf('data-view="all"') - 60, html.indexOf('data-view="all"') + 60);
+  assert.ok(!allPill.includes('⧉'), 'All Sessions pill stays plain (no view glyph)');
+
+  globalThis.document.getElementById = origGetById;
+  app._setServerSettings(null);
+});
+
+test('_epGroupLabel prefixes user views with ⧉ and auto views with 📁', () => {
+  // Not exported — assert via source so session pills stay glyph-free while
+  // every expanded-header view-group pill reads as a view.
+  const appSource = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const start = appSource.indexOf('function _epGroupLabel(');
+  assert.ok(start !== -1, '_epGroupLabel must exist');
+  const body = appSource.slice(start, start + 200);
+  assert.ok(/g\.isAuto\s*\?\s*'📁 '\s*:\s*'⧉ '/.test(body),
+    '_epGroupLabel must use 📁 for auto views and ⧉ for user views');
 });
 
 test('renderViewDropdown lists auto-views and suppresses Manage for them (A5)', () => {

@@ -16,6 +16,7 @@ from muxplex.sessions import (
     run_tmux,
     snapshot_all,
     update_session_cache,
+    validate_session_name,
 )
 
 
@@ -351,3 +352,38 @@ def test_session_paths_cache_roundtrip():
     got["b"] = "/y"  # mutating the copy must not affect the cache
     assert sessions_mod.get_session_paths() == {"a": "/x"}
     sessions_mod.update_session_paths({})
+
+
+# ---------------------------------------------------------------------------
+# validate_session_name (v0.9 rename)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_session_name_accepts_plain_name():
+    assert validate_session_name("my-project") is None
+    assert validate_session_name("  trimmed  ") is None
+
+
+def test_validate_session_name_rejects_empty_and_whitespace():
+    assert validate_session_name("") is not None
+    assert validate_session_name("   ") is not None
+
+
+def test_validate_session_name_rejects_tmux_separators():
+    assert validate_session_name("a.b") is not None
+    assert validate_session_name("a:b") is not None
+
+
+def test_validate_session_name_rejects_dir_prefix():
+    assert validate_session_name("dir:foo") is not None
+    assert validate_session_name("DIR:foo") is not None
+
+
+def test_validate_session_name_rejects_control_chars():
+    assert validate_session_name("a\tb") is not None
+    assert validate_session_name("a\nb") is not None
+
+
+def test_validate_session_name_rejects_duplicate():
+    assert validate_session_name("taken", existing=["taken", "other"]) is not None
+    assert validate_session_name("fresh", existing=["taken", "other"]) is None
