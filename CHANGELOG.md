@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.9.2 (2026-06-18)
+
+Directory auto-grouping now spans git worktrees.
+
+### Fixes
+
+- **Worktree sessions group with their parent repo.** The cwd auto-grouping feature
+  (the directory drop-downs in the header) keys each session on its git repo name. But
+  a linked worktree — e.g. one created under `<repo>/.worktrees/<branch>` — places a
+  `.git` *file* (not a directory) at its root, and the resolver stopped there and
+  returned the *worktree directory's* name. So a session working in a worktree formed
+  its own lonely `dir:<worktree>` group instead of joining the repo's group alongside
+  the sessions in the main checkout. `resolve_git_repo` now detects the `.git`-file
+  case and follows it (via the worktree gitdir's `commondir` pointer, falling back to
+  stripping the conventional `worktrees/<name>` suffix) to the **main repo** name, so
+  every session for a repo — main checkout and all its worktrees — lands in one
+  directory group. Pure-Python, still no `git` subprocess; unparseable `.git` files
+  fall back to the old per-directory name. (Backend only — the frontend grouping logic
+  was already correct; it was being fed the wrong repo name.)
+
 ## v0.9.1 (2026-06-18)
 
 Multi-browser session-sync fixes.
