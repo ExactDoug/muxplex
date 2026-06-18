@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.9.1 (2026-06-18)
+
+Multi-browser session-sync fixes.
+
+### Fixes
+
+- **The sidebar now tracks the session that's actually on screen.** muxplex serves
+  every browser/​tab from a single shared ttyd (one global `active_session`), so when a
+  second browser on the same machine opened a different session, the first browser's
+  terminal silently followed the shared ttyd — but its sidebar kept highlighting the
+  *old* session, and re-clicking that stale highlight was a dead no-op (the click was
+  short-circuited because the local "current session" variable still matched). The poll
+  cycle now reconciles against the server's `active_session` while a session is open
+  (`reconcileViewingSession`): it adopts whatever session is really being displayed so
+  the sidebar highlight, header, and pills follow reality, and clicking is never stuck.
+  The re-attach is client-only — it never re-issues `/connect`, so it can't kill+respawn
+  the shared ttyd and disrupt the browser that made the switch. A short grace window
+  after a local open prevents an in-flight state write from being read back stale and
+  yanking you off the session you just clicked. (This makes all your browsers/​tabs
+  *converge* on one session; independent per-browser sessions remain future work.)
+
+- **The hover-preview overlay no longer pops for the session you're already viewing.**
+  On the interactive page, hovering the active session's sidebar thumbnail (or having
+  just clicked it open) showed the large light-box preview of the very session already
+  filling the main viewer — redundant and distracting. `showPreview` now early-returns
+  when the hovered session is the one currently displayed; previews for *other* sessions
+  are unchanged. (A global on/off toggle already exists at Settings → Display → "Show
+  hover preview".)
+
 ## v0.9.0 (2026-06-11)
 
 Session-UX improvements.

@@ -2221,8 +2221,10 @@ test('openSession mounts terminal AFTER connect POST, not inside animation timer
   );
 
   // Find the openSession function body
+  // Window widened 4000→4800 when reconcileOnly gating grew the function body
+  // (terminal mount stays last, just further from fnStart). Stays < closeSession.
   const fnStart = source.indexOf('async function openSession');
-  const fnBody = source.substring(fnStart, fnStart + 4000);
+  const fnBody = source.substring(fnStart, fnStart + 4800);
 
   // _openTerminal must NOT appear inside setTimeout
   const setTimeoutIdx = fnBody.indexOf('setTimeout');
@@ -3887,6 +3889,56 @@ test('showPreview checks showHoverPreview setting before showing popover', () =>
   const fnEnd = source.indexOf('\n}', fnStart);
   const fnBody = source.substring(fnStart, fnEnd + 2);
   assert.ok(fnBody.includes('showHoverPreview'), 'showPreview must check showHoverPreview setting before showing popover');
+});
+
+test('showPreview suppresses the overlay for the already-displayed session', () => {
+  const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const fnStart = source.indexOf('function showPreview(');
+  assert.ok(fnStart !== -1, 'showPreview must exist');
+  const fnEnd = source.indexOf('\n}', fnStart);
+  const fnBody = source.substring(fnStart, fnEnd + 2);
+  // The big hover overlay is redundant noise when you're already viewing that session.
+  assert.ok(/name === _viewingSession/.test(fnBody),
+    'showPreview must early-return when the hovered session is the one already displayed');
+  assert.ok(fnBody.includes("_viewMode === 'fullscreen'"),
+    'the already-displayed suppression must be scoped to the interactive (fullscreen) view');
+});
+
+test('openSession gates connect/PATCH writes behind reconcileOnly', () => {
+  const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const fnStart = source.indexOf('async function openSession');
+  const fnBody = source.substring(fnStart, fnStart + 4800);
+  assert.ok(/if \(!opts\.reconcileOnly\)/.test(fnBody),
+    'openSession must guard the /connect POST + PATCH /api/state behind !opts.reconcileOnly so a reconcile follows the server without re-spawning the shared ttyd');
+  // Terminal still mounts in both paths (client-only re-attach for reconcile).
+  const openTermIdx = fnBody.indexOf('_openTerminal');
+  assert.ok(openTermIdx !== -1, 'openSession must still mount the terminal in the reconcile path');
+});
+
+test('reconcileViewingSession follows server active_session WITHOUT re-issuing /connect', () => {
+  const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const fnStart = source.indexOf('async function reconcileViewingSession');
+  assert.ok(fnStart !== -1, 'reconcileViewingSession must exist');
+  const fnEnd = source.indexOf('\n}', fnStart);
+  const fnBody = source.substring(fnStart, fnEnd + 2);
+  assert.ok(fnBody.includes('/api/state'),
+    'reconcileViewingSession must read the shared active_session from GET /api/state');
+  assert.ok(fnBody.includes('reconcileOnly: true'),
+    'reconcileViewingSession must adopt the server session via a reconcileOnly open');
+  assert.ok(fnBody.includes('RECONCILE_GRACE_MS'),
+    'reconcileViewingSession must skip within the post-local-open grace window (stale-read race guard)');
+  assert.ok(!fnBody.includes('/connect'),
+    'reconcileViewingSession must NOT re-issue /connect — that would kill+respawn the shared ttyd and disrupt the client that made the switch');
+});
+
+test('pollSessions reconciles the displayed session only in fullscreen view', () => {
+  const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const fnStart = source.indexOf('async function pollSessions');
+  const fnBody = source.substring(fnStart, fnStart + 2500);
+  assert.ok(fnBody.includes('reconcileViewingSession'),
+    'pollSessions must reconcile the displayed session each cycle');
+  assert.ok(fnBody.includes("_viewMode === 'fullscreen'"),
+    'reconcile must be gated to fullscreen (no extra /api/state read while on the grid)');
 });
 
 test('bindStaticEventListeners binds change events for display toggle controls', () => {

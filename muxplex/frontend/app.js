@@ -115,12 +115,17 @@ function buildHeartbeatPayload(device_id, viewing_session, view_mode, last_inter
 const POLL_MS = 2000;
 const HEARTBEAT_MS = 5000;
 const MOBILE_THRESHOLD = 600;
+// After a local openSession, ignore poll-driven reconcile for this long so our
+// own in-flight PATCH /api/state isn't read back stale and yank us off the
+// session we just clicked. Must exceed one poll cycle. See reconcileViewingSession.
+const RECONCILE_GRACE_MS = 3000;
 
 // ─── App state ────────────────────────────────────────────────────────────────
 let _deviceId = '';
 let _currentSessions = [];
 let _viewingSession = null;
 let _viewingRemoteId = '';
+let _lastLocalOpenAt = 0;  // Date.now() of the last user-initiated openSession (reconcile race-guard)
 let _viewMode = 'grid';
 let _lastInteractionAt = Date.now() / 1000;
 let _pollingTimer;
@@ -348,6 +353,36 @@ function setConnectionStatus(level) {
 
 // ─── Session polling ─────────────────────────────────────────────────────────────────────────────
 /**
+ * Reconcile the locally-tracked viewing session against the server's shared
+ * active_session. muxplex serves every browser/tab from ONE shared ttyd, so when
+ * another client on this machine opens a different session our terminal follows
+ * that shared ttyd while local _viewingSession goes stale — leaving the sidebar
+ * highlighting the wrong session and the click-idempotency guard dead (re-clicking
+ * the highlighted session becomes a no-op). Adopt whatever the server reports as
+ * active so the sidebar + hover-preview guard track the truly-displayed session.
+ * Re-attach is client-only (reconcileOnly) — we never re-issue /connect, which
+ * would kill+respawn the shared ttyd and disrupt the client that made the switch.
+ * Skipped within RECONCILE_GRACE_MS of a local open so our own in-flight PATCH
+ * isn't read back stale. Only called while a session is open (fullscreen view).
+ * @returns {Promise<void>}
+ */
+async function reconcileViewingSession() {
+  if (Date.now() - _lastLocalOpenAt < RECONCILE_GRACE_MS) return;
+  try {
+    const res = await api('GET', '/api/state');
+    const state = await res.json();
+    const serverName = state.active_session || null;
+    if (!serverName) return;
+    const serverRid = state.active_remote_id || '';
+    if (serverName === _viewingSession && serverRid === (_viewingRemoteId || '')) return;
+    await openSession(serverName, { remoteId: serverRid, skipAnimation: true, reconcileOnly: true });
+  } catch (err) {
+    // Non-fatal: pollSessions owns connection-status; a failed reconcile just
+    // leaves local state as-is until the next poll retries.
+  }
+}
+
+/**
  * Fetch sessions from the appropriate endpoint and update the UI.
  * Uses /api/federation/sessions when multi_device_enabled is true,
  * /api/sessions otherwise.
@@ -381,6 +416,9 @@ async function pollSessions() {
     updateSessionPill(sessions);
     updateFaviconBadge();
     updatePageTitle();
+    // Follow cross-browser session switches: while viewing a session, adopt the
+    // server's shared active_session if another client repointed the shared ttyd.
+    if (_viewMode === 'fullscreen' && _viewingSession != null) await reconcileViewingSession();
   } catch (err) {
     _pollFailCount++;
     setConnectionStatus(_pollFailCount <= 2 ? 'warn' : 'err');
@@ -2098,6 +2136,11 @@ function showPreview(name, remoteId) {
   var _previewDs = getDisplaySettings();
   if (_previewDs.showHoverPreview === false) return;
   var rid = remoteId || '';
+  // Don't pop the big overlay for the session already showing in the main viewer.
+  // Once you're looking at it (or just clicked it open) the large preview is pure
+  // redundant noise. _viewingSession reliably tracks the truly-displayed session
+  // (kept honest by reconcileViewingSession), so this also covers cross-browser switches.
+  if (_viewMode === 'fullscreen' && name === _viewingSession && rid === (_viewingRemoteId || '')) return;
   // Match name + remoteId so the preview (and the click that follows) targets the correct
   // device's session under federation, not merely the first same-named one.
   var session = _currentSessions.find(function (s) {
@@ -3422,6 +3465,11 @@ function _clearZoomTileStyles(tile) {
  */
 async function openSession(name, opts = {}) {
   if (!name || !name.trim()) return;
+  // reconcileOnly: follow the server's shared active_session WITHOUT POSTing
+  // /connect or PATCHing state — used by reconcileViewingSession to adopt a
+  // switch made by another browser/tab. A user-initiated open stamps the
+  // race-guard so an in-flight PATCH isn't read back stale.
+  if (!opts.reconcileOnly) _lastLocalOpenAt = Date.now();
   hidePreview();
   _viewingSession = name;
   _viewingRemoteId = opts.remoteId != null ? opts.remoteId : '';
@@ -3494,24 +3542,30 @@ async function openSession(name, opts = {}) {
   // Always spawn ttyd for this session — ensures correct session after service restart or page restore
   // _deviceId holds the device_id string (was integer remoteId index in old protocol)
   var _deviceId = opts.remoteId != null ? opts.remoteId : '';
-  try {
-    if (_deviceId !== '') {
-      // Remote session: route connect POST through same-origin federation proxy
-      await api('POST', '/api/federation/' + encodeURIComponent(_deviceId) + '/connect/' + encodeURIComponent(name));
-    } else {
-      await api('POST', '/api/sessions/' + encodeURIComponent(name) + '/connect');
+  // reconcileOnly skips ALL of the connect/PATCH/bell network writes: the shared
+  // ttyd is already serving this session (another client repointed it) and our
+  // PATCH would just echo the value we're following. We still re-mount the
+  // terminal below so this browser's xterm + terminal.js target re-sync client-side.
+  if (!opts.reconcileOnly) {
+    try {
+      if (_deviceId !== '') {
+        // Remote session: route connect POST through same-origin federation proxy
+        await api('POST', '/api/federation/' + encodeURIComponent(_deviceId) + '/connect/' + encodeURIComponent(name));
+      } else {
+        await api('POST', '/api/sessions/' + encodeURIComponent(name) + '/connect');
+      }
+    } catch (err) {
+      showToast(err.message || 'Connection failed');
+      return closeSession();
     }
-  } catch (err) {
-    showToast(err.message || 'Connection failed');
-    return closeSession();
-  }
 
-  // Persist active_remote_id so restoreState() can reopen remote sessions after page refresh
-  api('PATCH', '/api/state', { active_session: name, active_remote_id: _deviceId || null }).catch(function() {});
+    // Persist active_remote_id so restoreState() can reopen remote sessions after page refresh
+    api('PATCH', '/api/state', { active_session: name, active_remote_id: _deviceId || null }).catch(function() {});
 
-  // Fire-and-forget bell-clear for remote sessions — acknowledge bells on the remote server
-  if (_deviceId !== '') {
-    api('POST', '/api/federation/' + encodeURIComponent(_deviceId) + '/sessions/' + encodeURIComponent(name) + '/bell/clear').catch(function() {});
+    // Fire-and-forget bell-clear for remote sessions — acknowledge bells on the remote server
+    if (_deviceId !== '') {
+      api('POST', '/api/federation/' + encodeURIComponent(_deviceId) + '/sessions/' + encodeURIComponent(name) + '/bell/clear').catch(function() {});
+    }
   }
 
   // Wait for animation to finish (may already be done if /connect was slow)
