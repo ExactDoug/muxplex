@@ -1135,6 +1135,49 @@ test('terminal.js gates text selection behind a drag threshold (focus-click neve
     'a focus-only click must clear any stray selection and refocus the terminal');
 });
 
+test('terminal.js first click after a terminal regains focus is a reset+focus click (no stale drag)', () => {
+  // If a drag's mouseup never reaches the page (window blurred mid-drag, button
+  // released outside the window), xterm's selection drag is never terminated and
+  // extends from the stale anchor when the pointer returns. Fix: track focus
+  // (focusin/focusout + window blur) and treat the first click after refocus as
+  // a pure reset+focus click — clear selection, refocus, consume the press, do
+  // no mouse action — plus terminate any in-progress drag the moment focus is lost.
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  const start = source.indexOf('initDeliberateSelection');
+  const block = source.substring(start, source.indexOf('})();', start));
+  // Focus is tracked via bubbling focusin/focusout and window blur (alt-tab).
+  assert.ok(block.includes("addEventListener('focusin'") && block.includes("addEventListener('focusout'"),
+    'must track terminal focus via focusin/focusout');
+  assert.ok(/window\.addEventListener\('blur'/.test(block),
+    'must treat window blur as focus loss (alt-tab keeps element focus but not window focus)');
+  // Losing focus tears down the gesture and ends any stale xterm drag.
+  assert.ok(block.includes('endGesture'), 'must define a gesture-teardown path on focus loss');
+  assert.ok(/dispatchEvent\(new MouseEvent\('mouseup'/.test(block),
+    'must terminate a stale xterm selection drag by dispatching a synthetic mouseup');
+  // The reset click consumes the press and performs no mouse action.
+  const mdStart = block.indexOf("addEventListener('mousedown'");
+  const mdBlock = block.substring(mdStart);
+  assert.ok(/if \(!hasFocus\)/.test(mdBlock),
+    'the mousedown handler must special-case the first (refocus) click');
+  const resetBranch = mdBlock.substring(mdBlock.indexOf('if (!hasFocus)'));
+  assert.ok(resetBranch.includes('stopImmediatePropagation') && resetBranch.includes('preventDefault'),
+    'the reset click must consume the press so xterm starts no selection');
+  assert.ok(resetBranch.includes('_term.focus()'),
+    'the reset click must refocus the terminal so typing resumes');
+});
+
+test('terminal.js never injects a synthetic mouse release into a TUI mouse-tracking stream', () => {
+  // The stale-drag teardown must be selection-mode only; in mouse-tracking mode a
+  // synthetic mouseup would forward a spurious release escape into the TUI.
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  const start = source.indexOf('initDeliberateSelection');
+  const block = source.substring(start, source.indexOf('})();', start));
+  const egStart = block.indexOf('function endGesture');
+  const egBlock = block.substring(egStart, block.indexOf('}', block.indexOf('dispatchEvent', egStart)));
+  assert.ok(/!inMouseTracking\(\)/.test(egBlock) || /mouseTrackingMode === 'none'/.test(egBlock),
+    'the synthetic mouseup must be gated to non-mouse-tracking (selection) mode');
+});
+
 test('terminal.js deliberate-selection handlers are attached once at module level (no stacking)', () => {
   const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
   const openStart = source.indexOf('function openTerminal');

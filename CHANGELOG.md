@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.9.4 (2026-06-18)
+
+Returning focus to a terminal no longer drags a selection from a stale point.
+
+### Fixes
+
+- **The first click after a terminal regains focus is a clean reset, not a stale
+  drag.** xterm.js builds a selection by anchoring on mousedown and extending on every
+  mousemove until mouseup — but if that mouseup never reaches the page (the window
+  blurred mid-drag, or the button was released outside the window), the drag is never
+  terminated and its mousemove listener stays live. Returning to the terminal and moving
+  the mouse toward your next click then *extended a selection from the old anchor* to the
+  new point — it looked like a click-and-drag you never made, and typing went nowhere.
+  Now: losing focus (`focusout` / window `blur`) terminates any in-progress drag and
+  resets all gesture state at the source, and the **first click after the terminal
+  regains focus is a pure reset+focus click** — it clears any stale selection, refocuses
+  so typing resumes, and performs no mouse action. A second click does real mouse work
+  (selection still needs a deliberate drag past the threshold from v0.9.3). Focus is
+  tracked with bubbling `focusin`/`focusout` plus window `blur` to cover alt-tab (where
+  the element keeps DOM focus but the window does not). The stale-drag teardown is
+  selection-mode only — it never injects a synthetic release into a full-screen TUI's
+  mouse-tracking stream.
+
 ## v0.9.3 (2026-06-18)
 
 Terminal mouse fixes: a focus-click no longer drops you into selection mode, and

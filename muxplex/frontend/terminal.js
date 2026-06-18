@@ -661,30 +661,44 @@ window._setTerminalFontSize = setTerminalFontSize;
 })();
 
 // ---------------------------------------------------------------------------
-// Deliberate text selection — a plain click must NOT start a selection.
-// xterm.js begins selecting on the first left mousedown and extends it on every
-// mousemove, so the tiniest pointer drift while clicking-to-focus (e.g.
-// clicking the window just to regain OS focus when switching between apps)
-// leaves a stray selection. Keystrokes then look "stuck" and the user has to
-// Escape / scroll / right-click to recover — the exact aggravation this fixes.
+// Deliberate text selection + focus-reset click.
 //
-// Fix: gate selection behind a small drag threshold. On a qualifying left press
-// we let xterm focus its hidden textarea (we do NOT preventDefault), but we
-// intercept — in CAPTURE phase, ahead of xterm's bubble-phase document
-// mousemove — the moves that would EXTEND the selection, stopImmediate-
-// Propagation while the pointer stays within DRAG_THRESHOLD px of the press
-// point. Cross the threshold and it is a real drag: we stop intercepting and
-// xterm builds the selection normally, anchored at the original press cell. A
-// press that never crosses the threshold is a focus click — no selection forms,
-// and on mouseup we clear any stray selection and refocus so typing stays live.
+// xterm.js (5.3.0, no built-in drag threshold) starts selecting on the first
+// left mousedown and extends the selection on every mousemove until mouseup.
+// Two failure modes follow from that:
+//
+//   (A) Accidental selection on a focus click. Clicking the terminal just to
+//       regain OS/browser focus + the tiniest pointer drift starts a selection;
+//       keystrokes then look "stuck". Fix: gate selection behind a small drag
+//       threshold — a press that never drags past ~5px is a focus click and
+//       starts no selection.
+//
+//   (B) Stale drag extends from an old anchor. If a drag's mouseup never
+//       reaches the page (window blurred mid-drag, button released outside the
+//       window), xterm's drag is never terminated and its document mousemove
+//       stays live — so when you return and move the mouse toward your click,
+//       that movement extends a selection from the OLD anchor to the new point
+//       ("it thinks I clicked-and-dragged from somewhere else"). Fix, in two
+//       parts: terminate the drag + reset all gesture state the moment focus is
+//       lost (focusout / window blur), AND treat the FIRST click after the
+//       terminal regains focus as a pure reset+focus click — it clears any
+//       stale selection, refocuses, and performs NO mouse action. A second
+//       click is required for real mouse work, which is the intended UX.
+//
+// Mechanism: a CAPTURE-phase mousedown on the static #terminal-container runs
+// ahead of xterm. The selection-extending move is suppressed via a capture-
+// phase document mousemove (fires before xterm's bubble-phase document
+// mousemove) until the threshold is crossed; then we step aside and xterm
+// selects normally, anchored at the press cell. Focus is tracked with
+// focusin/focusout (they bubble, unlike focus/blur) plus window 'blur' to cover
+// alt-tab, where the element keeps DOM focus but the window does not.
 //
 // Guards: left button only (right button is the copy/paste gesture above);
 // single click only (e.detail === 1) so double/triple-click word/line selection
-// is untouched; unmodified only (Shift/Alt/Ctrl/Meta-drag fall through to
-// xterm); never interfere when a full-screen TUI has mouse tracking on
-// (_term.modes.mouseTrackingMode !== 'none') — those apps consume the drag.
-// Module-level attach-once on the static #terminal-container, same as the
-// handlers above, so session switches cannot stack duplicates.
+// is untouched; unmodified only; never interfere when a full-screen TUI has
+// mouse tracking on (_term.modes.mouseTrackingMode !== 'none') — those apps own
+// the drag, and we never inject a synthetic release into their input stream.
+// Module-level attach-once on the static container, same as the handlers above.
 // ---------------------------------------------------------------------------
 ;(function initDeliberateSelection() {
   var container = document.getElementById('terminal-container');
@@ -694,6 +708,24 @@ window._setTerminalFontSize = setTerminalFontSize;
   var armed = false;             // a qualifying left press is in progress
   var passedThreshold = false;   // pointer has moved far enough to select
   var startX = 0, startY = 0;
+  var hasFocus = false;          // is the terminal currently focused?
+
+  function inMouseTracking() {
+    return !!(_term && _term.modes && _term.modes.mouseTrackingMode !== 'none');
+  }
+
+  // Tear down any in-progress gesture and terminate a stale xterm selection
+  // drag (one whose mouseup we never saw). Selection mode only — we must NOT
+  // inject a synthetic release into a TUI's mouse-tracking stream.
+  function endGesture() {
+    document.removeEventListener('mousemove', onMouseMove, true);
+    document.removeEventListener('mouseup', onMouseUp, true);
+    armed = false;
+    passedThreshold = false;
+    if (!inMouseTracking()) {
+      try { document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); } catch (_) {}
+    }
+  }
 
   // Capture-phase document mousemove: fires before xterm's bubble-phase
   // mousemove, so we can swallow the move that would extend the selection.
@@ -720,11 +752,36 @@ window._setTerminalFontSize = setTerminalFontSize;
     passedThreshold = false;
   }
 
+  // Focus tracking. focusin/focusout bubble from the xterm helper textarea;
+  // window 'blur' covers alt-tab (element keeps DOM focus, window does not).
+  container.addEventListener('focusin', function () { hasFocus = true; });
+  container.addEventListener('focusout', function () { hasFocus = false; endGesture(); });
+  window.addEventListener('blur', function () { hasFocus = false; endGesture(); });
+
   container.addEventListener('mousedown', function (e) {
     if (e.button !== 0) return;                 // left button only
+
+    // (B) First click after the terminal regained focus: reset, do nothing
+    // else. Never let the focus-returning click be read as a (possibly stale)
+    // drag — clear selection, refocus, and consume the press. The next click
+    // does real mouse work.
+    if (!hasFocus) {
+      hasFocus = true;
+      armed = false;
+      passedThreshold = false;
+      if (_term) {
+        if (_term.hasSelection()) _term.clearSelection();
+        _term.focus();
+      }
+      e.preventDefault();           // keep the manual focus from being undone
+      e.stopImmediatePropagation(); // xterm must not start a selection / forward this
+      return;
+    }
+
+    // (A) Deliberate-selection drag threshold for normal clicks.
     if (e.detail !== 1) return;                 // leave dbl/triple-click selection alone
     if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return; // modified → xterm
-    if (_term && _term.modes && _term.modes.mouseTrackingMode !== 'none') return; // TUI mouse app
+    if (inMouseTracking()) return;              // TUI mouse app owns the drag
     armed = true;
     passedThreshold = false;
     startX = e.clientX;
