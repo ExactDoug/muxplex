@@ -5,9 +5,9 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.0** (on branch `feat/v0.9-session-ux`).
+improvements. Current version: **0.9.2** (on branch `feat/v0.9-session-ux`).
 
-**v0.9 session UX (DONE on `feat/v0.9-session-ux`)** — see `CHANGELOG.md` v0.9.0:
+**v0.9 session UX (DONE on `feat/v0.9-session-ux`)** — see `CHANGELOG.md` v0.9.0–v0.9.2:
 (1) new sessions reliably auto-open (createNewSession poll now keys off the canonical
 `device_id:name` sessionKey and waits ~120s); (2) **session rename** —
 `POST /api/sessions/{name}/rename` (`tmux rename-session`) with an atomic cascade
@@ -17,6 +17,11 @@ flyout (grid + sidebar) and the expanded-header session dropdown (✎). **Local-
 in v0.9 (remote rename would stale peers' keys); (3) View pills carry a leading ⧉
 glyph (auto-views keep 📁) to read distinctly from session pills. Also: narrow-viewport
 idle session-name contrast bumped `--text-dim`→`--text-muted`.
+**v0.9.1**: cross-browser session-view convergence (`reconcileViewingSession`) +
+suppressed redundant hover preview. **v0.9.2**: cwd auto-grouping now spans git
+worktrees — `resolve_git_repo` resolves a linked worktree's `.git`-*file* to the
+**main repo** name (see auto-views contract #6 below), so worktree sessions group
+with their parent repo instead of forming a lone `dir:<worktree>` view.
 
 ## Running locally (development)
 
@@ -94,6 +99,13 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    that must exclude them (bulk ops, new-session picker, search chips, keyboard
    digits, federation sync) are correct BECAUSE the list is separate — do not
    "simplify" by merging it into the views array.
+   **Worktree grouping (v0.9.2):** the group key comes from `gitRepo` (backend
+   `sessions.resolve_git_repo`). A linked git worktree (e.g. `<repo>/.worktrees/<branch>`)
+   roots a `.git` *file*, not a directory; the resolver follows it (via the worktree
+   gitdir's `commondir`, falling back to stripping `worktrees/<name>`) to the **main
+   repo** name, so a repo's main checkout and all its worktrees share one `dir:` group.
+   Unparseable `.git` files fall back to the worktree dir's own name. Pure-Python, no
+   `git` subprocess. Do NOT revert `resolve_git_repo` to stopping at the first `.git`.
 
 ## Documentation map
 
@@ -129,4 +141,7 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
   `CHANGELOG.md` v0.9.0 — reliable new-session auto-open, **local** session rename
   (`POST /api/sessions/{name}/rename` + `views.rename_session_key` cascade; flyout +
   expanded-header ✎; remote rename out of scope), ⧉ View-pill glyph, and a
-  narrow-viewport idle-name contrast fix.
+  narrow-viewport idle-name contrast fix. **v0.9.1** (`CHANGELOG.md`): cross-browser
+  session-view convergence + suppressed redundant hover preview. **v0.9.2**
+  (`CHANGELOG.md`): cwd auto-grouping spans git worktrees — backend-only
+  `resolve_git_repo` change (see auto-views contract #6); no design doc.
