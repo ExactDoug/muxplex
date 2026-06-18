@@ -5,7 +5,7 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.2** (on branch `feat/v0.9-session-ux`).
+improvements. Current version: **0.9.3** (on branch `feat/v0.9-session-ux`).
 
 **v0.9 session UX (DONE on `feat/v0.9-session-ux`)** — see `CHANGELOG.md` v0.9.0–v0.9.2:
 (1) new sessions reliably auto-open (createNewSession poll now keys off the canonical
@@ -22,6 +22,9 @@ suppressed redundant hover preview. **v0.9.2**: cwd auto-grouping now spans git
 worktrees — `resolve_git_repo` resolves a linked worktree's `.git`-*file* to the
 **main repo** name (see auto-views contract #6 below), so worktree sessions group
 with their parent repo instead of forming a lone `dir:<worktree>` view.
+**v0.9.3**: terminal mouse fixes — a focus-click no longer starts a text selection
+(`initDeliberateSelection` drag threshold, contract #4b) and right-click-to-copy never
+also pastes (OR-based contextmenu gate, contract #2).
 
 ## Running locally (development)
 
@@ -77,16 +80,37 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    Reading the clipboard in this path = **double-paste** (COE).
 2. **Right-click copy-or-paste** — gesture semantics: right-click WITH a selection
    completes a copy (never pastes); right-click with NO selection pastes via
-   `navigator.clipboard.readText()`. The selection state MUST be sampled in a
-   capture-phase `mousedown` handler: event order is mousedown → *xterm clears the
-   selection* → contextmenu, so `hasSelection()` inside contextmenu is always false.
+   `navigator.clipboard.readText()`. Selection is sampled in a capture-phase
+   `mousedown` handler (ahead of xterm) AND the contextmenu handler treats it as
+   copy-only if a selection existed at **either** mousedown **or** contextmenu time
+   (`hadSelectionOnRightDown || _term.hasSelection()`) — the OR closes a race (v0.9.3)
+   where the mousedown sample read false (stale latch when contextmenu fires without a
+   button-2 mousedown, or cross-client selection desync) while a selection was live,
+   which let one click both copy and paste. The copy branch re-copies + clears and
+   `return`s before `_pasteFromClipboard()`; copy and paste must NEVER both fire.
    `hasSelection()` is buffer-based — scrolling selection out of view doesn't affect it.
+   (Do NOT restore the old comment claiming xterm clears the selection on right-down /
+   that `hasSelection()` in contextmenu is always false — with `rightClickSelectsWord`
+   unset it does not, and that false premise is what left the race open.)
 3. **No handler stacking** — `#terminal-container` is static and `openTerminal()`
    re-runs per session switch. Container-level listeners belong in module-level
    attach-once IIFEs (`initRightClickCopyPaste`, `initMobileTerminalScroll`), never
    inside `openTerminal()`.
 4. **Shift+Enter** sends LF (`0x0a`, = Ctrl+J) so TUI apps (Claude Code) insert a
    newline instead of submitting; shells treat LF/CR identically.
+4b. **Deliberate text selection** (`initDeliberateSelection`, v0.9.3) — xterm.js (5.3.0,
+   no built-in drag threshold) starts selecting on the first left `mousedown`, so a
+   click made only to regain OS/browser focus + the tiniest drift left a stray selection
+   and "stuck" keystrokes. The guard suppresses xterm's selection-extending mousemove —
+   a **capture-phase document `mousemove`** that `stopImmediatePropagation()`s while the
+   pointer stays within ~5px of the press — until a real drag crosses the threshold;
+   then it stops interfering and xterm selects normally (anchored at the press cell). A
+   sub-threshold press is a focus click: on mouseup it clears any stray selection and
+   refocuses. Guards (do NOT remove): left button only, `e.detail === 1` (leaves
+   double/triple-click word/line selection alone), unmodified only, and bails when
+   `_term.modes.mouseTrackingMode !== 'none'` (TUI mouse apps own the drag). Module-level
+   attach-once IIFE like the others (contract #3). Do NOT `preventDefault` the mousedown
+   — xterm still needs it to focus the textarea.
 5. **View pills** (`renderViewPills` in `app.js`) — one pill per view in the header,
    single-click activates; collapse below 600px where the dropdown trigger swaps to
    the dynamic active-view label (static "Views" label on desktop). Pills re-render

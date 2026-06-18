@@ -604,13 +604,18 @@ window._setTerminalFontSize = setTerminalFontSize;
 //   right-click WITH an active selection  → completes the COPY, never pastes
 //   right-click with NO selection         → pastes the browser clipboard
 //
-// CRITICAL ordering detail: a right-click fires mousedown → (xterm clears
-// the selection) → contextmenu. By the time contextmenu fires hasSelection()
-// is already false, so checking it there would treat the copy gesture as a
-// paste — copying AND pasting on the same click. The selection state is
-// therefore sampled (and the copy performed) in a capture-phase mousedown
-// handler, before xterm's own mouse handling runs; contextmenu then consumes
-// that flag and pastes only when no selection was present at press time.
+// CRITICAL ordering detail: a right-click fires mousedown → contextmenu, and
+// depending on browser/input (touchpad two-finger tap, synthetic contextmenu)
+// the button-2 mousedown may not fire at all, or selection state may diverge
+// between the two events. The selection is therefore sampled (and the copy
+// performed) in a capture-phase mousedown handler, before xterm's own mouse
+// handling runs. contextmenu then treats the gesture as a COPY if a selection
+// was present at EITHER moment — the sampled mousedown flag OR a live
+// hasSelection() re-check at contextmenu time — and only pastes when no
+// selection existed at either point. The OR closes the race where the
+// mousedown sample read false (stale flag / cross-client selection desync)
+// while a selection is in fact live, which previously let one right-click both
+// copy (auto-copy on select) AND paste.
 //
 // hasSelection() is buffer-based, not viewport-based — scrolling the selected
 // text out of view does not affect it, so no selection tracking of our own
@@ -636,15 +641,98 @@ window._setTerminalFontSize = setTerminalFontSize;
     if (e.shiftKey || e.ctrlKey || e.metaKey) return; // let modified clicks through
     e.preventDefault();
     if (!_term) return;
-    if (hadSelectionOnRightDown) {
-      // This right-click was the COPY gesture (copied at mousedown above).
-      // Do NOT paste on the same click — the next right-click pastes.
-      hadSelectionOnRightDown = false;
-      if (_term.hasSelection()) _term.clearSelection();
+    // A selection counts as present for this gesture if it existed at the
+    // right-button mousedown (sampled flag) OR is still live right now. Either
+    // way the gesture is a COPY and must NEVER also paste on the same click.
+    var hadSelection = hadSelectionOnRightDown || _term.hasSelection();
+    hadSelectionOnRightDown = false; // consume the latch regardless of branch
+    if (hadSelection) {
+      // COPY gesture. Re-copy if a selection is still live (covers inputs that
+      // fired contextmenu without a button-2 mousedown, so nothing copied yet),
+      // then clear it. Do NOT paste — the next selection-free right-click pastes.
+      if (_term.hasSelection()) {
+        _copyToClipboard(_term.getSelection());
+        _term.clearSelection();
+      }
       return;
     }
     _pasteFromClipboard();
   });
+})();
+
+// ---------------------------------------------------------------------------
+// Deliberate text selection — a plain click must NOT start a selection.
+// xterm.js begins selecting on the first left mousedown and extends it on every
+// mousemove, so the tiniest pointer drift while clicking-to-focus (e.g.
+// clicking the window just to regain OS focus when switching between apps)
+// leaves a stray selection. Keystrokes then look "stuck" and the user has to
+// Escape / scroll / right-click to recover — the exact aggravation this fixes.
+//
+// Fix: gate selection behind a small drag threshold. On a qualifying left press
+// we let xterm focus its hidden textarea (we do NOT preventDefault), but we
+// intercept — in CAPTURE phase, ahead of xterm's bubble-phase document
+// mousemove — the moves that would EXTEND the selection, stopImmediate-
+// Propagation while the pointer stays within DRAG_THRESHOLD px of the press
+// point. Cross the threshold and it is a real drag: we stop intercepting and
+// xterm builds the selection normally, anchored at the original press cell. A
+// press that never crosses the threshold is a focus click — no selection forms,
+// and on mouseup we clear any stray selection and refocus so typing stays live.
+//
+// Guards: left button only (right button is the copy/paste gesture above);
+// single click only (e.detail === 1) so double/triple-click word/line selection
+// is untouched; unmodified only (Shift/Alt/Ctrl/Meta-drag fall through to
+// xterm); never interfere when a full-screen TUI has mouse tracking on
+// (_term.modes.mouseTrackingMode !== 'none') — those apps consume the drag.
+// Module-level attach-once on the static #terminal-container, same as the
+// handlers above, so session switches cannot stack duplicates.
+// ---------------------------------------------------------------------------
+;(function initDeliberateSelection() {
+  var container = document.getElementById('terminal-container');
+  if (!container) return;
+
+  var DRAG_THRESHOLD_SQ = 5 * 5; // squared CSS px of movement before selecting
+  var armed = false;             // a qualifying left press is in progress
+  var passedThreshold = false;   // pointer has moved far enough to select
+  var startX = 0, startY = 0;
+
+  // Capture-phase document mousemove: fires before xterm's bubble-phase
+  // mousemove, so we can swallow the move that would extend the selection.
+  function onMouseMove(e) {
+    if (!armed || passedThreshold) return;
+    var dx = e.clientX - startX;
+    var dy = e.clientY - startY;
+    if (dx * dx + dy * dy >= DRAG_THRESHOLD_SQ) {
+      passedThreshold = true; // real drag — hand the rest to xterm
+      return;
+    }
+    e.stopImmediatePropagation(); // below threshold — xterm never extends
+  }
+
+  function onMouseUp() {
+    document.removeEventListener('mousemove', onMouseMove, true);
+    document.removeEventListener('mouseup', onMouseUp, true);
+    if (armed && !passedThreshold && _term) {
+      // Focus-only click: drop any stray selection and keep the keyboard live.
+      if (_term.hasSelection()) _term.clearSelection();
+      _term.focus();
+    }
+    armed = false;
+    passedThreshold = false;
+  }
+
+  container.addEventListener('mousedown', function (e) {
+    if (e.button !== 0) return;                 // left button only
+    if (e.detail !== 1) return;                 // leave dbl/triple-click selection alone
+    if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return; // modified → xterm
+    if (_term && _term.modes && _term.modes.mouseTrackingMode !== 'none') return; // TUI mouse app
+    armed = true;
+    passedThreshold = false;
+    startX = e.clientX;
+    startY = e.clientY;
+    // Do NOT preventDefault — xterm still focuses its textarea on this press.
+    document.addEventListener('mousemove', onMouseMove, true);
+    document.addEventListener('mouseup', onMouseUp, true);
+  }, true); // capture phase — register the move suppressor before xterm reacts
 })();
 
 // ---------------------------------------------------------------------------

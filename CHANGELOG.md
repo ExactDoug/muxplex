@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.9.3 (2026-06-18)
+
+Terminal mouse fixes: a focus-click no longer drops you into selection mode, and
+right-click-to-copy never also pastes.
+
+### Fixes
+
+- **A plain click to focus the terminal no longer starts a text selection.** When you
+  click into the browser terminal just to give the window OS focus — the constant move
+  when jumping between apps — the tiniest pointer drift used to be read by xterm.js as
+  the start of a text selection. Typing then appeared to "do nothing" (keystrokes went
+  to a stray selection / the view sat scrolled up), and escaping meant scrolling down,
+  tapping Escape once or twice, or right-clicking. Selection is now **deliberate**: a
+  new `initDeliberateSelection` guard suppresses xterm's selection-extending mousemove
+  (in capture phase, ahead of xterm) until the pointer drags past a ~5px threshold, so
+  a click-without-drag is a pure focus click — no selection, no lost keystrokes. A real
+  drag past the threshold selects normally, anchored at the press point. Double/triple-
+  click word/line selection, Shift/Alt-drag, and full-screen TUIs that own the mouse
+  (`mouseTrackingMode`) are all left untouched.
+- **Right-click to copy a selection never also pastes.** Selecting text and right-
+  clicking to copy could *also* paste that text back into the session — a race where the
+  selection state sampled at right-button mousedown read `false` (a stale latch when an
+  input fires `contextmenu` without a button-2 mousedown, or cross-client selection
+  desync) while a selection was in fact live, so the handler fell through to the paste
+  branch. The contextmenu handler now treats the gesture as copy-only when a selection
+  existed at **either** mousedown **or** contextmenu time (`hadSelectionOnRightDown ||
+  _term.hasSelection()`), and re-copies + clears before returning — so copy and paste
+  can never both fire on one right-click. (A selection-free right-click still pastes.)
+
 ## v0.9.2 (2026-06-18)
 
 Directory auto-grouping now spans git worktrees.

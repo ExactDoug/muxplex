@@ -1091,6 +1091,59 @@ test('terminal.js right-click handlers are attached once at module level (no sta
     'openTerminal must NOT register contextmenu handlers (they would stack across reopens)');
 });
 
+test('terminal.js right-click treats a selection live at EITHER mousedown OR contextmenu as copy-only', () => {
+  // Hardening for the residual copy-AND-paste race: the capture-phase mousedown
+  // sample can read false (stale flag when contextmenu fires without a button-2
+  // mousedown, or cross-client selection desync) while a selection is in fact
+  // live. contextmenu must therefore OR the sampled flag with a fresh
+  // hasSelection() check and copy-only in that case — never fall through to paste.
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  const blockStart = source.indexOf('initRightClickCopyPaste');
+  const block = source.substring(blockStart, source.indexOf('})();', blockStart));
+  const ctxStart = block.indexOf("addEventListener('contextmenu'");
+  const ctxBlock = block.substring(ctxStart);
+  // The copy-vs-paste decision must combine the sampled flag with a live re-check.
+  assert.ok(/hadSelectionOnRightDown\s*\|\|\s*_term\.hasSelection\(\)/.test(ctxBlock),
+    'contextmenu must gate on hadSelectionOnRightDown || _term.hasSelection() (close the desync race)');
+  // The selection branch must still return before the paste call.
+  const decisionIdx = ctxBlock.indexOf('hadSelectionOnRightDown');
+  const guardBlock = ctxBlock.substring(decisionIdx, ctxBlock.indexOf('_pasteFromClipboard()'));
+  assert.ok(guardBlock.includes('return'),
+    'copy branch must return before _pasteFromClipboard() — copy and paste must never both fire');
+});
+
+// --- Deliberate selection: a plain focus-click must not start a selection ---
+
+test('terminal.js gates text selection behind a drag threshold (focus-click never selects)', () => {
+  // A click made only to regain OS/browser focus must NOT enter selection mode.
+  // initDeliberateSelection suppresses xterm's selection-extending mousemove (in
+  // capture phase) until the pointer drags past a small threshold, so a click
+  // without a drag stays a pure focus click.
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('(function initDeliberateSelection()'),
+    'must define a module-level initDeliberateSelection IIFE');
+  const start = source.indexOf('initDeliberateSelection');
+  const block = source.substring(start, source.indexOf('})();', start));
+  assert.ok(block.includes('e.button !== 0'), 'must apply to the left button only');
+  assert.ok(block.includes('e.detail !== 1'), 'must leave double/triple-click word/line selection alone');
+  assert.ok(block.includes('mouseTrackingMode'), 'must not interfere when a TUI has mouse tracking on');
+  assert.ok(block.includes('stopImmediatePropagation'),
+    'must suppress xterm selection-extending mousemove below the threshold');
+  assert.ok(/addEventListener\('mousemove'[^)]*,\s*true\)/.test(block),
+    'the move suppressor must be registered in capture phase (ahead of xterm)');
+  assert.ok(block.includes('clearSelection') && block.includes('_term.focus()'),
+    'a focus-only click must clear any stray selection and refocus the terminal');
+});
+
+test('terminal.js deliberate-selection handlers are attached once at module level (no stacking)', () => {
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  const openStart = source.indexOf('function openTerminal');
+  const openEnd = source.indexOf('function closeTerminal', openStart);
+  const openBlock = source.substring(openStart, openEnd);
+  assert.ok(!openBlock.includes('initDeliberateSelection'),
+    'openTerminal must NOT register the deliberate-selection handlers (they would stack across reopens)');
+});
+
 // --- Shift+Enter inserts a newline (LF) instead of submitting (CR) ---
 
 test('terminal.js Shift+Enter sends LF (0x0a) so TUI apps insert a newline', () => {
