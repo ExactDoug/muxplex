@@ -1135,47 +1135,49 @@ test('terminal.js gates text selection behind a drag threshold (focus-click neve
     'a focus-only click must clear any stray selection and refocus the terminal');
 });
 
-test('terminal.js first click after a terminal regains focus is a reset+focus click (no stale drag)', () => {
-  // If a drag's mouseup never reaches the page (window blurred mid-drag, button
-  // released outside the window), xterm's selection drag is never terminated and
-  // extends from the stale anchor when the pointer returns. Fix: track focus
-  // (focusin/focusout + window blur) and treat the first click after refocus as
-  // a pure reset+focus click — clear selection, refocus, consume the press, do
-  // no mouse action — plus terminate any in-progress drag the moment focus is lost.
+test('terminal.js kills a zombie xterm selection drag on a buttonless mousemove (focus-independent)', () => {
+  // Root cause: xterm 5.3.0 extends a selection from its anchor on every mousemove
+  // with NO button-state check, and only tears the drag down on mouseup. If that
+  // mouseup is lost (released outside the window / blurred mid-drag), returning the
+  // pointer extends a huge selection from the stale anchor before any click. Fix:
+  // an always-on capture-phase document mousemove that, when e.buttons === 0 and a
+  // drag may be open, kills it (clearSelection = full teardown of anchor+listeners)
+  // BEFORE xterm's bubble-phase move can extend it. A real mouseup clears the latch.
   const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
   const start = source.indexOf('initDeliberateSelection');
   const block = source.substring(start, source.indexOf('})();', start));
-  // Focus is tracked via bubbling focusin/focusout and window blur (alt-tab).
-  assert.ok(block.includes("addEventListener('focusin'") && block.includes("addEventListener('focusout'"),
-    'must track terminal focus via focusin/focusout');
-  assert.ok(/window\.addEventListener\('blur'/.test(block),
-    'must treat window blur as focus loss (alt-tab keeps element focus but not window focus)');
-  // Losing focus tears down the gesture and ends any stale xterm drag.
-  assert.ok(block.includes('endGesture'), 'must define a gesture-teardown path on focus loss');
-  assert.ok(/dispatchEvent\(new MouseEvent\('mouseup'/.test(block),
-    'must terminate a stale xterm selection drag by dispatching a synthetic mouseup');
-  // The reset click consumes the press and performs no mouse action.
-  const mdStart = block.indexOf("addEventListener('mousedown'");
-  const mdBlock = block.substring(mdStart);
-  assert.ok(/if \(!hasFocus\)/.test(mdBlock),
-    'the mousedown handler must special-case the first (refocus) click');
-  const resetBranch = mdBlock.substring(mdBlock.indexOf('if (!hasFocus)'));
-  assert.ok(resetBranch.includes('stopImmediatePropagation') && resetBranch.includes('preventDefault'),
-    'the reset click must consume the press so xterm starts no selection');
-  assert.ok(resetBranch.includes('_term.focus()'),
-    'the reset click must refocus the terminal so typing resumes');
+  // A latch tracks whether a drag may be open.
+  assert.ok(block.includes('dragMaybeActive'), 'must track whether an xterm drag may be open');
+  // The latch is set on a left mousedown and cleared by any real mouseup.
+  assert.ok(/dragMaybeActive = true/.test(block), 'a qualifying left mousedown must arm the drag latch');
+  assert.ok(/addEventListener\('mouseup', function \(\) \{ dragMaybeActive = false; \}, true\)/.test(block),
+    'any real mouseup must clear the drag latch (capture phase)');
+  // The guard keys off the PHYSICAL button state (e.buttons === 0), not focus.
+  assert.ok(/e\.buttons !== 0 \|\| !dragMaybeActive \|\| inMouseTracking\(\)/.test(block),
+    'the zombie-drag guard must fire only on a buttonless move with the latch set, outside mouse tracking');
+  assert.ok(/addEventListener\('mousemove', function \(e\) \{[\s\S]*killDrag\(e\)[\s\S]*\}, true\)/.test(block),
+    'the buttonless-move guard must run in capture phase and call killDrag');
+  // killDrag suppresses the move and fully tears down the drag.
+  const kdStart = block.indexOf('function killDrag');
+  const kdBlock = block.substring(kdStart, block.indexOf('function onMouseMove', kdStart));
+  assert.ok(kdBlock.includes('stopImmediatePropagation'),
+    'killDrag must stop the buttonless move from reaching xterm');
+  assert.ok(kdBlock.includes('_term.clearSelection()'),
+    'killDrag must clearSelection() — a full teardown that nulls the anchor and removes xterm listeners');
+  // The fix must NOT depend on focus tracking (the prior unreliable approach).
+  assert.ok(!block.includes('hasFocus'), 'must not rely on focus tracking (unreliable: focusin can precede mousedown)');
 });
 
-test('terminal.js never injects a synthetic mouse release into a TUI mouse-tracking stream', () => {
-  // The stale-drag teardown must be selection-mode only; in mouse-tracking mode a
-  // synthetic mouseup would forward a spurious release escape into the TUI.
+test('terminal.js zombie-drag killer never fires in a TUI mouse-tracking stream or while a button is held', () => {
+  // A buttonless move is legitimate app input under mouse tracking, and a held
+  // button (e.buttons !== 0) is a real drag — neither must trigger the killer.
   const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
   const start = source.indexOf('initDeliberateSelection');
   const block = source.substring(start, source.indexOf('})();', start));
-  const egStart = block.indexOf('function endGesture');
-  const egBlock = block.substring(egStart, block.indexOf('}', block.indexOf('dispatchEvent', egStart)));
-  assert.ok(/!inMouseTracking\(\)/.test(egBlock) || /mouseTrackingMode === 'none'/.test(egBlock),
-    'the synthetic mouseup must be gated to non-mouse-tracking (selection) mode');
+  assert.ok(/e\.buttons !== 0[^\n]*return/.test(block),
+    'must bail when any button is physically held (real drag)');
+  assert.ok(/inMouseTracking\(\)[^\n]*return/.test(block),
+    'must bail in mouse-tracking mode (buttonless moves are real app input)');
 });
 
 test('terminal.js deliberate-selection handlers are attached once at module level (no stacking)', () => {

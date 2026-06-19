@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.9.5 (2026-06-19)
+
+Actually fixes the "returning to the terminal selects a huge block of text" bug
+(v0.9.4's focus-based approach didn't). Root cause found by reverse-engineering xterm.
+
+### Fixes
+
+- **Returning to a terminal no longer drags a giant selection from a stale anchor.** The
+  real cause (confirmed in the vendored xterm.js 5.3.0 source): xterm extends a selection
+  from its stored anchor on *every* `mousemove` and **never checks whether a mouse button
+  is actually held** — it only tears the drag down on `mouseup`. So if a `mouseup` never
+  reaches the page (button released outside the window, or the window blurred mid-drag),
+  the drag becomes a "zombie": its document `mousemove` listener stays live, and simply
+  moving the pointer back toward your next click — with no button down — extends a huge
+  selection from the old anchor to the cursor *before any click happens*. v0.9.4 tried to
+  fix this on `mousedown` / focus state, but the damage is done on a buttonless mousemove,
+  and focus state proved unreliable (`focusin` can fire before `mousedown`; focus may
+  never move at all). The fix is now **focus-independent**: we track whether a drag may be
+  open and, the instant a `mousemove` arrives with `e.buttons === 0` (no button physically
+  down) while a drag is supposedly open, we recognize the zombie and kill it in capture
+  phase — *before* xterm's handler can extend it — via `clearSelection()`, which fully
+  tears down the anchor and xterm's own listeners. A real `mouseup` clears the latch, so
+  normal completed selections are untouched. Still left-button / single-click /
+  non-mouse-tracking only, and never injects events into a TUI's mouse stream. The
+  unreliable focus-tracking + first-click-reset logic from v0.9.4 was removed.
+
 ## v0.9.4 (2026-06-18)
 
 Returning focus to a terminal no longer drags a selection from a stale point.

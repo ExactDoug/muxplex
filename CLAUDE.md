@@ -5,7 +5,7 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.4** (on branch `feat/v0.9-session-ux`).
+improvements. Current version: **0.9.5** (on branch `feat/v0.9-session-ux`).
 
 **v0.9 session UX (DONE on `feat/v0.9-session-ux`)** — see `CHANGELOG.md` v0.9.0–v0.9.2:
 (1) new sessions reliably auto-open (createNewSession poll now keys off the canonical
@@ -27,6 +27,9 @@ with their parent repo instead of forming a lone `dir:<worktree>` view.
 also pastes (OR-based contextmenu gate, contract #2). **v0.9.4**: returning focus to a
 terminal no longer drags a selection from a stale anchor — first click after refocus is
 a reset+focus click; stale drags are torn down on focus loss (contract #4b part B).
+**v0.9.5**: that v0.9.4 focus approach didn't actually work — root-caused to xterm
+extending selections on buttonless mousemoves (no physical-button check); replaced with
+a focus-independent zombie-drag killer keyed on `e.buttons === 0` (contract #4b part B).
 
 ## Running locally (development)
 
@@ -100,28 +103,32 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    inside `openTerminal()`.
 4. **Shift+Enter** sends LF (`0x0a`, = Ctrl+J) so TUI apps (Claude Code) insert a
    newline instead of submitting; shells treat LF/CR identically.
-4b. **Deliberate text selection + focus-reset click** (`initDeliberateSelection`,
-   v0.9.3/v0.9.4) — xterm.js (5.3.0, no built-in drag threshold) anchors a selection on
-   the first left `mousedown` and extends it on every mousemove until mouseup. Two fixes:
-   **(A, v0.9.3) drag threshold** — the guard suppresses xterm's selection-extending
-   mousemove (a **capture-phase document `mousemove`** that `stopImmediatePropagation()`s
-   while the pointer stays within ~5px of the press) until a real drag crosses the
-   threshold; then it steps aside and xterm selects normally (anchored at the press
-   cell). A sub-threshold press is a focus click — no selection.
-   **(B, v0.9.4) stale-drag / refocus reset** — if a drag's mouseup never reached the
-   page (window blurred mid-drag, button released outside the window), xterm's drag was
-   never terminated and extended from the OLD anchor when the pointer returned. So:
-   losing focus (`focusout` / window `blur`) runs `endGesture()` — tears down our
-   listeners and dispatches a synthetic document `mouseup` to terminate xterm's stale
-   drag — and the **first click after the terminal regains focus is a pure reset+focus
-   click** (`if (!hasFocus)`): clears stale selection, refocuses, `preventDefault` +
-   `stopImmediatePropagation`, no mouse action; a second click does real work. Focus is
-   tracked via bubbling `focusin`/`focusout` + window `blur` (alt-tab keeps element focus
-   but not window focus). Guards (do NOT remove): left button only; `e.detail === 1`
-   (leaves dbl/triple-click word/line select alone); unmodified only; bails when
-   `_term.modes.mouseTrackingMode !== 'none'` (TUI mouse apps own the drag), and the
-   synthetic-mouseup teardown is **selection-mode only** — never inject a release into a
-   TUI's mouse-tracking stream. Module-level attach-once IIFE (contract #3).
+4b. **Deliberate text selection + zombie-drag killer** (`initDeliberateSelection`,
+   v0.9.3/v0.9.5) — xterm.js 5.3.0 anchors a selection on a left `mousedown`, attaches
+   document mousemove/mouseup listeners, and extends from the anchor on every mousemove
+   **with NO physical-button check** (verified in the vendored bundle: the move handler's
+   only gate is `if (!selectionStart) return`); it removes the listeners ONLY on mouseup.
+   Two fixes:
+   **(A, v0.9.3) drag threshold** — a **capture-phase document `mousemove`** that
+   `stopImmediatePropagation()`s while the pointer stays within ~5px of the press, until a
+   real drag crosses the threshold; then it steps aside and xterm selects normally. A
+   sub-threshold left press is a focus click — no selection.
+   **(B, v0.9.5) ZOMBIE-DRAG KILLER** — if a drag's mouseup never reaches the page
+   (released outside the window, blurred mid-drag), xterm's drag is never torn down and
+   re-extends a huge selection from the stale anchor on the next **buttonless** mousemove
+   when the pointer returns — *before any click*. Fix is **focus-INDEPENDENT** (the
+   v0.9.4 focus-tracking / first-click-reset was unreliable — `focusin` can fire before
+   `mousedown`, focus may never move — and was REMOVED). A `dragMaybeActive` latch is set
+   on a qualifying left mousedown and cleared by any real document `mouseup`; an always-on
+   **capture-phase document `mousemove`** fires `killDrag` when `e.buttons === 0 &&
+   dragMaybeActive && !inMouseTracking()` — `stopImmediatePropagation` (so xterm's
+   bubble-phase move can't extend) + `_term.clearSelection()` (full teardown: nulls anchor
+   AND removes xterm's listeners). Guards (do NOT remove): left button only; `e.detail
+   === 1` (leaves dbl/triple-click select alone); unmodified only; bails when
+   `_term.modes.mouseTrackingMode !== 'none'` (TUI mouse apps own the drag, and a
+   buttonless move is real app input there) and when `e.buttons !== 0` (real drag in
+   progress). Do NOT reintroduce focus-based gating. Module-level attach-once IIFE
+   (contract #3).
 5. **View pills** (`renderViewPills` in `app.js`) — one pill per view in the header,
    single-click activates; collapse below 600px where the dropdown trigger swaps to
    the dynamic active-view label (static "Views" label on desktop). Pills re-render
