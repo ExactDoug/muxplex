@@ -3674,14 +3674,14 @@ test('applyFitLayout does NOT measure DOM dimensions (pure arithmetic)', () => {
     'applyFitLayout must NOT set inline tile heights — CSS grid 1fr rows handle sizing');
 });
 
-// ─── Settings tab reorganization (4 tabs) ────────────────────────────────────
+// ─── Settings tab reorganization ─────────────────────────────────────────────
 
-test('HTML settings dialog has exactly 4 tab buttons', () => {
+test('HTML settings dialog has exactly 6 tab buttons', () => {
   const source = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   const tabMatches = source.match(/class="settings-tab[^"]*"\s+data-tab=/g) || [];
-  // Updated in v0.6.0: Views tab added to settings dialog — now has 5 tabs:
-  // Display, Sessions, Views, Commands, Multi-Device.
-  assert.strictEqual(tabMatches.length, 5, 'settings dialog must have exactly 5 tab buttons (Views tab added in v0.6.0)');
+  // v0.6.0 added Views; v0.9.6 added the Mouse Lab experimental tab — now 6 tabs:
+  // Display, Sessions, Views, Commands, Multi-Device, Mouse Lab.
+  assert.strictEqual(tabMatches.length, 6, 'settings dialog must have exactly 6 tab buttons (Mouse Lab tab added in v0.9.6)');
 });
 
 test('HTML index.html has no Notifications tab button', () => {

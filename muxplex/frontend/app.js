@@ -5027,6 +5027,88 @@ function switchSettingsTab(tabName) {
       panel.classList.add('hidden');
     }
   });
+  // Re-sync the Mouse Lab controls when its tab is shown (config may have changed
+  // in another browser tab via the storage event).
+  if (tabName === 'mouselab') renderMouseLabUI();
+}
+
+// ─── Mouse Lab (experimental selection levers) ──────────────────────────────
+// Per-device A/B harness for the inadvertent-selection bug. The config lives in
+// terminal.js's window.MouseLab (localStorage-backed); the handlers read it live.
+// Profiles are one-shot presets: applying one writes the levers once (not
+// enforced), and any later individual toggle flips "Current" to Custom.
+var MOUSELAB_LEVERS = ['dragThreshold', 'zombieKiller', 'focusClickClear',
+                       'honorTracking', 'tmuxCopyClear', 'diagLogging'];
+var MOUSELAB_PROFILES = {
+  shipped:     { label: 'Shipped (v0.9.5)',
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: false, diagLogging: false },
+  baseline:    { label: 'Baseline (raw bug, no fixes)',
+                 dragThreshold: false, zombieKiller: false, focusClickClear: false, honorTracking: false, tmuxCopyClear: false, diagLogging: false },
+  ignoreguard: { label: 'Ignore tracking guard (Hyp. B)',
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: false, tmuxCopyClear: false, diagLogging: false },
+  tmuxclear:   { label: 'tmux copy-mode clear (Hyp. A)',
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: true,  diagLogging: false },
+  diagnostics: { label: 'Diagnostics only',
+                 dragThreshold: false, zombieKiller: false, focusClickClear: false, honorTracking: false, tmuxCopyClear: false, diagLogging: true },
+  everything:  { label: 'Everything on',
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: true,  diagLogging: true },
+};
+
+// Return the label of the profile the current config exactly matches, or 'Custom'.
+function _mouselabMatchProfile(cfg) {
+  for (var key in MOUSELAB_PROFILES) {
+    var p = MOUSELAB_PROFILES[key];
+    var match = true;
+    for (var i = 0; i < MOUSELAB_LEVERS.length; i++) {
+      var lv = MOUSELAB_LEVERS[i];
+      if (!!cfg[lv] !== !!p[lv]) { match = false; break; }
+    }
+    if (match) return p.label;
+  }
+  return 'Custom';
+}
+
+// Reflect the live Mouse Lab config into the tab's checkboxes + Current label.
+function renderMouseLabUI() {
+  if (!window.MouseLab) return;
+  var cfg = window.MouseLab.all();
+  MOUSELAB_LEVERS.forEach(function (lv) {
+    var el = document.getElementById('mouselab-' + lv);
+    if (el) el.checked = !!cfg[lv];
+  });
+  var cur = document.getElementById('mouselab-current');
+  if (cur) cur.textContent = _mouselabMatchProfile(cfg);
+}
+
+// Wire the Mouse Lab tab controls once (called from the main init block).
+function initMouseLabUI() {
+  if (!window.MouseLab) return;
+  MOUSELAB_LEVERS.forEach(function (lv) {
+    var el = document.getElementById('mouselab-' + lv);
+    if (!el) return;
+    on(el, 'change', function () {
+      var patch = {};
+      patch[lv] = el.checked;
+      window.MouseLab.save(patch);
+      renderMouseLabUI();
+    });
+  });
+  var applyBtn = document.getElementById('mouselab-apply');
+  var sel = document.getElementById('mouselab-profile');
+  if (applyBtn && sel) {
+    on(applyBtn, 'click', function () {
+      var p = MOUSELAB_PROFILES[sel.value];
+      if (!p) return;
+      var patch = {};
+      MOUSELAB_LEVERS.forEach(function (lv) { patch[lv] = !!p[lv]; });
+      window.MouseLab.save(patch);
+      renderMouseLabUI();
+      if (typeof showToast === 'function') showToast('Applied: ' + p.label);
+    });
+  }
+  // Stay in sync if the config changes elsewhere (another tab via storage event).
+  window.addEventListener('muxplex:mouselab-changed', renderMouseLabUI);
+  renderMouseLabUI();
 }
 
 /**
@@ -6055,6 +6137,7 @@ function bindStaticEventListeners() {
   document.querySelectorAll('.settings-tab').forEach(function(tab) {
     on(tab, 'click', function() { switchSettingsTab(tab.dataset.tab); });
   });
+  initMouseLabUI();
 
   // Hover preview — delegated on grid container (tiles are re-rendered each poll)
   var gridEl = $('session-grid');

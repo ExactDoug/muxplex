@@ -5,7 +5,9 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.5** (on branch `feat/v0.9-session-ux`).
+improvements. Current version: **0.9.6.dev2** (on branch `feat/v0.9-session-ux`) — a
+**dev/experimental** build carrying the Mouse Lab selection-fix harness (see below); last
+released version is **0.9.5**.
 
 **v0.9 session UX (DONE on `feat/v0.9-session-ux`)** — see `CHANGELOG.md` v0.9.0–v0.9.2:
 (1) new sessions reliably auto-open (createNewSession poll now keys off the canonical
@@ -30,6 +32,17 @@ a reset+focus click; stale drags are torn down on focus loss (contract #4b part 
 **v0.9.5**: that v0.9.4 focus approach didn't actually work — root-caused to xterm
 extending selections on buttonless mousemoves (no physical-button check); replaced with
 a focus-independent zombie-drag killer keyed on `e.buttons === 0` (contract #4b part B).
+**v0.9.6.dev2 (IN PROGRESS, uncommitted-then-committed this checkpoint):** the v0.9.5 fix
+may still not stick because the user's tmux has **`set -g mouse on`**, so xterm.js is in
+mouse-tracking mode most of the time and the xterm-side fixes bail / may target the wrong
+layer. Two hypotheses — **A:** the stale highlight is **tmux copy-mode** (server-side), not
+xterm's, so `_term.clearSelection()` is aimed wrong (fix = send Esc to PTY); **B:** tracking
+mode desync. Decisive read: `_term.hasSelection()` false while a highlight is visible ⇒ A.
+Built a **Mouse Lab** harness (Settings tab) — 6 per-device localStorage toggles + 6
+profiles to A/B-test fixes live without reloads; diagnostics now log `hasSel`/`track`.
+**Defaults reproduce shipped v0.9.5 behavior (tests stay green).** Design + test plan:
+`docs/plans/2026-06-24-mouse-lab-harness.md`. Awaiting the user's over-time testing before
+a winning fix is baked in and the harness removed.
 
 ## Running locally (development)
 
@@ -129,6 +142,14 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    buttonless move is real app input there) and when `e.buttons !== 0` (real drag in
    progress). Do NOT reintroduce focus-based gating. Module-level attach-once IIFE
    (contract #3).
+   **v0.9.6.dev2 note:** parts A/B (and the focus-click clear) are now **lever-gated** by
+   the Mouse Lab harness (`window.MouseLab` in terminal.js) so the fix can be A/B-tested
+   live. `inMouseTracking()` now also folds the `honorTracking` lever (returns false when
+   that lever is off, making the killer act even under mouse tracking). **Lever defaults
+   reproduce exactly this shipped behavior**, so the contract still holds by default. A new
+   lever 5 (`tmuxCopyClear`) sends Esc to the PTY on window refocus to cancel a possibly-
+   stranded tmux copy-mode selection (Hypothesis A). See
+   `docs/plans/2026-06-24-mouse-lab-harness.md`.
 5. **View pills** (`renderViewPills` in `app.js`) — one pill per view in the header,
    single-click activates; collapse below 600px where the dropdown trigger swaps to
    the dynamic active-view label (static "Views" label on desktop). Pills re-render
@@ -187,3 +208,10 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
   session-view convergence + suppressed redundant hover preview. **v0.9.2**
   (`CHANGELOG.md`): cwd auto-grouping spans git worktrees — backend-only
   `resolve_git_repo` change (see auto-views contract #6); no design doc.
+- Mouse Lab selection-fix harness (v0.9.6.dev2, IN PROGRESS):
+  `docs/plans/2026-06-24-mouse-lab-harness.md` — per-device localStorage toggle harness
+  (6 levers + 6 profiles) to A/B-test candidate fixes for the stale-selection bug, after
+  the tmux-`mouse on` "wrong-layer" reframing (Hypothesis A: stale highlight is tmux
+  copy-mode, not xterm's). Defaults preserve shipped v0.9.5 behavior. Research artifact
+  that prompted it: `docs/Claude Code + tmux + Mouse.md` (NOT muxplex-specific; its env-var
+  fixes don't apply — different stack). No CHANGELOG entry yet (dev build, no release).
