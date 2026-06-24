@@ -42,8 +42,10 @@ function _encodePayload(typeChar, str) {
 // routes through xterm's bracketed-paste support so multi-line pastes arrive
 // as one paste event. Returns true if the async clipboard API is available.
 function _pasteFromClipboard() {
+  if (_diagOn()) console.log('[seldebug] _pasteFromClipboard() called', new Error().stack.split('\n')[2]);
   if (!(navigator.clipboard && navigator.clipboard.readText)) return false;
   navigator.clipboard.readText().then(function(text) {
+    if (_diagOn()) console.log('[seldebug] clipboard.readText resolved → _term.paste len=' + (text ? text.length : 0));
     if (text && _term) _term.paste(text);
   }).catch(function() {
     // Permission denied or empty clipboard — nothing to paste
@@ -137,6 +139,18 @@ window.MouseLab = (function () {
   };
 })();
 
+// Shared diagnostic predicate — true when Mouse Lab lever 6 (diagLogging) is on,
+// or the legacy ?seldebug=1 URL / localStorage override is set. Used by the paste
+// + right-click probes and by initSelectionDebug below.
+function _diagOn() {
+  try {
+    if (window.MouseLab && window.MouseLab.get('diagLogging')) return true;
+    if (/[?&]seldebug=1/.test(location.search)) return true;
+    if (localStorage.getItem('muxplex_seldebug') === '1') return true;
+  } catch (_) {}
+  return false;
+}
+
 // ─── Forward declarations ─────────────────────────────────────────────────────
 
 function connectWebSocket(name, remoteId) {
@@ -163,6 +177,11 @@ function connectWebSocket(name, remoteId) {
   if (_term) {
     _term.onData(function(data) {
       if (_ws && _ws.readyState === WebSocket.OPEN) {
+        // Diagnostic: log every PTY send so a right-click double-paste shows
+        // whether the clipboard text is sent once or twice (and whether xterm
+        // also forwards an SGR mouse sequence). JSON.stringify reveals control
+        // bytes like the \e[200~ bracketed-paste markers and \e[<2;..M mouse.
+        if (_diagOn()) console.log('[seldebug] onData→PTY', JSON.stringify(data).slice(0, 80));
         // ttyd protocol: input is type 0x30 ('0') + UTF-8 keystroke bytes
         _ws.send(encodePayload(0x30, data));
       }
@@ -702,12 +721,15 @@ window._setTerminalFontSize = setTerminalFontSize;
   container.addEventListener('mousedown', function (e) {
     if (e.button !== 2) return; // right button only
     hadSelectionOnRightDown = !!(_term && _term.hasSelection());
+    if (_diagOn()) console.log('[seldebug] rclick mousedown hadSel=' + hadSelectionOnRightDown +
+      ' track=' + ((_term && _term.modes && _term.modes.mouseTrackingMode) || 'none'));
     // Copy NOW while the selection still exists (auto-copy on select already
     // ran; copying again is idempotent and covers any clipboard divergence).
     if (hadSelectionOnRightDown) _copyToClipboard(_term.getSelection());
   }, true); // capture phase — ahead of xterm's mousedown handling
 
   container.addEventListener('contextmenu', function (e) {
+    if (_diagOn()) console.log('[seldebug] contextmenu fired, hadSelectionOnRightDown=' + hadSelectionOnRightDown);
     if (e.shiftKey || e.ctrlKey || e.metaKey) return; // let modified clicks through
     e.preventDefault();
     if (!_term) return;
