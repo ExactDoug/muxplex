@@ -96,6 +96,7 @@ window.MouseLab = (function () {
     focusClickClear: true,
     honorTracking: true,
     tmuxCopyClear: false,
+    rightClickPassThru: false,
     diagLogging: false,
   };
   var cfg = Object.assign({}, DEFAULTS);
@@ -718,8 +719,20 @@ window._setTerminalFontSize = setTerminalFontSize;
 
   var hadSelectionOnRightDown = false;
 
+  // Mouse Lab lever 7 (rightClickPassThru): when ON and a full-screen TUI owns
+  // the mouse (raw mouseTrackingMode, independent of the left-click honorTracking
+  // lever), muxplex does NOT run its own right-click copy/paste — it lets xterm
+  // forward the right-click to the app so the app handles it, instead of BOTH
+  // acting on one click (the fullscreen-Claude-Code double-paste). Default OFF =
+  // current behavior (contract #2 unchanged, tests green).
+  function rightClickOwnedByApp() {
+    return !!(window.MouseLab && window.MouseLab.get('rightClickPassThru') &&
+              _term && _term.modes && _term.modes.mouseTrackingMode !== 'none');
+  }
+
   container.addEventListener('mousedown', function (e) {
     if (e.button !== 2) return; // right button only
+    if (rightClickOwnedByApp()) return; // app owns the mouse — don't copy here
     hadSelectionOnRightDown = !!(_term && _term.hasSelection());
     if (_diagOn()) console.log('[seldebug] rclick mousedown hadSel=' + hadSelectionOnRightDown +
       ' track=' + ((_term && _term.modes && _term.modes.mouseTrackingMode) || 'none'));
@@ -731,7 +744,10 @@ window._setTerminalFontSize = setTerminalFontSize;
   container.addEventListener('contextmenu', function (e) {
     if (_diagOn()) console.log('[seldebug] contextmenu fired, hadSelectionOnRightDown=' + hadSelectionOnRightDown);
     if (e.shiftKey || e.ctrlKey || e.metaKey) return; // let modified clicks through
-    e.preventDefault();
+    e.preventDefault(); // always suppress the browser context menu
+    // lever 7: app owns the mouse — suppress the menu but don't copy/paste here
+    // (let the forwarded right-click reach the app), avoiding the double-paste.
+    if (rightClickOwnedByApp()) { hadSelectionOnRightDown = false; return; }
     if (!_term) return;
     // A selection counts as present for this gesture if it existed at the
     // right-button mousedown (sampled flag) OR is still live right now. Either
@@ -801,7 +817,7 @@ window._setTerminalFontSize = setTerminalFontSize;
   // except the two opt-in experimental ones).
   function ML(k) {
     if (window.MouseLab) return window.MouseLab.get(k);
-    return !(k === 'tmuxCopyClear' || k === 'diagLogging');
+    return !(k === 'tmuxCopyClear' || k === 'rightClickPassThru' || k === 'diagLogging');
   }
 
   var DRAG_THRESHOLD_SQ = 5 * 5; // squared CSS px of movement before selecting

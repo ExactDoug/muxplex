@@ -321,6 +321,7 @@
                 <option value="baseline">Baseline (raw bug, no fixes)</option>
                 <option value="ignoreguard">Ignore tracking guard (Hyp. B)</option>
                 <option value="tmuxclear">tmux copy-mode clear (Hyp. A)</option>
+                <option value="rclickpass">Right-click pass-through (double-paste fix)</option>
                 <option value="diagnostics">Diagnostics only</option>
                 <option value="everything">Everything on</option>
               </select>
@@ -349,7 +350,11 @@
             <input type="checkbox" id="mouselab-tmuxCopyClear" class="settings-checkbox" data-lever="tmuxCopyClear" />
           </div>
           <div class="settings-field">
-            <label class="settings-label" for="mouselab-diagLogging">6. Diagnostic logging (console)</label>
+            <label class="settings-label" for="mouselab-rightClickPassThru">6. Right-click pass-through when app owns mouse (double-paste fix)</label>
+            <input type="checkbox" id="mouselab-rightClickPassThru" class="settings-checkbox" data-lever="rightClickPassThru" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label" for="mouselab-diagLogging">7. Diagnostic logging (console)</label>
             <input type="checkbox" id="mouselab-diagLogging" class="settings-checkbox" data-lever="diagLogging" />
           </div>
         </div>

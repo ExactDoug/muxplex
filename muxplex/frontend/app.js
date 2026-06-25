@@ -5038,20 +5038,22 @@ function switchSettingsTab(tabName) {
 // Profiles are one-shot presets: applying one writes the levers once (not
 // enforced), and any later individual toggle flips "Current" to Custom.
 var MOUSELAB_LEVERS = ['dragThreshold', 'zombieKiller', 'focusClickClear',
-                       'honorTracking', 'tmuxCopyClear', 'diagLogging'];
+                       'honorTracking', 'tmuxCopyClear', 'rightClickPassThru', 'diagLogging'];
 var MOUSELAB_PROFILES = {
   shipped:     { label: 'Shipped (v0.9.5)',
-                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: false, diagLogging: false },
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: false, rightClickPassThru: false, diagLogging: false },
   baseline:    { label: 'Baseline (raw bug, no fixes)',
-                 dragThreshold: false, zombieKiller: false, focusClickClear: false, honorTracking: false, tmuxCopyClear: false, diagLogging: false },
+                 dragThreshold: false, zombieKiller: false, focusClickClear: false, honorTracking: false, tmuxCopyClear: false, rightClickPassThru: false, diagLogging: false },
   ignoreguard: { label: 'Ignore tracking guard (Hyp. B)',
-                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: false, tmuxCopyClear: false, diagLogging: false },
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: false, tmuxCopyClear: false, rightClickPassThru: false, diagLogging: false },
   tmuxclear:   { label: 'tmux copy-mode clear (Hyp. A)',
-                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: true,  diagLogging: false },
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: true,  rightClickPassThru: false, diagLogging: false },
+  rclickpass:  { label: 'Right-click pass-through (double-paste fix)',
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: false, rightClickPassThru: true,  diagLogging: false },
   diagnostics: { label: 'Diagnostics only',
-                 dragThreshold: false, zombieKiller: false, focusClickClear: false, honorTracking: false, tmuxCopyClear: false, diagLogging: true },
+                 dragThreshold: false, zombieKiller: false, focusClickClear: false, honorTracking: false, tmuxCopyClear: false, rightClickPassThru: false, diagLogging: true },
   everything:  { label: 'Everything on',
-                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: true,  diagLogging: true },
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: true,  rightClickPassThru: true,  diagLogging: true },
 };
 
 // Return the label of the profile the current config exactly matches, or 'Custom'.
