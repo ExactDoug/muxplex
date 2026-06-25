@@ -5,7 +5,7 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.6.dev2** (on branch `feat/v0.9-session-ux`) — a
+improvements. Current version: **0.9.6.dev4** (on branch `feat/v0.9-session-ux`) — a
 **dev/experimental** build carrying the Mouse Lab selection-fix harness (see below); last
 released version is **0.9.5**.
 
@@ -38,11 +38,22 @@ mouse-tracking mode most of the time and the xterm-side fixes bail / may target 
 layer. Two hypotheses — **A:** the stale highlight is **tmux copy-mode** (server-side), not
 xterm's, so `_term.clearSelection()` is aimed wrong (fix = send Esc to PTY); **B:** tracking
 mode desync. Decisive read: `_term.hasSelection()` false while a highlight is visible ⇒ A.
-Built a **Mouse Lab** harness (Settings tab) — 6 per-device localStorage toggles + 6
-profiles to A/B-test fixes live without reloads; diagnostics now log `hasSel`/`track`.
+Built a **Mouse Lab** harness (Settings tab) — per-device localStorage toggles + profiles
+to A/B-test fixes live without reloads; diagnostics now log `hasSel`/`track`.
 **Defaults reproduce shipped v0.9.5 behavior (tests stay green).** Design + test plan:
 `docs/plans/2026-06-24-mouse-lab-harness.md`. Awaiting the user's over-time testing before
 a winning fix is baked in and the harness removed.
+**v0.9.6.dev3–dev4 (committed): a SECOND, distinct bug — right-click double-paste.** It
+started when the user accepted Claude Code's **fullscreen** prompt (`~/.claude/settings.json`
+`tui:fullscreen`), which turns Claude Code's **mouse capture ON**; with tmux `mouse on`, a
+right-click is handled by BOTH muxplex's `contextmenu` paste AND the click forwarded to
+Claude Code → double paste (Ctrl+V is immune — keystroke, not forwarded). dev3 added
+paste-path diagnostics (`_pasteFromClipboard`/`onData→PTY`/right-click branch, gated by
+lever 7). dev4 added **lever 6 `rightClickPassThru`** (default OFF): when an app owns the
+mouse, muxplex suppresses the browser menu but lets the forwarded right-click reach the app
+instead of also pasting. The Mouse Lab now has **7 levers + 7 profiles**. Open question the
+lever-6 test settles: ON makes double→single ⇒ fix confirmed; double→zero ⇒ muxplex was
+double-sending (different fix). Current version: **0.9.6.dev4**.
 
 ## Running locally (development)
 
@@ -110,6 +121,11 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    (Do NOT restore the old comment claiming xterm clears the selection on right-down /
    that `hasSelection()` in contextmenu is always false — with `rightClickSelectsWord`
    unset it does not, and that false premise is what left the race open.)
+   **v0.9.6.dev4 note:** `initRightClickCopyPaste` is now **lever-gated** by Mouse Lab
+   lever 6 (`rightClickPassThru`, default OFF → contract unchanged). When ON and an app
+   owns the mouse (`mouseTrackingMode !== 'none'`), the handler suppresses the browser menu
+   but does NOT copy/paste — it lets the forwarded right-click reach the app, fixing the
+   fullscreen-Claude-Code right-click double-paste (see v0.9.6 paragraph above).
 3. **No handler stacking** — `#terminal-container` is static and `openTerminal()`
    re-runs per session switch. Container-level listeners belong in module-level
    attach-once IIFEs (`initRightClickCopyPaste`, `initMobileTerminalScroll`), never
@@ -210,8 +226,10 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
   `resolve_git_repo` change (see auto-views contract #6); no design doc.
 - Mouse Lab selection-fix harness (v0.9.6.dev2, IN PROGRESS):
   `docs/plans/2026-06-24-mouse-lab-harness.md` — per-device localStorage toggle harness
-  (6 levers + 6 profiles) to A/B-test candidate fixes for the stale-selection bug, after
-  the tmux-`mouse on` "wrong-layer" reframing (Hypothesis A: stale highlight is tmux
-  copy-mode, not xterm's). Defaults preserve shipped v0.9.5 behavior. Research artifact
-  that prompted it: `docs/Claude Code + tmux + Mouse.md` (NOT muxplex-specific; its env-var
-  fixes don't apply — different stack). No CHANGELOG entry yet (dev build, no release).
+  (**7 levers + 7 profiles** as of dev4) to A/B-test candidate fixes for TWO bugs: the
+  stale-selection bug (tmux-`mouse on` "wrong-layer" reframing; Hyp. A = tmux copy-mode,
+  not xterm's; levers 4/5) **and** the right-click double-paste from fullscreen Claude Code
+  mouse capture (lever 6 `rightClickPassThru`). Defaults preserve shipped v0.9.5 behavior.
+  Research artifact that prompted the reframing: `docs/Claude Code + tmux + Mouse.md` (NOT
+  muxplex-specific; its env-var fixes don't apply — different stack). No CHANGELOG entry yet
+  (dev build, no release).
