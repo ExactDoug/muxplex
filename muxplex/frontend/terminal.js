@@ -42,8 +42,10 @@ function _encodePayload(typeChar, str) {
 // routes through xterm's bracketed-paste support so multi-line pastes arrive
 // as one paste event. Returns true if the async clipboard API is available.
 function _pasteFromClipboard() {
+  if (_diagOn()) console.log('[seldebug] _pasteFromClipboard() called', new Error().stack.split('\n')[2]);
   if (!(navigator.clipboard && navigator.clipboard.readText)) return false;
   navigator.clipboard.readText().then(function(text) {
+    if (_diagOn()) console.log('[seldebug] clipboard.readText resolved → _term.paste len=' + (text ? text.length : 0));
     if (text && _term) _term.paste(text);
   }).catch(function() {
     // Permission denied or empty clipboard — nothing to paste
@@ -65,6 +67,89 @@ function _copyToClipboard(text) {
     try { document.execCommand('copy'); } catch(e) {}
     document.body.removeChild(ta);
   }
+}
+
+// ─── Mouse Lab: experimental terminal-selection levers ──────────────────────
+// A per-device (localStorage-backed) harness for A/B-testing the candidate
+// fixes for the inadvertent-text-selection bug. Each lever gates one behavior
+// in the deliberate-selection and diagnostic IIFEs below. Defaults reproduce the
+// SHIPPED (v0.9.5) behavior, so the test suite and production users are
+// unaffected unless a lever is deliberately changed. The settings UI (app.js
+// "Mouse Lab" tab) writes this config via MouseLab.save(); handlers read it live
+// at gesture time, so toggles take effect on the next mouse action — no reload.
+//
+// Levers (see CLAUDE.md frontend contract #4b for the behaviors they gate):
+//   dragThreshold   — ~5px suppressor: sub-threshold left press is a focus click
+//   zombieKiller    — buttonless-mousemove kill of a stale (zombie) xterm drag
+//   focusClickClear — a focus-only click drops any stray selection + refocuses
+//   honorTracking   — when on, the three above bail under mouseTrackingMode
+//                     (TUI mouse app owns the mouse); off = act regardless
+//   tmuxCopyClear   — on window refocus after a press was lost outside the
+//                     window, send Esc to the PTY to cancel tmux copy-mode
+//                     (Hypothesis A: the stale highlight is tmux's, not xterm's)
+//   diagLogging     — console [seldebug] logging of every mouse event + state
+window.MouseLab = (function () {
+  var KEY = 'muxplex_mouselab';
+  var DEFAULTS = {
+    dragThreshold: true,
+    zombieKiller: true,
+    focusClickClear: true,
+    honorTracking: true,
+    tmuxCopyClear: false,
+    rightClickPassThru: false,
+    diagLogging: false,
+  };
+  var cfg = Object.assign({}, DEFAULTS);
+
+  function load() {
+    var next = Object.assign({}, DEFAULTS);
+    try {
+      var raw = localStorage.getItem(KEY);
+      if (raw) {
+        var parsed = JSON.parse(raw);
+        for (var k in DEFAULTS) {
+          if (typeof parsed[k] === 'boolean') next[k] = parsed[k];
+        }
+      }
+    } catch (_) { /* blocked / malformed — fall back to defaults */ }
+    cfg = next;
+  }
+  load();
+
+  // Cross-tab + same-tab change propagation (UI in app.js dispatches the latter).
+  try {
+    window.addEventListener('storage', function (e) {
+      if (!e || e.key === KEY || e.key === null) load();
+    });
+    window.addEventListener('muxplex:mouselab-changed', load);
+  } catch (_) {}
+
+  return {
+    DEFAULTS: DEFAULTS,
+    get: function (k) { return cfg[k]; },
+    all: function () { return Object.assign({}, cfg); },
+    reload: load,
+    // Merge a partial config, persist, and notify readers (this tab + others).
+    save: function (partial) {
+      var merged = Object.assign({}, cfg, partial || {});
+      cfg = merged;
+      try { localStorage.setItem(KEY, JSON.stringify(merged)); } catch (_) {}
+      try { window.dispatchEvent(new Event('muxplex:mouselab-changed')); } catch (_) {}
+      return Object.assign({}, merged);
+    },
+  };
+})();
+
+// Shared diagnostic predicate — true when Mouse Lab lever 6 (diagLogging) is on,
+// or the legacy ?seldebug=1 URL / localStorage override is set. Used by the paste
+// + right-click probes and by initSelectionDebug below.
+function _diagOn() {
+  try {
+    if (window.MouseLab && window.MouseLab.get('diagLogging')) return true;
+    if (/[?&]seldebug=1/.test(location.search)) return true;
+    if (localStorage.getItem('muxplex_seldebug') === '1') return true;
+  } catch (_) {}
+  return false;
 }
 
 // ─── Forward declarations ─────────────────────────────────────────────────────
@@ -93,6 +178,11 @@ function connectWebSocket(name, remoteId) {
   if (_term) {
     _term.onData(function(data) {
       if (_ws && _ws.readyState === WebSocket.OPEN) {
+        // Diagnostic: log every PTY send so a right-click double-paste shows
+        // whether the clipboard text is sent once or twice (and whether xterm
+        // also forwards an SGR mouse sequence). JSON.stringify reveals control
+        // bytes like the \e[200~ bracketed-paste markers and \e[<2;..M mouse.
+        if (_diagOn()) console.log('[seldebug] onData→PTY', JSON.stringify(data).slice(0, 80));
         // ttyd protocol: input is type 0x30 ('0') + UTF-8 keystroke bytes
         _ws.send(encodePayload(0x30, data));
       }
@@ -604,13 +694,18 @@ window._setTerminalFontSize = setTerminalFontSize;
 //   right-click WITH an active selection  → completes the COPY, never pastes
 //   right-click with NO selection         → pastes the browser clipboard
 //
-// CRITICAL ordering detail: a right-click fires mousedown → (xterm clears
-// the selection) → contextmenu. By the time contextmenu fires hasSelection()
-// is already false, so checking it there would treat the copy gesture as a
-// paste — copying AND pasting on the same click. The selection state is
-// therefore sampled (and the copy performed) in a capture-phase mousedown
-// handler, before xterm's own mouse handling runs; contextmenu then consumes
-// that flag and pastes only when no selection was present at press time.
+// CRITICAL ordering detail: a right-click fires mousedown → contextmenu, and
+// depending on browser/input (touchpad two-finger tap, synthetic contextmenu)
+// the button-2 mousedown may not fire at all, or selection state may diverge
+// between the two events. The selection is therefore sampled (and the copy
+// performed) in a capture-phase mousedown handler, before xterm's own mouse
+// handling runs. contextmenu then treats the gesture as a COPY if a selection
+// was present at EITHER moment — the sampled mousedown flag OR a live
+// hasSelection() re-check at contextmenu time — and only pastes when no
+// selection existed at either point. The OR closes the race where the
+// mousedown sample read false (stale flag / cross-client selection desync)
+// while a selection is in fact live, which previously let one right-click both
+// copy (auto-copy on select) AND paste.
 //
 // hasSelection() is buffer-based, not viewport-based — scrolling the selected
 // text out of view does not affect it, so no selection tracking of our own
@@ -624,27 +719,287 @@ window._setTerminalFontSize = setTerminalFontSize;
 
   var hadSelectionOnRightDown = false;
 
+  // Mouse Lab lever 7 (rightClickPassThru): when ON and a full-screen TUI owns
+  // the mouse (raw mouseTrackingMode, independent of the left-click honorTracking
+  // lever), muxplex does NOT run its own right-click copy/paste — it lets xterm
+  // forward the right-click to the app so the app handles it, instead of BOTH
+  // acting on one click (the fullscreen-Claude-Code double-paste). Default OFF =
+  // current behavior (contract #2 unchanged, tests green).
+  function rightClickOwnedByApp() {
+    return !!(window.MouseLab && window.MouseLab.get('rightClickPassThru') &&
+              _term && _term.modes && _term.modes.mouseTrackingMode !== 'none');
+  }
+
   container.addEventListener('mousedown', function (e) {
     if (e.button !== 2) return; // right button only
+    if (rightClickOwnedByApp()) return; // app owns the mouse — don't copy here
     hadSelectionOnRightDown = !!(_term && _term.hasSelection());
+    if (_diagOn()) console.log('[seldebug] rclick mousedown hadSel=' + hadSelectionOnRightDown +
+      ' track=' + ((_term && _term.modes && _term.modes.mouseTrackingMode) || 'none'));
     // Copy NOW while the selection still exists (auto-copy on select already
     // ran; copying again is idempotent and covers any clipboard divergence).
     if (hadSelectionOnRightDown) _copyToClipboard(_term.getSelection());
   }, true); // capture phase — ahead of xterm's mousedown handling
 
   container.addEventListener('contextmenu', function (e) {
+    if (_diagOn()) console.log('[seldebug] contextmenu fired, hadSelectionOnRightDown=' + hadSelectionOnRightDown);
     if (e.shiftKey || e.ctrlKey || e.metaKey) return; // let modified clicks through
-    e.preventDefault();
+    e.preventDefault(); // always suppress the browser context menu
+    // lever 7: app owns the mouse — suppress the menu but don't copy/paste here
+    // (let the forwarded right-click reach the app), avoiding the double-paste.
+    if (rightClickOwnedByApp()) { hadSelectionOnRightDown = false; return; }
     if (!_term) return;
-    if (hadSelectionOnRightDown) {
-      // This right-click was the COPY gesture (copied at mousedown above).
-      // Do NOT paste on the same click — the next right-click pastes.
-      hadSelectionOnRightDown = false;
-      if (_term.hasSelection()) _term.clearSelection();
+    // A selection counts as present for this gesture if it existed at the
+    // right-button mousedown (sampled flag) OR is still live right now. Either
+    // way the gesture is a COPY and must NEVER also paste on the same click.
+    var hadSelection = hadSelectionOnRightDown || _term.hasSelection();
+    hadSelectionOnRightDown = false; // consume the latch regardless of branch
+    if (hadSelection) {
+      // COPY gesture. Re-copy if a selection is still live (covers inputs that
+      // fired contextmenu without a button-2 mousedown, so nothing copied yet),
+      // then clear it. Do NOT paste — the next selection-free right-click pastes.
+      if (_term.hasSelection()) {
+        _copyToClipboard(_term.getSelection());
+        _term.clearSelection();
+      }
       return;
     }
     _pasteFromClipboard();
   });
+})();
+
+// ---------------------------------------------------------------------------
+// Deliberate text selection + zombie-drag killer.
+//
+// xterm.js 5.3.0's SelectionService stores a selection anchor on a left
+// mousedown, attaches document-level mousemove/mouseup listeners, and extends
+// the selection from that anchor on EVERY mousemove — with NO check of whether
+// a mouse button is physically held (verified in the vendored bundle: the move
+// handler's only gate is `if (!selectionStart) return`). Those listeners are
+// removed ONLY on mouseup. Two failure modes follow:
+//
+//   (A) Accidental selection on a focus click. Clicking the terminal just to
+//       regain focus + the tiniest pointer drift starts a selection and
+//       keystrokes look "stuck". Fix: a drag threshold — a left press that
+//       never drags past ~5px starts no selection.
+//
+//   (B) ZOMBIE DRAG (the big one). If a drag's mouseup never reaches the page —
+//       button released outside the window, or the window blurred mid-drag —
+//       xterm's drag is never torn down: its document mousemove stays live and
+//       the anchor stays set. When you return and merely MOVE the pointer
+//       toward your next click (no button held), xterm extends a huge selection
+//       from the stale anchor to the cursor BEFORE any click happens. A
+//       mousedown- or focus-based reset can't catch this — the damage is done
+//       on a buttonless mousemove. Fix: track whether a drag may be open, and
+//       the instant a mousemove arrives with `e.buttons === 0` (no button
+//       physically down) while a drag is supposedly open, it's a zombie — kill
+//       it in CAPTURE phase (ahead of xterm's bubble-phase move) before it can
+//       extend. `_term.clearSelection()` is a full teardown in 5.3.0: it nulls
+//       the anchor AND removes xterm's document listeners, so nothing can
+//       re-extend. This is focus-INDEPENDENT — the earlier focus-tracking
+//       approach was unreliable (focusin can fire before mousedown; focus may
+//       never move) and is gone.
+//
+// Guards: left button only (right button is the copy/paste gesture above);
+// single click only (e.detail === 1) so double/triple-click word/line selection
+// is untouched; unmodified only; never act when a full-screen TUI has mouse
+// tracking on (_term.modes.mouseTrackingMode !== 'none') — there a buttonless
+// move is legitimate app input. Module-level attach-once on the static
+// container/document, same as the handlers above (no per-session stacking).
+// ---------------------------------------------------------------------------
+;(function initDeliberateSelection() {
+  var container = document.getElementById('terminal-container');
+  if (!container) return;
+
+  // Lever read helper — reads the live Mouse Lab config at gesture time so UI
+  // toggles take effect on the next mouse action (no reload). Falls back to the
+  // shipped defaults if MouseLab somehow failed to initialize (all levers on
+  // except the two opt-in experimental ones).
+  function ML(k) {
+    if (window.MouseLab) return window.MouseLab.get(k);
+    return !(k === 'tmuxCopyClear' || k === 'rightClickPassThru' || k === 'diagLogging');
+  }
+
+  var DRAG_THRESHOLD_SQ = 5 * 5; // squared CSS px of movement before selecting
+  var armed = false;             // a qualifying left press is in progress
+  var passedThreshold = false;   // pointer has moved far enough to select
+  var startX = 0, startY = 0;
+  // True while a left mousedown that reached xterm may have an open selection
+  // drag. Cleared by any real mouseup; if a mouseup is lost, a later buttonless
+  // mousemove exposes the zombie and we kill it.
+  var dragMaybeActive = false;
+  // Tracking-independent latch for lever 5 (tmuxCopyClear): any left press is
+  // "open" until its mouseup. If the window blurs while open, the mouseup was
+  // likely lost outside the window → tmux copy-mode may be stranded.
+  var leftPressOpen = false;
+  var blurredWithPress = false;
+
+  // Lever 4 (honorTracking): when on, the selection levers stand aside while a
+  // full-screen TUI owns the mouse (mouseTrackingMode !== 'none') — there a
+  // buttonless move is real app input. Turning the lever off makes this return
+  // false unconditionally, so the levers act regardless of tracking — to test
+  // whether the guard itself is suppressing the killer. (Name kept as
+  // inMouseTracking: it answers "should the tracking guard suppress us?")
+  function inMouseTracking() {
+    if (!ML('honorTracking')) return false;
+    return !!(_term && _term.modes && _term.modes.mouseTrackingMode !== 'none');
+  }
+
+  // Kill a (possibly zombie) xterm selection drag. clearSelection() nulls the
+  // anchor and removes xterm's own document mousemove/mouseup listeners, so no
+  // further move can re-extend.
+  function killDrag(e) {
+    if (e) e.stopImmediatePropagation(); // this buttonless move must not reach xterm
+    dragMaybeActive = false;
+    armed = false;
+    passedThreshold = false;
+    document.removeEventListener('mousemove', onMouseMove, true);
+    document.removeEventListener('mouseup', onMouseUp, true);
+    if (_term) { try { _term.clearSelection(); } catch (_) {} }
+  }
+
+  // (A / lever 1) Per-gesture threshold suppressor: swallow xterm's selection-
+  // extending move (capture phase, ahead of xterm's bubble move) until a real
+  // drag crosses ~5px; then step aside and let xterm select normally. When the
+  // lever is off, do not suppress — xterm selects from the first pixel.
+  function onMouseMove(e) {
+    if (!armed || passedThreshold) return;
+    if (!ML('dragThreshold')) { passedThreshold = true; return; }
+    var dx = e.clientX - startX;
+    var dy = e.clientY - startY;
+    if (dx * dx + dy * dy >= DRAG_THRESHOLD_SQ) {
+      passedThreshold = true; // real drag — hand the rest to xterm
+      return;
+    }
+    e.stopImmediatePropagation(); // below threshold — xterm never extends
+  }
+
+  // (C / lever 3) Focus-only click: on a sub-threshold left release, drop any
+  // stray selection and keep the keyboard live.
+  function onMouseUp() {
+    document.removeEventListener('mousemove', onMouseMove, true);
+    document.removeEventListener('mouseup', onMouseUp, true);
+    if (ML('focusClickClear') && armed && !passedThreshold && _term) {
+      if (_term.hasSelection()) _term.clearSelection();
+      _term.focus();
+    }
+    armed = false;
+    passedThreshold = false;
+  }
+
+  // (B / lever 2) Always-on zombie-drag killer, focus-independent. Capture phase
+  // so it runs before xterm's bubble-phase document mousemove. If a drag may be
+  // open and a move arrives with NO button physically held, it's a zombie: kill
+  // it before xterm extends. Suppressed under the tracking guard (lever 4).
+  document.addEventListener('mousemove', function (e) {
+    if (!ML('zombieKiller')) return;
+    if (e.buttons !== 0 || !dragMaybeActive || inMouseTracking()) return;
+    killDrag(e);
+  }, true);
+
+  // Any real mouseup ends the drag latch cleanly — a zombie only exists when
+  // this never fires (released outside the window / blurred mid-drag).
+  document.addEventListener('mouseup', function () { dragMaybeActive = false; }, true);
+  // The tracking-independent lever-5 latch clears on the same real mouseup.
+  document.addEventListener('mouseup', function () { leftPressOpen = false; }, true);
+
+  // (lever 5 / tmuxCopyClear) tmux copy-mode lives server-side, independent of
+  // xterm's selection. If a left press was open when the window blurred, the
+  // mouseup was likely lost outside the window and tmux may be sitting in
+  // copy-mode with a stale highlight. On refocus, send Esc to the PTY to cancel
+  // it. The blurred-with-press gate keeps Esc from firing on ordinary alt-tab.
+  window.addEventListener('blur', function () { blurredWithPress = leftPressOpen; });
+  window.addEventListener('focus', function () {
+    if (ML('tmuxCopyClear') && blurredWithPress &&
+        _ws && _ws.readyState === WebSocket.OPEN) {
+      try { _ws.send(_encodePayload(0x30, '\x1b')); } catch (_) {}
+    }
+    blurredWithPress = false;
+    leftPressOpen = false;
+  });
+
+  container.addEventListener('mousedown', function (e) {
+    if (e.button !== 0) return;        // left button only
+    leftPressOpen = true;              // lever-5 latch (tracking-independent)
+    if (inMouseTracking()) return;     // TUI mouse app owns the drag (lever 4)
+    // Any left press that reaches xterm opens a selection drag — track it so a
+    // lost mouseup can be detected later as a zombie.
+    dragMaybeActive = true;
+    if (e.detail !== 1) return;        // leave dbl/triple-click selection alone
+    if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return; // modified → xterm
+    // Arm the threshold/focus-click machinery only if a lever needs it.
+    if (!ML('dragThreshold') && !ML('focusClickClear')) return;
+    armed = true;
+    passedThreshold = false;
+    startX = e.clientX;
+    startY = e.clientY;
+    // Do NOT preventDefault — xterm still focuses its textarea on this press.
+    document.addEventListener('mousemove', onMouseMove, true);
+    document.addEventListener('mouseup', onMouseUp, true);
+  }, true); // capture phase — register the move suppressor before xterm reacts
+})();
+
+// ---------------------------------------------------------------------------
+// Diagnostic logging (Mouse Lab lever 6 / diagLogging). Logs every mouse event +
+// the xterm selection range + mouse-ownership state so we can see exactly how a
+// plain click produces a stale-anchor selection. Listeners are always attached
+// but each is gated on isOn() at call time, so the lever toggles logging live
+// (no reload). The legacy ?seldebug=1 URL / localStorage flag forces it on too.
+// REMOVE once the selection bug is root-caused.
+// ---------------------------------------------------------------------------
+;(function initSelectionDebug() {
+  var override = false;
+  try {
+    override = /[?&]seldebug=1/.test(location.search) ||
+               localStorage.getItem('muxplex_seldebug') === '1';
+  } catch (_) {}
+  function isOn() {
+    return override || !!(window.MouseLab && window.MouseLab.get('diagLogging'));
+  }
+
+  function selInfo() {
+    if (!_term) return 'no _term';
+    var pos = null, len = 0, hasSel = '?', track = '?';
+    try { pos = _term.getSelectionPosition(); } catch (_) {}
+    try { len = (_term.getSelection() || '').length; } catch (_) {}
+    // Decisive for Hypothesis A vs B: if a highlight is visible while
+    // hasSel=false, the selection is tmux copy-mode (server side), not xterm's
+    // — our _term.clearSelection() fixes would be aimed at the wrong layer.
+    // track is the mouse-ownership state (set by tmux mouse-on / Claude Code).
+    try { hasSel = _term.hasSelection(); } catch (_) {}
+    try { track = (_term.modes && _term.modes.mouseTrackingMode) || 'none'; } catch (_) {}
+    return 'sel.len=' + len + ' hasSel=' + hasSel + ' track=' + track +
+           ' range=' + (pos ? JSON.stringify(pos) : 'none');
+  }
+  function log(tag, e) {
+    if (!isOn()) return;
+    var t = e.target;
+    var desc = t && t.tagName
+      ? t.tagName + (t.className ? '.' + String(t.className).split(' ')[0] : '')
+      : String(t);
+    console.log('[seldebug]', tag,
+      'btn=' + e.button, 'buttons=' + e.buttons, 'detail=' + e.detail,
+      'x=' + e.clientX, 'y=' + e.clientY,
+      'mods=' + (e.shiftKey ? 'S' : '') + (e.altKey ? 'A' : '') +
+                (e.ctrlKey ? 'C' : '') + (e.metaKey ? 'M' : ''),
+      'tgt=' + desc, '|', selInfo());
+    // The selection usually forms right after the event — sample again next frame.
+    requestAnimationFrame(function () {
+      if (isOn()) console.log('[seldebug]', tag + '+raf', selInfo());
+    });
+  }
+  ['mousedown', 'mouseup', 'click', 'dblclick'].forEach(function (type) {
+    document.addEventListener(type, function (e) { log(type, e); }, true);
+  });
+  window.addEventListener('blur', function () {
+    if (isOn()) console.log('[seldebug] window blur |', selInfo());
+  });
+  window.addEventListener('focus', function () {
+    if (isOn()) console.log('[seldebug] window focus |', selInfo());
+  });
+  if (override) {
+    console.log('[seldebug] enabled — reproduce the bug, then copy ALL [seldebug] console lines back to Claude');
+  }
 })();
 
 // ---------------------------------------------------------------------------

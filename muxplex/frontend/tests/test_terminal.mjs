@@ -1091,6 +1091,104 @@ test('terminal.js right-click handlers are attached once at module level (no sta
     'openTerminal must NOT register contextmenu handlers (they would stack across reopens)');
 });
 
+test('terminal.js right-click treats a selection live at EITHER mousedown OR contextmenu as copy-only', () => {
+  // Hardening for the residual copy-AND-paste race: the capture-phase mousedown
+  // sample can read false (stale flag when contextmenu fires without a button-2
+  // mousedown, or cross-client selection desync) while a selection is in fact
+  // live. contextmenu must therefore OR the sampled flag with a fresh
+  // hasSelection() check and copy-only in that case — never fall through to paste.
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  const blockStart = source.indexOf('initRightClickCopyPaste');
+  const block = source.substring(blockStart, source.indexOf('})();', blockStart));
+  const ctxStart = block.indexOf("addEventListener('contextmenu'");
+  const ctxBlock = block.substring(ctxStart);
+  // The copy-vs-paste decision must combine the sampled flag with a live re-check.
+  assert.ok(/hadSelectionOnRightDown\s*\|\|\s*_term\.hasSelection\(\)/.test(ctxBlock),
+    'contextmenu must gate on hadSelectionOnRightDown || _term.hasSelection() (close the desync race)');
+  // The selection branch must still return before the paste call.
+  const decisionIdx = ctxBlock.indexOf('hadSelectionOnRightDown');
+  const guardBlock = ctxBlock.substring(decisionIdx, ctxBlock.indexOf('_pasteFromClipboard()'));
+  assert.ok(guardBlock.includes('return'),
+    'copy branch must return before _pasteFromClipboard() — copy and paste must never both fire');
+});
+
+// --- Deliberate selection: a plain focus-click must not start a selection ---
+
+test('terminal.js gates text selection behind a drag threshold (focus-click never selects)', () => {
+  // A click made only to regain OS/browser focus must NOT enter selection mode.
+  // initDeliberateSelection suppresses xterm's selection-extending mousemove (in
+  // capture phase) until the pointer drags past a small threshold, so a click
+  // without a drag stays a pure focus click.
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('(function initDeliberateSelection()'),
+    'must define a module-level initDeliberateSelection IIFE');
+  const start = source.indexOf('initDeliberateSelection');
+  const block = source.substring(start, source.indexOf('})();', start));
+  assert.ok(block.includes('e.button !== 0'), 'must apply to the left button only');
+  assert.ok(block.includes('e.detail !== 1'), 'must leave double/triple-click word/line selection alone');
+  assert.ok(block.includes('mouseTrackingMode'), 'must not interfere when a TUI has mouse tracking on');
+  assert.ok(block.includes('stopImmediatePropagation'),
+    'must suppress xterm selection-extending mousemove below the threshold');
+  assert.ok(/addEventListener\('mousemove'[^)]*,\s*true\)/.test(block),
+    'the move suppressor must be registered in capture phase (ahead of xterm)');
+  assert.ok(block.includes('clearSelection') && block.includes('_term.focus()'),
+    'a focus-only click must clear any stray selection and refocus the terminal');
+});
+
+test('terminal.js kills a zombie xterm selection drag on a buttonless mousemove (focus-independent)', () => {
+  // Root cause: xterm 5.3.0 extends a selection from its anchor on every mousemove
+  // with NO button-state check, and only tears the drag down on mouseup. If that
+  // mouseup is lost (released outside the window / blurred mid-drag), returning the
+  // pointer extends a huge selection from the stale anchor before any click. Fix:
+  // an always-on capture-phase document mousemove that, when e.buttons === 0 and a
+  // drag may be open, kills it (clearSelection = full teardown of anchor+listeners)
+  // BEFORE xterm's bubble-phase move can extend it. A real mouseup clears the latch.
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  const start = source.indexOf('initDeliberateSelection');
+  const block = source.substring(start, source.indexOf('})();', start));
+  // A latch tracks whether a drag may be open.
+  assert.ok(block.includes('dragMaybeActive'), 'must track whether an xterm drag may be open');
+  // The latch is set on a left mousedown and cleared by any real mouseup.
+  assert.ok(/dragMaybeActive = true/.test(block), 'a qualifying left mousedown must arm the drag latch');
+  assert.ok(/addEventListener\('mouseup', function \(\) \{ dragMaybeActive = false; \}, true\)/.test(block),
+    'any real mouseup must clear the drag latch (capture phase)');
+  // The guard keys off the PHYSICAL button state (e.buttons === 0), not focus.
+  assert.ok(/e\.buttons !== 0 \|\| !dragMaybeActive \|\| inMouseTracking\(\)/.test(block),
+    'the zombie-drag guard must fire only on a buttonless move with the latch set, outside mouse tracking');
+  assert.ok(/addEventListener\('mousemove', function \(e\) \{[\s\S]*killDrag\(e\)[\s\S]*\}, true\)/.test(block),
+    'the buttonless-move guard must run in capture phase and call killDrag');
+  // killDrag suppresses the move and fully tears down the drag.
+  const kdStart = block.indexOf('function killDrag');
+  const kdBlock = block.substring(kdStart, block.indexOf('function onMouseMove', kdStart));
+  assert.ok(kdBlock.includes('stopImmediatePropagation'),
+    'killDrag must stop the buttonless move from reaching xterm');
+  assert.ok(kdBlock.includes('_term.clearSelection()'),
+    'killDrag must clearSelection() — a full teardown that nulls the anchor and removes xterm listeners');
+  // The fix must NOT depend on focus tracking (the prior unreliable approach).
+  assert.ok(!block.includes('hasFocus'), 'must not rely on focus tracking (unreliable: focusin can precede mousedown)');
+});
+
+test('terminal.js zombie-drag killer never fires in a TUI mouse-tracking stream or while a button is held', () => {
+  // A buttonless move is legitimate app input under mouse tracking, and a held
+  // button (e.buttons !== 0) is a real drag — neither must trigger the killer.
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  const start = source.indexOf('initDeliberateSelection');
+  const block = source.substring(start, source.indexOf('})();', start));
+  assert.ok(/e\.buttons !== 0[^\n]*return/.test(block),
+    'must bail when any button is physically held (real drag)');
+  assert.ok(/inMouseTracking\(\)[^\n]*return/.test(block),
+    'must bail in mouse-tracking mode (buttonless moves are real app input)');
+});
+
+test('terminal.js deliberate-selection handlers are attached once at module level (no stacking)', () => {
+  const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
+  const openStart = source.indexOf('function openTerminal');
+  const openEnd = source.indexOf('function closeTerminal', openStart);
+  const openBlock = source.substring(openStart, openEnd);
+  assert.ok(!openBlock.includes('initDeliberateSelection'),
+    'openTerminal must NOT register the deliberate-selection handlers (they would stack across reopens)');
+});
+
 // --- Shift+Enter inserts a newline (LF) instead of submitting (CR) ---
 
 test('terminal.js Shift+Enter sends LF (0x0a) so TUI apps insert a newline', () => {

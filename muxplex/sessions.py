@@ -68,6 +68,38 @@ def update_session_paths(paths: dict[str, str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Session-name validation
+# ---------------------------------------------------------------------------
+
+# tmux uses '.' and ':' as separators in target specs (session:window.pane), so
+# a session name containing either can't be reliably addressed. 'dir:' would be
+# caught by the ':' rule, but we reject it explicitly for a clearer message
+# (it is the reserved auto-view namespace — see views.AUTO_VIEW_PREFIX).
+_AUTO_VIEW_PREFIX = "dir:"
+
+
+def validate_session_name(name: str, existing: list[str] | None = None) -> str | None:
+    """Validate a tmux session name. Return an error message, or None if valid.
+
+    Rules: non-empty after trimming; no '.' or ':' (tmux target separators); no
+    control characters; not the reserved 'dir:' auto-view prefix; and unique
+    among *existing* session names when provided.
+    """
+    stripped = (name or "").strip()
+    if not stripped:
+        return "Session name cannot be empty"
+    if stripped.lower().startswith(_AUTO_VIEW_PREFIX):
+        return f"Names starting with '{_AUTO_VIEW_PREFIX}' are reserved"
+    if "." in stripped or ":" in stripped:
+        return "Session name cannot contain '.' or ':'"
+    if any(ord(c) < 0x20 for c in stripped):
+        return "Session name cannot contain control characters"
+    if existing and stripped in set(existing):
+        return f"A session named '{stripped}' already exists"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Subprocess helpers
 # ---------------------------------------------------------------------------
 
@@ -180,13 +212,71 @@ _git_repo_cache: dict[str, str | None] = {}
 _GIT_REPO_CACHE_MAX = 512
 
 
+def _main_repo_name_from_worktree(git_file: str) -> str | None:
+    """Resolve the *main* repo name for a linked worktree's `.git` file.
+
+    A linked worktree (`git worktree add`) places a `.git` *file* — not a
+    directory — at the worktree root, reading::
+
+        gitdir: <main>/.git/worktrees/<wt-name>
+
+    We follow that to the worktree's gitdir, then to the shared common dir
+    (canonically via its `commondir` file, falling back to stripping the
+    trailing `worktrees/<wt-name>`), and return the basename of the common
+    dir's parent — i.e. the main repo directory name. This makes worktree
+    sessions group with their parent repo instead of forming a lone
+    `dir:<wt-name>` auto-view. Returns None if the file can't be parsed (the
+    caller then falls back to the worktree directory's own name).
+    """
+    try:
+        text = ""
+        with open(git_file, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("gitdir:"):
+                    text = line[len("gitdir:"):].strip()
+                    break
+        if not text:
+            return None
+        base = os.path.dirname(git_file)  # worktree root
+        wt_gitdir = os.path.normpath(os.path.join(base, text))
+
+        # Prefer the canonical `commondir` pointer; fall back to stripping
+        # the conventional ".../worktrees/<name>" suffix.
+        common: str | None = None
+        commondir_file = os.path.join(wt_gitdir, "commondir")
+        try:
+            with open(commondir_file, encoding="utf-8") as fh:
+                rel = fh.read().strip()
+            if rel:
+                common = os.path.normpath(os.path.join(wt_gitdir, rel))
+        except OSError:
+            common = None
+        if common is None:
+            # wt_gitdir == <main-git-dir>/worktrees/<name>
+            common = os.path.dirname(os.path.dirname(wt_gitdir))
+
+        # common is the shared git dir (typically "<repo>/.git"); the repo
+        # root is its parent when it is named ".git", else common itself.
+        repo_root = (
+            os.path.dirname(common)
+            if os.path.basename(common) == ".git"
+            else common
+        )
+        return os.path.basename(repo_root) or None
+    except OSError:
+        return None
+
+
 def resolve_git_repo(cwd: str) -> str | None:
     """Return the git repo name for *cwd*, or None when not inside a repo.
 
     Pure-Python walk-up: the repo root is the first ancestor of *cwd*
-    (inclusive) containing a `.git` entry (directory for normal clones, file
-    for linked worktrees — which therefore yield the worktree directory's
-    name). No `git` subprocess. Memoized per directory.
+    (inclusive) containing a `.git` entry. For normal clones `.git` is a
+    directory and the name is that directory's basename. For linked worktrees
+    `.git` is a file pointing back at the main repo — we resolve it to the
+    *main* repo's name (see `_main_repo_name_from_worktree`) so worktree
+    sessions group with their parent repo. No `git` subprocess. Memoized per
+    directory.
     """
     if not cwd:
         return None
@@ -199,7 +289,11 @@ def resolve_git_repo(cwd: str) -> str | None:
     repo: str | None = None
     path = os.path.abspath(cwd)
     while True:
-        if os.path.exists(os.path.join(path, ".git")):
+        dot_git = os.path.join(path, ".git")
+        if os.path.isfile(dot_git):  # linked worktree
+            repo = _main_repo_name_from_worktree(dot_git) or os.path.basename(path) or None
+            break
+        if os.path.exists(dot_git):  # normal clone (.git directory)
             repo = os.path.basename(path) or None
             break
         parent = os.path.dirname(path)

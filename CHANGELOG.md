@@ -1,5 +1,172 @@
 # Changelog
 
+## v0.9.5 (2026-06-19)
+
+Actually fixes the "returning to the terminal selects a huge block of text" bug
+(v0.9.4's focus-based approach didn't). Root cause found by reverse-engineering xterm.
+
+### Fixes
+
+- **Returning to a terminal no longer drags a giant selection from a stale anchor.** The
+  real cause (confirmed in the vendored xterm.js 5.3.0 source): xterm extends a selection
+  from its stored anchor on *every* `mousemove` and **never checks whether a mouse button
+  is actually held** — it only tears the drag down on `mouseup`. So if a `mouseup` never
+  reaches the page (button released outside the window, or the window blurred mid-drag),
+  the drag becomes a "zombie": its document `mousemove` listener stays live, and simply
+  moving the pointer back toward your next click — with no button down — extends a huge
+  selection from the old anchor to the cursor *before any click happens*. v0.9.4 tried to
+  fix this on `mousedown` / focus state, but the damage is done on a buttonless mousemove,
+  and focus state proved unreliable (`focusin` can fire before `mousedown`; focus may
+  never move at all). The fix is now **focus-independent**: we track whether a drag may be
+  open and, the instant a `mousemove` arrives with `e.buttons === 0` (no button physically
+  down) while a drag is supposedly open, we recognize the zombie and kill it in capture
+  phase — *before* xterm's handler can extend it — via `clearSelection()`, which fully
+  tears down the anchor and xterm's own listeners. A real `mouseup` clears the latch, so
+  normal completed selections are untouched. Still left-button / single-click /
+  non-mouse-tracking only, and never injects events into a TUI's mouse stream. The
+  unreliable focus-tracking + first-click-reset logic from v0.9.4 was removed.
+
+## v0.9.4 (2026-06-18)
+
+Returning focus to a terminal no longer drags a selection from a stale point.
+
+### Fixes
+
+- **The first click after a terminal regains focus is a clean reset, not a stale
+  drag.** xterm.js builds a selection by anchoring on mousedown and extending on every
+  mousemove until mouseup — but if that mouseup never reaches the page (the window
+  blurred mid-drag, or the button was released outside the window), the drag is never
+  terminated and its mousemove listener stays live. Returning to the terminal and moving
+  the mouse toward your next click then *extended a selection from the old anchor* to the
+  new point — it looked like a click-and-drag you never made, and typing went nowhere.
+  Now: losing focus (`focusout` / window `blur`) terminates any in-progress drag and
+  resets all gesture state at the source, and the **first click after the terminal
+  regains focus is a pure reset+focus click** — it clears any stale selection, refocuses
+  so typing resumes, and performs no mouse action. A second click does real mouse work
+  (selection still needs a deliberate drag past the threshold from v0.9.3). Focus is
+  tracked with bubbling `focusin`/`focusout` plus window `blur` to cover alt-tab (where
+  the element keeps DOM focus but the window does not). The stale-drag teardown is
+  selection-mode only — it never injects a synthetic release into a full-screen TUI's
+  mouse-tracking stream.
+
+## v0.9.3 (2026-06-18)
+
+Terminal mouse fixes: a focus-click no longer drops you into selection mode, and
+right-click-to-copy never also pastes.
+
+### Fixes
+
+- **A plain click to focus the terminal no longer starts a text selection.** When you
+  click into the browser terminal just to give the window OS focus — the constant move
+  when jumping between apps — the tiniest pointer drift used to be read by xterm.js as
+  the start of a text selection. Typing then appeared to "do nothing" (keystrokes went
+  to a stray selection / the view sat scrolled up), and escaping meant scrolling down,
+  tapping Escape once or twice, or right-clicking. Selection is now **deliberate**: a
+  new `initDeliberateSelection` guard suppresses xterm's selection-extending mousemove
+  (in capture phase, ahead of xterm) until the pointer drags past a ~5px threshold, so
+  a click-without-drag is a pure focus click — no selection, no lost keystrokes. A real
+  drag past the threshold selects normally, anchored at the press point. Double/triple-
+  click word/line selection, Shift/Alt-drag, and full-screen TUIs that own the mouse
+  (`mouseTrackingMode`) are all left untouched.
+- **Right-click to copy a selection never also pastes.** Selecting text and right-
+  clicking to copy could *also* paste that text back into the session — a race where the
+  selection state sampled at right-button mousedown read `false` (a stale latch when an
+  input fires `contextmenu` without a button-2 mousedown, or cross-client selection
+  desync) while a selection was in fact live, so the handler fell through to the paste
+  branch. The contextmenu handler now treats the gesture as copy-only when a selection
+  existed at **either** mousedown **or** contextmenu time (`hadSelectionOnRightDown ||
+  _term.hasSelection()`), and re-copies + clears before returning — so copy and paste
+  can never both fire on one right-click. (A selection-free right-click still pastes.)
+
+## v0.9.2 (2026-06-18)
+
+Directory auto-grouping now spans git worktrees.
+
+### Fixes
+
+- **Worktree sessions group with their parent repo.** The cwd auto-grouping feature
+  (the directory drop-downs in the header) keys each session on its git repo name. But
+  a linked worktree — e.g. one created under `<repo>/.worktrees/<branch>` — places a
+  `.git` *file* (not a directory) at its root, and the resolver stopped there and
+  returned the *worktree directory's* name. So a session working in a worktree formed
+  its own lonely `dir:<worktree>` group instead of joining the repo's group alongside
+  the sessions in the main checkout. `resolve_git_repo` now detects the `.git`-file
+  case and follows it (via the worktree gitdir's `commondir` pointer, falling back to
+  stripping the conventional `worktrees/<name>` suffix) to the **main repo** name, so
+  every session for a repo — main checkout and all its worktrees — lands in one
+  directory group. Pure-Python, still no `git` subprocess; unparseable `.git` files
+  fall back to the old per-directory name. (Backend only — the frontend grouping logic
+  was already correct; it was being fed the wrong repo name.)
+
+## v0.9.1 (2026-06-18)
+
+Multi-browser session-sync fixes.
+
+### Fixes
+
+- **The sidebar now tracks the session that's actually on screen.** muxplex serves
+  every browser/​tab from a single shared ttyd (one global `active_session`), so when a
+  second browser on the same machine opened a different session, the first browser's
+  terminal silently followed the shared ttyd — but its sidebar kept highlighting the
+  *old* session, and re-clicking that stale highlight was a dead no-op (the click was
+  short-circuited because the local "current session" variable still matched). The poll
+  cycle now reconciles against the server's `active_session` while a session is open
+  (`reconcileViewingSession`): it adopts whatever session is really being displayed so
+  the sidebar highlight, header, and pills follow reality, and clicking is never stuck.
+  The re-attach is client-only — it never re-issues `/connect`, so it can't kill+respawn
+  the shared ttyd and disrupt the browser that made the switch. A short grace window
+  after a local open prevents an in-flight state write from being read back stale and
+  yanking you off the session you just clicked. (This makes all your browsers/​tabs
+  *converge* on one session; independent per-browser sessions remain future work.)
+
+- **The hover-preview overlay no longer pops for the session you're already viewing.**
+  On the interactive page, hovering the active session's sidebar thumbnail (or having
+  just clicked it open) showed the large light-box preview of the very session already
+  filling the main viewer — redundant and distracting. `showPreview` now early-returns
+  when the hovered session is the one currently displayed; previews for *other* sessions
+  are unchanged. (A global on/off toggle already exists at Settings → Display → "Show
+  hover preview".)
+
+## v0.9.0 (2026-06-11)
+
+Session-UX improvements.
+
+### Features
+
+- **New sessions now open straight into their terminal.** Creating a session from
+  any entry point (header/​sidebar/​FAB "+" buttons) lands you in the new session's
+  fullscreen terminal instead of leaving you on the grid. The previous auto-open
+  silently failed for *local* sessions: the create-poll matched the new session by a
+  bare name, but the backend tags every session (local included) with a canonical
+  `device_id:name` `sessionKey`, so the match never succeeded and the poll always
+  timed out. The poll now builds the local key from the device id (with a bare-name
+  fallback) and waits generously (~120 s) for slow-to-start sessions — opening the
+  moment the session appears rather than on a fixed delay.
+- **Rename tmux sessions from the UI** (local sessions; v0.9 scope). A new
+  `POST /api/sessions/{name}/rename` runs `tmux rename-session` and **atomically
+  cascades** the rename everywhere the old name was stored — every view's membership
+  list, `hidden_sessions` (legacy bare-name entries are healed to canonical form), and
+  persistent state (`active_session`, `session_order`, per-session bell, the device's
+  `viewing_session`). New names are validated (no empty/whitespace, no tmux-illegal
+  `.`/`:`, not the reserved `dir:` auto-view prefix, no duplicates). Reachable from the
+  tile/card flyout (grid **and** sidebar) and from the expanded terminal header's
+  session dropdown (a ✎ control). The existing ttyd attach survives the rename, so the
+  live terminal keeps running. Remote/federated rename is intentionally out of scope
+  (it would leave peers' membership keys stale until the stale-key prune); the UI hides
+  Rename for remote sessions.
+- **View pills are now visually distinct from session pills** in both headers. User
+  views carry a leading ⧉ layers glyph; auto/​directory views keep their 📁 folder
+  glyph; session pills stay glyph-free capsules. Shape/glyph cue (not color) so it
+  reads for color-blind users, and it doesn't disturb the width-aware pill collapse.
+
+### Fixes
+
+- **Readable session names in the narrow-viewport list.** When the grid collapses to a
+  single-column list on very small screens, idle-tier session names were rendered in
+  `--text-dim` (#4A5060) on the header background — only ~2.3:1 contrast, below WCAG AA.
+  They now use `--text-muted` (~6:1): comfortably readable without the harsh glare of
+  full-brightness text.
+
 ## v0.8.2 (2026-06-10)
 
 ### Fixes

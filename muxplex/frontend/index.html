@@ -160,6 +160,7 @@
         <button class="settings-tab" data-tab="views">Views</button>
         <button class="settings-tab" data-tab="new-session">Commands</button>
         <button class="settings-tab" data-tab="devices">Multi-Device</button>
+        <button class="settings-tab" data-tab="mouselab">Mouse Lab</button>
       </nav>
       <div class="settings-content">
         <div class="settings-panel" data-tab="display">
@@ -299,6 +300,62 @@
               <div id="setting-remote-instances" class="settings-remote-list"></div>
               <button id="add-remote-instance-btn" class="settings-action-btn">+ Add Remote</button>
             </div>
+          </div>
+        </div>
+        <div class="settings-panel hidden" data-tab="mouselab">
+          <p class="settings-helper">
+            Experimental terminal-selection levers for diagnosing the inadvertent
+            text-selection bug. Stored per-device (this browser only); changes take
+            effect on the next mouse action — no restart needed. Defaults match
+            shipped v0.9.5 behavior.
+          </p>
+          <div class="settings-field">
+            <label class="settings-label">Current profile</label>
+            <span id="mouselab-current" class="settings-status-text">Shipped (v0.9.5)</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label" for="mouselab-profile">Apply a profile</label>
+            <div class="settings-federation-key">
+              <select id="mouselab-profile" class="settings-select">
+                <option value="shipped">Shipped (v0.9.5)</option>
+                <option value="baseline">Baseline (raw bug, no fixes)</option>
+                <option value="ignoreguard">Ignore tracking guard (Hyp. B)</option>
+                <option value="tmuxclear">tmux copy-mode clear (Hyp. A)</option>
+                <option value="rclickpass">Right-click pass-through (double-paste fix)</option>
+                <option value="diagnostics">Diagnostics only</option>
+                <option value="everything">Everything on</option>
+              </select>
+              <button id="mouselab-apply" class="settings-action-btn">Apply</button>
+            </div>
+            <span class="settings-helper">Applies the set once. Toggling any lever afterward switches Current to &ldquo;Custom&rdquo;.</span>
+          </div>
+          <div class="settings-field">
+            <label class="settings-label" for="mouselab-dragThreshold">1. Drag-threshold suppressor</label>
+            <input type="checkbox" id="mouselab-dragThreshold" class="settings-checkbox" data-lever="dragThreshold" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label" for="mouselab-zombieKiller">2. Zombie-drag killer</label>
+            <input type="checkbox" id="mouselab-zombieKiller" class="settings-checkbox" data-lever="zombieKiller" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label" for="mouselab-focusClickClear">3. Focus-click clears selection</label>
+            <input type="checkbox" id="mouselab-focusClickClear" class="settings-checkbox" data-lever="focusClickClear" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label" for="mouselab-honorTracking">4. Honor mouse-tracking guard</label>
+            <input type="checkbox" id="mouselab-honorTracking" class="settings-checkbox" data-lever="honorTracking" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label" for="mouselab-tmuxCopyClear">5. Clear tmux copy-mode on refocus (Esc)</label>
+            <input type="checkbox" id="mouselab-tmuxCopyClear" class="settings-checkbox" data-lever="tmuxCopyClear" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label" for="mouselab-rightClickPassThru">6. Right-click pass-through when app owns mouse (double-paste fix)</label>
+            <input type="checkbox" id="mouselab-rightClickPassThru" class="settings-checkbox" data-lever="rightClickPassThru" />
+          </div>
+          <div class="settings-field">
+            <label class="settings-label" for="mouselab-diagLogging">7. Diagnostic logging (console)</label>
+            <input type="checkbox" id="mouselab-diagLogging" class="settings-checkbox" data-lever="diagLogging" />
           </div>
         </div>
       </div>

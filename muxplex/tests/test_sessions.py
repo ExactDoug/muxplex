@@ -16,6 +16,7 @@ from muxplex.sessions import (
     run_tmux,
     snapshot_all,
     update_session_cache,
+    validate_session_name,
 )
 
 
@@ -318,12 +319,42 @@ def test_resolve_git_repo_finds_repo_root(tmp_path):
     assert sessions_mod.resolve_git_repo(str(repo)) == "myrepo"
 
 
-def test_resolve_git_repo_handles_git_file_worktree(tmp_path):
+def test_resolve_git_repo_worktree_resolves_to_main_repo(tmp_path):
+    """A linked worktree groups under the *main* repo, not its own dir name."""
+    sessions_mod._git_repo_cache.clear()
+    repo = tmp_path / "myrepo"
+    main_gitdir = repo / ".git"
+    wt_gitdir = main_gitdir / "worktrees" / "wt1"
+    wt_gitdir.mkdir(parents=True)
+    # git writes a commondir pointer relative to the worktree's gitdir
+    (wt_gitdir / "commondir").write_text("../..\n")
+    # worktrees live inside the repo at ./.worktrees/<name>
+    wt = repo / ".worktrees" / "wt1"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text(f"gitdir: {wt_gitdir}\n")
+    assert sessions_mod.resolve_git_repo(str(wt)) == "myrepo"
+    # a nested cwd inside the worktree resolves the same way
+    nested = wt / "src" / "deep"
+    nested.mkdir(parents=True)
+    assert sessions_mod.resolve_git_repo(str(nested)) == "myrepo"
+
+
+def test_resolve_git_repo_worktree_without_commondir(tmp_path):
+    """Falls back to stripping 'worktrees/<name>' when no commondir file."""
     sessions_mod._git_repo_cache.clear()
     wt = tmp_path / "myrepo-wt1"
     wt.mkdir()
-    (wt / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt1\n")
-    assert sessions_mod.resolve_git_repo(str(wt)) == "myrepo-wt1"
+    (wt / ".git").write_text("gitdir: /home/u/myrepo/.git/worktrees/wt1\n")
+    assert sessions_mod.resolve_git_repo(str(wt)) == "myrepo"
+
+
+def test_resolve_git_repo_worktree_unparseable_falls_back(tmp_path):
+    """An unreadable/empty .git file falls back to the worktree dir name."""
+    sessions_mod._git_repo_cache.clear()
+    wt = tmp_path / "lonely-wt"
+    wt.mkdir()
+    (wt / ".git").write_text("not a gitdir pointer\n")
+    assert sessions_mod.resolve_git_repo(str(wt)) == "lonely-wt"
 
 
 def test_resolve_git_repo_returns_none_outside_repo(tmp_path):
@@ -351,3 +382,38 @@ def test_session_paths_cache_roundtrip():
     got["b"] = "/y"  # mutating the copy must not affect the cache
     assert sessions_mod.get_session_paths() == {"a": "/x"}
     sessions_mod.update_session_paths({})
+
+
+# ---------------------------------------------------------------------------
+# validate_session_name (v0.9 rename)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_session_name_accepts_plain_name():
+    assert validate_session_name("my-project") is None
+    assert validate_session_name("  trimmed  ") is None
+
+
+def test_validate_session_name_rejects_empty_and_whitespace():
+    assert validate_session_name("") is not None
+    assert validate_session_name("   ") is not None
+
+
+def test_validate_session_name_rejects_tmux_separators():
+    assert validate_session_name("a.b") is not None
+    assert validate_session_name("a:b") is not None
+
+
+def test_validate_session_name_rejects_dir_prefix():
+    assert validate_session_name("dir:foo") is not None
+    assert validate_session_name("DIR:foo") is not None
+
+
+def test_validate_session_name_rejects_control_chars():
+    assert validate_session_name("a\tb") is not None
+    assert validate_session_name("a\nb") is not None
+
+
+def test_validate_session_name_rejects_duplicate():
+    assert validate_session_name("taken", existing=["taken", "other"]) is not None
+    assert validate_session_name("fresh", existing=["taken", "other"]) is None

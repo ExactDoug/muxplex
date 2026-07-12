@@ -115,12 +115,17 @@ function buildHeartbeatPayload(device_id, viewing_session, view_mode, last_inter
 const POLL_MS = 2000;
 const HEARTBEAT_MS = 5000;
 const MOBILE_THRESHOLD = 600;
+// After a local openSession, ignore poll-driven reconcile for this long so our
+// own in-flight PATCH /api/state isn't read back stale and yank us off the
+// session we just clicked. Must exceed one poll cycle. See reconcileViewingSession.
+const RECONCILE_GRACE_MS = 3000;
 
 // ─── App state ────────────────────────────────────────────────────────────────
 let _deviceId = '';
 let _currentSessions = [];
 let _viewingSession = null;
 let _viewingRemoteId = '';
+let _lastLocalOpenAt = 0;  // Date.now() of the last user-initiated openSession (reconcile race-guard)
 let _viewMode = 'grid';
 let _lastInteractionAt = Date.now() / 1000;
 let _pollingTimer;
@@ -150,12 +155,14 @@ let _flyoutRemoteId = null;
 const FLYOUT_MENU_MAP = {
   'all': [
     { label: 'Add to View\u2026', action: 'add-to-view', className: 'flyout-menu__item--has-submenu' },
+    { label: 'Rename\u2026', action: 'rename', localOnly: true },
     { label: 'Hide', action: 'hide' },
     { separator: true },
     { label: 'Kill Session', action: 'kill', className: 'flyout-menu__item--danger' },
   ],
   'user': [
     { label: 'Add to View\u2026', action: 'add-to-view', className: 'flyout-menu__item--has-submenu' },
+    { label: 'Rename\u2026', action: 'rename', localOnly: true },
     { label: 'Hide', action: 'hide' },
     { separator: true },
     { label: 'Kill Session', action: 'kill', className: 'flyout-menu__item--danger' },
@@ -163,10 +170,18 @@ const FLYOUT_MENU_MAP = {
   'hidden': [
     { label: 'Unhide', action: 'unhide' },
     { label: 'Unhide & Add to View\u2026', action: 'unhide-add-to-view', className: 'flyout-menu__item--has-submenu' },
+    { label: 'Rename\u2026', action: 'rename', localOnly: true },
     { separator: true },
     { label: 'Kill Session', action: 'kill', className: 'flyout-menu__item--danger' },
   ],
 };
+
+/** Filter flyout items to those valid for the current target. localOnly items
+ *  (e.g. Rename \u2014 v0.9 local-only) are dropped for remote sessions. */
+function _flyoutItemsFor(items) {
+  if (!_flyoutRemoteId) return items;
+  return items.filter(function (it) { return !it.localOnly; });
+}
 
 /**
  * Build the flyout menu HTML string based on the active view type.
@@ -180,7 +195,7 @@ function _buildFlyoutMenuItems() {
     viewType = 'user';
   }
 
-  var items = FLYOUT_MENU_MAP[viewType] || FLYOUT_MENU_MAP['all'];
+  var items = _flyoutItemsFor(FLYOUT_MENU_MAP[viewType] || FLYOUT_MENU_MAP['all']);
   var html = '';
 
   for (var i = 0; i < items.length; i++) {
@@ -338,6 +353,36 @@ function setConnectionStatus(level) {
 
 // ─── Session polling ─────────────────────────────────────────────────────────────────────────────
 /**
+ * Reconcile the locally-tracked viewing session against the server's shared
+ * active_session. muxplex serves every browser/tab from ONE shared ttyd, so when
+ * another client on this machine opens a different session our terminal follows
+ * that shared ttyd while local _viewingSession goes stale — leaving the sidebar
+ * highlighting the wrong session and the click-idempotency guard dead (re-clicking
+ * the highlighted session becomes a no-op). Adopt whatever the server reports as
+ * active so the sidebar + hover-preview guard track the truly-displayed session.
+ * Re-attach is client-only (reconcileOnly) — we never re-issue /connect, which
+ * would kill+respawn the shared ttyd and disrupt the client that made the switch.
+ * Skipped within RECONCILE_GRACE_MS of a local open so our own in-flight PATCH
+ * isn't read back stale. Only called while a session is open (fullscreen view).
+ * @returns {Promise<void>}
+ */
+async function reconcileViewingSession() {
+  if (Date.now() - _lastLocalOpenAt < RECONCILE_GRACE_MS) return;
+  try {
+    const res = await api('GET', '/api/state');
+    const state = await res.json();
+    const serverName = state.active_session || null;
+    if (!serverName) return;
+    const serverRid = state.active_remote_id || '';
+    if (serverName === _viewingSession && serverRid === (_viewingRemoteId || '')) return;
+    await openSession(serverName, { remoteId: serverRid, skipAnimation: true, reconcileOnly: true });
+  } catch (err) {
+    // Non-fatal: pollSessions owns connection-status; a failed reconcile just
+    // leaves local state as-is until the next poll retries.
+  }
+}
+
+/**
  * Fetch sessions from the appropriate endpoint and update the UI.
  * Uses /api/federation/sessions when multi_device_enabled is true,
  * /api/sessions otherwise.
@@ -371,6 +416,9 @@ async function pollSessions() {
     updateSessionPill(sessions);
     updateFaviconBadge();
     updatePageTitle();
+    // Follow cross-browser session switches: while viewing a session, adopt the
+    // server's shared active_session if another client repointed the shared ttyd.
+    if (_viewMode === 'fullscreen' && _viewingSession != null) await reconcileViewingSession();
   } catch (err) {
     _pollFailCount++;
     setConnectionStatus(_pollFailCount <= 2 ? 'warn' : 'err');
@@ -1228,7 +1276,9 @@ function renderViewPills() {
   for (var i = 0; i < views.length && i < 7; i++) {
     var v = views[i];
     var vActive = _activeView === v.name ? ' view-pill--active' : '';
-    fixedHtmls.push('<button class="view-pill' + vActive + '" data-view="' + escapeHtml(v.name) + '" title="' + escapeHtml(v.name) + '">' + escapeHtml(v.name) + ' <span class="view-pill__count">' + visibleCount(_currentSessions, _serverSettings, v.name) + '</span></button>');
+    // Leading ⧉ glyph marks this as a user view (a saved container of sessions);
+    // auto-views use 📁 (_autoViewPillHTML). All Sessions / Hidden stay plain.
+    fixedHtmls.push('<button class="view-pill view-pill--user' + vActive + '" data-view="' + escapeHtml(v.name) + '" title="' + escapeHtml(v.name) + '"><span class="view-pill__glyph" aria-hidden="true">⧉</span>' + escapeHtml(v.name) + ' <span class="view-pill__count">' + visibleCount(_currentSessions, _serverSettings, v.name) + '</span></button>');
   }
 
   // — Hidden: only when it has sessions (or is currently active)
@@ -2086,6 +2136,11 @@ function showPreview(name, remoteId) {
   var _previewDs = getDisplaySettings();
   if (_previewDs.showHoverPreview === false) return;
   var rid = remoteId || '';
+  // Don't pop the big overlay for the session already showing in the main viewer.
+  // Once you're looking at it (or just clicked it open) the large preview is pure
+  // redundant noise. _viewingSession reliably tracks the truly-displayed session
+  // (kept honest by reconcileViewingSession), so this also covers cross-browser switches.
+  if (_viewMode === 'fullscreen' && name === _viewingSession && rid === (_viewingRemoteId || '')) return;
   // Match name + remoteId so the preview (and the click that follows) targets the correct
   // device's session under federation, not merely the first same-named one.
   var session = _currentSessions.find(function (s) {
@@ -2234,7 +2289,7 @@ function _openFlyoutSheet() {
   var viewType = _activeView;
   if (viewType !== 'all' && viewType !== 'hidden') viewType = 'user';
 
-  var items = FLYOUT_MENU_MAP[viewType] || FLYOUT_MENU_MAP['all'];
+  var items = _flyoutItemsFor(FLYOUT_MENU_MAP[viewType] || FLYOUT_MENU_MAP['all']);
 
   var html = '<div class="flyout-sheet__backdrop"></div>';
   html += '<div class="flyout-sheet__panel" aria-label="Session options" role="menu">';
@@ -2469,6 +2524,14 @@ function _handleFlyoutClick(e) {
     case 'unhide':
       _doUnhideSession();
       break;
+    case 'rename': {
+      // Capture before closeFlyoutMenu() nulls the flyout target state.
+      var renameName = _flyoutSessionName;
+      var renameRemoteId = _flyoutRemoteId;
+      closeFlyoutMenu();
+      _openRenameSessionInput(renameName, renameRemoteId);
+      break;
+    }
     case 'kill':
       _doKillSessionInline(item);
       break;
@@ -3402,6 +3465,11 @@ function _clearZoomTileStyles(tile) {
  */
 async function openSession(name, opts = {}) {
   if (!name || !name.trim()) return;
+  // reconcileOnly: follow the server's shared active_session WITHOUT POSTing
+  // /connect or PATCHing state — used by reconcileViewingSession to adopt a
+  // switch made by another browser/tab. A user-initiated open stamps the
+  // race-guard so an in-flight PATCH isn't read back stale.
+  if (!opts.reconcileOnly) _lastLocalOpenAt = Date.now();
   hidePreview();
   _viewingSession = name;
   _viewingRemoteId = opts.remoteId != null ? opts.remoteId : '';
@@ -3474,24 +3542,30 @@ async function openSession(name, opts = {}) {
   // Always spawn ttyd for this session — ensures correct session after service restart or page restore
   // _deviceId holds the device_id string (was integer remoteId index in old protocol)
   var _deviceId = opts.remoteId != null ? opts.remoteId : '';
-  try {
-    if (_deviceId !== '') {
-      // Remote session: route connect POST through same-origin federation proxy
-      await api('POST', '/api/federation/' + encodeURIComponent(_deviceId) + '/connect/' + encodeURIComponent(name));
-    } else {
-      await api('POST', '/api/sessions/' + encodeURIComponent(name) + '/connect');
+  // reconcileOnly skips ALL of the connect/PATCH/bell network writes: the shared
+  // ttyd is already serving this session (another client repointed it) and our
+  // PATCH would just echo the value we're following. We still re-mount the
+  // terminal below so this browser's xterm + terminal.js target re-sync client-side.
+  if (!opts.reconcileOnly) {
+    try {
+      if (_deviceId !== '') {
+        // Remote session: route connect POST through same-origin federation proxy
+        await api('POST', '/api/federation/' + encodeURIComponent(_deviceId) + '/connect/' + encodeURIComponent(name));
+      } else {
+        await api('POST', '/api/sessions/' + encodeURIComponent(name) + '/connect');
+      }
+    } catch (err) {
+      showToast(err.message || 'Connection failed');
+      return closeSession();
     }
-  } catch (err) {
-    showToast(err.message || 'Connection failed');
-    return closeSession();
-  }
 
-  // Persist active_remote_id so restoreState() can reopen remote sessions after page refresh
-  api('PATCH', '/api/state', { active_session: name, active_remote_id: _deviceId || null }).catch(function() {});
+    // Persist active_remote_id so restoreState() can reopen remote sessions after page refresh
+    api('PATCH', '/api/state', { active_session: name, active_remote_id: _deviceId || null }).catch(function() {});
 
-  // Fire-and-forget bell-clear for remote sessions — acknowledge bells on the remote server
-  if (_deviceId !== '') {
-    api('POST', '/api/federation/' + encodeURIComponent(_deviceId) + '/sessions/' + encodeURIComponent(name) + '/bell/clear').catch(function() {});
+    // Fire-and-forget bell-clear for remote sessions — acknowledge bells on the remote server
+    if (_deviceId !== '') {
+      api('POST', '/api/federation/' + encodeURIComponent(_deviceId) + '/sessions/' + encodeURIComponent(name) + '/bell/clear').catch(function() {});
+    }
   }
 
   // Wait for animation to finish (may already be done if /connect was slow)
@@ -3793,10 +3867,12 @@ function _epSessionPillHTML(s, isCurrent) {
     escapeHtml(s.name) + _epBellHTML(s) + '</button>';
 }
 
-/** Display label for a strip group — auto (directory) groups get the folder
- *  glyph that marks synthesized views everywhere else. */
+/** Display label for a strip group — every view-group pill carries a leading
+ *  glyph so it reads as a *view* (a container of sessions) rather than a
+ *  session: auto (directory) groups get the folder glyph; user views get the
+ *  layers glyph. Session pills (_epSessionPillHTML) carry no glyph. */
 function _epGroupLabel(g) {
-  return (g.isAuto ? '📁 ' : '') + g.viewName;
+  return (g.isAuto ? '📁 ' : '⧉ ') + g.viewName;
 }
 
 /** Dropdown pill HTML (other view / group overflow / Other Sessions). */
@@ -3808,15 +3884,22 @@ function _epMenuPillHTML(menuKey, label, countText, extraClass) {
     '<span class="nav-pill__caret" aria-hidden="true">▾</span></button>';
 }
 
-/** Dropdown menu item HTML for a slim session. */
+/** Dropdown menu item HTML for a slim session. Local sessions get a trailing
+ *  Rename (✎) control (v0.9, local-only); the click handler distinguishes it
+ *  from the open-on-click button via the data-rename attribute. */
 function _epMenuItemHTML(s) {
   var ds = getDisplaySettings();
   var badge = '';
   if (_serverSettings && _serverSettings.multi_device_enabled && s.deviceName && ds.showDeviceBadges !== false) {
     badge = ' <span class="device-badge">' + escapeHtml(s.deviceName) + '</span>';
   }
-  return '<button class="view-dropdown__item" role="menuitem" data-session="' + escapeHtml(s.name) +
-    '" data-remote-id="' + escapeHtml(s.remoteId) + '">' + escapeHtml(s.name) + badge + _epBellHTML(s) + '</button>';
+  var openBtn = '<button class="view-dropdown__item ep-menu-row__open" role="menuitem" data-session="' +
+    escapeHtml(s.name) + '" data-remote-id="' + escapeHtml(s.remoteId) + '">' +
+    escapeHtml(s.name) + badge + _epBellHTML(s) + '</button>';
+  if (s.remoteId) return openBtn;  // remote sessions: open only, no rename
+  var renameBtn = '<button class="ep-menu-row__rename" data-rename="1" data-session="' +
+    escapeHtml(s.name) + '" data-remote-id="" title="Rename session" aria-label="Rename session">✎</button>';
+  return '<div class="ep-menu-row">' + openBtn + renameBtn + '</div>';
 }
 
 /**
@@ -4944,6 +5027,90 @@ function switchSettingsTab(tabName) {
       panel.classList.add('hidden');
     }
   });
+  // Re-sync the Mouse Lab controls when its tab is shown (config may have changed
+  // in another browser tab via the storage event).
+  if (tabName === 'mouselab') renderMouseLabUI();
+}
+
+// ─── Mouse Lab (experimental selection levers) ──────────────────────────────
+// Per-device A/B harness for the inadvertent-selection bug. The config lives in
+// terminal.js's window.MouseLab (localStorage-backed); the handlers read it live.
+// Profiles are one-shot presets: applying one writes the levers once (not
+// enforced), and any later individual toggle flips "Current" to Custom.
+var MOUSELAB_LEVERS = ['dragThreshold', 'zombieKiller', 'focusClickClear',
+                       'honorTracking', 'tmuxCopyClear', 'rightClickPassThru', 'diagLogging'];
+var MOUSELAB_PROFILES = {
+  shipped:     { label: 'Shipped (v0.9.5)',
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: false, rightClickPassThru: false, diagLogging: false },
+  baseline:    { label: 'Baseline (raw bug, no fixes)',
+                 dragThreshold: false, zombieKiller: false, focusClickClear: false, honorTracking: false, tmuxCopyClear: false, rightClickPassThru: false, diagLogging: false },
+  ignoreguard: { label: 'Ignore tracking guard (Hyp. B)',
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: false, tmuxCopyClear: false, rightClickPassThru: false, diagLogging: false },
+  tmuxclear:   { label: 'tmux copy-mode clear (Hyp. A)',
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: true,  rightClickPassThru: false, diagLogging: false },
+  rclickpass:  { label: 'Right-click pass-through (double-paste fix)',
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: false, rightClickPassThru: true,  diagLogging: false },
+  diagnostics: { label: 'Diagnostics only',
+                 dragThreshold: false, zombieKiller: false, focusClickClear: false, honorTracking: false, tmuxCopyClear: false, rightClickPassThru: false, diagLogging: true },
+  everything:  { label: 'Everything on',
+                 dragThreshold: true,  zombieKiller: true,  focusClickClear: true,  honorTracking: true,  tmuxCopyClear: true,  rightClickPassThru: true,  diagLogging: true },
+};
+
+// Return the label of the profile the current config exactly matches, or 'Custom'.
+function _mouselabMatchProfile(cfg) {
+  for (var key in MOUSELAB_PROFILES) {
+    var p = MOUSELAB_PROFILES[key];
+    var match = true;
+    for (var i = 0; i < MOUSELAB_LEVERS.length; i++) {
+      var lv = MOUSELAB_LEVERS[i];
+      if (!!cfg[lv] !== !!p[lv]) { match = false; break; }
+    }
+    if (match) return p.label;
+  }
+  return 'Custom';
+}
+
+// Reflect the live Mouse Lab config into the tab's checkboxes + Current label.
+function renderMouseLabUI() {
+  if (!window.MouseLab) return;
+  var cfg = window.MouseLab.all();
+  MOUSELAB_LEVERS.forEach(function (lv) {
+    var el = document.getElementById('mouselab-' + lv);
+    if (el) el.checked = !!cfg[lv];
+  });
+  var cur = document.getElementById('mouselab-current');
+  if (cur) cur.textContent = _mouselabMatchProfile(cfg);
+}
+
+// Wire the Mouse Lab tab controls once (called from the main init block).
+function initMouseLabUI() {
+  if (!window.MouseLab) return;
+  MOUSELAB_LEVERS.forEach(function (lv) {
+    var el = document.getElementById('mouselab-' + lv);
+    if (!el) return;
+    on(el, 'change', function () {
+      var patch = {};
+      patch[lv] = el.checked;
+      window.MouseLab.save(patch);
+      renderMouseLabUI();
+    });
+  });
+  var applyBtn = document.getElementById('mouselab-apply');
+  var sel = document.getElementById('mouselab-profile');
+  if (applyBtn && sel) {
+    on(applyBtn, 'click', function () {
+      var p = MOUSELAB_PROFILES[sel.value];
+      if (!p) return;
+      var patch = {};
+      MOUSELAB_LEVERS.forEach(function (lv) { patch[lv] = !!p[lv]; });
+      window.MouseLab.save(patch);
+      renderMouseLabUI();
+      if (typeof showToast === 'function') showToast('Applied: ' + p.label);
+    });
+  }
+  // Stay in sync if the config changes elsewhere (another tab via storage event).
+  window.addEventListener('muxplex:mouselab-changed', renderMouseLabUI);
+  renderMouseLabUI();
 }
 
 /**
@@ -5494,19 +5661,40 @@ async function createNewSession(name, remoteId, viewNames) {
       return;
     }
 
-    // Compute expectedKey: for remote sessions, use 'deviceId:sessionName' (sessionKey format)
-    var expectedKey = deviceId ? (deviceId + ':' + sessionName) : sessionName;
+    // Compute expectedKey in the canonical sessionKey form (device_id:name).
+    // Local sessions are ALSO tagged device_id:name by the backend (see main.py
+    // /api/sessions), so a bare name never matches s.sessionKey — use the cached
+    // local device id for local creates.
+    var expectedKey;
+    if (deviceId) {
+      expectedKey = deviceId + ':' + sessionName;
+    } else if (_localDeviceId) {
+      expectedKey = _localDeviceId + ':' + sessionName;
+    } else {
+      expectedKey = sessionName;
+    }
 
-    // Poll until the session appears in _currentSessions (max 30s, every 2s)
+    // Poll until the session appears in _currentSessions, then open it. New
+    // sessions can take several seconds to materialize and become responsive
+    // (setup scripts, repo clones, slow/remote hosts), so wait generously before
+    // giving up — and open the moment it appears, not on a fixed delay. Once
+    // openSession fires, terminal.js handles waiting for ttyd to become ready.
+    // The global poll loop keeps the grid live regardless, so a genuine creation
+    // failure just leaves the user on the grid rather than erroring.
+    function findNewSession() {
+      // Match the canonical key; fall back to bare name for local creates when
+      // _localDeviceId hasn't resolved yet (the open target is local either way).
+      return _currentSessions && _currentSessions.find(function(s) {
+        return (s.sessionKey || s.name) === expectedKey ||
+               (!deviceId && s.name === sessionName);
+      });
+    }
     var attempts = 0;
-    var maxAttempts = 15;
+    var maxAttempts = 60;  // 60 * 2s = up to ~120s before we stop auto-opening
     var pollForSession = setInterval(async function() {
       attempts++;
       await pollSessions();
-      var found = _currentSessions && _currentSessions.find(function(s) {
-        return (s.sessionKey || s.name) === expectedKey;
-      });
-      if (found) {
+      if (findNewSession()) {
         clearInterval(pollForSession);
         removeLoadingTile();
         showToast('Session \'' + sessionName + '\' ready');
@@ -5514,12 +5702,139 @@ async function createNewSession(name, remoteId, viewNames) {
       } else if (attempts >= maxAttempts) {
         clearInterval(pollForSession);
         removeLoadingTile();
-        showToast('Session \'' + sessionName + '\' is taking longer than expected');
+        showToast('Session \'' + sessionName + '\' is taking longer than expected — it will open from the grid once ready');
       }
     }, 2000);
   } catch (err) {
     showToast(err.message || 'Failed to create session');
   }
+}
+
+// ─── Session rename (v0.9 — local sessions only) ───────────────────────────
+
+/**
+ * Client-side mirror of the backend session-name rules
+ * (sessions.validate_session_name) for instant feedback. The server
+ * re-validates and remains the authority.
+ * @returns {string|null} an error message, or null when valid.
+ */
+function _validateSessionNameClient(name, existingNames) {
+  var n = (name || '').trim();
+  if (!n) return 'Session name cannot be empty';
+  if (n.toLowerCase().indexOf('dir:') === 0) return 'Names starting with \'dir:\' are reserved';
+  if (n.indexOf('.') !== -1 || n.indexOf(':') !== -1) return 'Session name cannot contain \'.\' or \':\'';
+  if (existingNames && existingNames.indexOf(n) !== -1) return 'A session named \'' + n + '\' already exists';
+  return null;
+}
+
+/**
+ * Rewrite a renamed local session's keys in the in-memory _serverSettings copy
+ * so the grid/pills reflect the rename immediately (mirrors the backend cascade
+ * in views.rename_session_key, which the server has already persisted).
+ */
+function _applyRenameToLocalSettings(oldName, newName) {
+  if (!_serverSettings) return;
+  var oldKey = _localDeviceId ? _localDeviceId + ':' + oldName : oldName;
+  var newKey = _localDeviceId ? _localDeviceId + ':' + newName : newName;
+  function rw(list) {
+    if (!Array.isArray(list)) return list;
+    var seen = {}, out = [];
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      if (e === oldKey || e === oldName) e = newKey;
+      if (seen[e]) continue;
+      seen[e] = true; out.push(e);
+    }
+    return out;
+  }
+  if (Array.isArray(_serverSettings.hidden_sessions)) {
+    _serverSettings.hidden_sessions = rw(_serverSettings.hidden_sessions);
+  }
+  var views = _serverSettings.views || [];
+  for (var i = 0; i < views.length; i++) {
+    if (Array.isArray(views[i].sessions)) views[i].sessions = rw(views[i].sessions);
+  }
+}
+
+/**
+ * Rename a local tmux session via POST /api/sessions/{old}/rename, then mirror
+ * the cascade locally and refresh. Remote sessions are out of scope in v0.9
+ * (a federated rename would leave peers' membership keys stale until the prune).
+ * @param {string} oldName
+ * @param {string} [remoteId] - non-empty = remote (rejected with a toast)
+ * @param {string} newName
+ * @returns {Promise<void>}
+ */
+function renameSession(oldName, remoteId, newName) {
+  newName = (newName || '').trim();
+  if (!oldName || !newName || newName === oldName) return Promise.resolve();
+  if (remoteId) { showToast('Renaming remote sessions isn’t supported yet'); return Promise.resolve(); }
+  return api('POST', '/api/sessions/' + encodeURIComponent(oldName) + '/rename', { new_name: newName })
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      var finalName = (data && data.name) || newName;
+      _applyRenameToLocalSettings(oldName, finalName);
+      // Keep the active-session view in sync if we renamed the one we're viewing
+      // (the existing ttyd attach survives the tmux rename — no reconnect needed).
+      if (_viewingSession === oldName && (_viewingRemoteId || '') === '') {
+        _viewingSession = finalName;
+        var nameEl = $('expanded-session-name');
+        if (nameEl) nameEl.textContent = finalName;
+      }
+      showToast('Renamed to ‘' + finalName + '’');
+      return pollSessions();
+    })
+    .catch(function (err) {
+      showToast(err && err.status === 400 ? 'Invalid session name' : ((err && err.message) || 'Failed to rename session'));
+    });
+}
+
+/**
+ * Show a centered inline input to rename a session — Enter commits, Escape
+ * cancels, blur commits if changed (mirrors the View inline-rename UX). Reuses
+ * the FAB overlay + new-session-input styling. Local sessions only.
+ * @param {string} oldName
+ * @param {string} [remoteId]
+ */
+function _openRenameSessionInput(oldName, remoteId) {
+  if (remoteId) { showToast('Renaming remote sessions isn’t supported yet'); return; }
+  if (document.querySelector('.fab-input-overlay')) return;
+
+  var overlay = document.createElement('div');
+  overlay.className = 'fab-input-overlay';
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'new-session-input';
+  input.value = oldName;
+  input.setAttribute('aria-label', 'Rename session');
+  overlay.appendChild(input);
+  document.body.appendChild(overlay);
+  input.focus();
+  input.select();
+
+  var done = false;
+  function cleanup() { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); }
+  function commit() {
+    if (done) return;
+    var newName = input.value.trim();
+    if (!newName || newName === oldName) { done = true; cleanup(); return; }
+    var existing = (_currentSessions || []).map(function (s) { return s.name; });
+    var errMsg = _validateSessionNameClient(newName, existing);
+    if (errMsg) { showToast(errMsg); input.focus(); return; }
+    done = true;
+    cleanup();
+    renameSession(oldName, remoteId || '', newName);
+  }
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { done = true; cleanup(); }
+  });
+  input.addEventListener('blur', function () {
+    setTimeout(function () {
+      if (done || document.activeElement === input) return;
+      commit();
+    }, 150);
+  });
 }
 
 /**
@@ -5625,6 +5940,14 @@ function bindStaticEventListeners() {
   var expandedPillMenu = $('expanded-pill-menu');
   if (expandedPillMenu) {
     expandedPillMenu.addEventListener('click', function (e) {
+      var renameBtn = e.target.closest && e.target.closest('[data-rename]');
+      if (renameBtn) {
+        var rName = renameBtn.dataset.session;
+        var rRid = renameBtn.dataset.remoteId || '';
+        _epCloseMenu();
+        _openRenameSessionInput(rName, rRid);
+        return;
+      }
       var item = e.target.closest && e.target.closest('[data-session]');
       if (!item) return;
       var itemRid = item.dataset.remoteId || '';
@@ -5816,6 +6139,7 @@ function bindStaticEventListeners() {
   document.querySelectorAll('.settings-tab').forEach(function(tab) {
     on(tab, 'click', function() { switchSettingsTab(tab.dataset.tab); });
   });
+  initMouseLabUI();
 
   // Hover preview — delegated on grid container (tiles are re-rendered each poll)
   var gridEl = $('session-grid');
@@ -6080,6 +6404,9 @@ function _getActiveView() { return _activeView; }
 /** Test-only: set _activeView directly. */
 function _setActiveView(view) { _activeView = view; }
 
+/** Test-only: set _localDeviceId directly. */
+function _setLocalDeviceId(id) { _localDeviceId = id; }
+
 // Recalculate fit layout on window resize
 window.addEventListener('resize', function() {
   var ds = getDisplaySettings();
@@ -6235,6 +6562,11 @@ if (typeof module !== 'undefined' && module.exports) {
     showNewSessionInput,
     showFabSessionInput,
     createNewSession,
+    // Rename session
+    renameSession,
+    _validateSessionNameClient,
+    _applyRenameToLocalSettings,
+    _openRenameSessionInput,
     // Kill session
     killSession,
     // Manage View panel
@@ -6261,6 +6593,7 @@ if (typeof module !== 'undefined' && module.exports) {
     buildExpandedPillsModel,
     allocateExpandedPills,
     renderExpandedHeaderPills,
+    _epMenuItemHTML,
     _epMenuSessions,
     _epToggleMenu,
     _epCloseMenu,
@@ -6292,6 +6625,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _resolveActiveView,
     _viewDisplayName,
     _setAutoViews,
+    _setLocalDeviceId,
     _getAutoViews,
     // Operation layer (Phase 2) — pure data ops
     _opAddMembership,
