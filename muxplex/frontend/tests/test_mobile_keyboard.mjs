@@ -116,3 +116,65 @@ test('init degrades safely when no browser DOM exists', () => {
     restore();
   }
 });
+
+test('keyboardOverlap reports the software keyboard height, and 0 when it is down', () => {
+  const previousVV = globalThis.visualViewport;
+  const previousIH = globalThis.innerHeight;
+  const { api, restore } = loadFresh();
+  try {
+    globalThis.innerHeight = 844;
+
+    // Keyboard down: visual viewport fills the layout viewport.
+    globalThis.visualViewport = { height: 844, offsetTop: 0 };
+    assert.equal(api.keyboardOverlap(), 0);
+
+    // Sub-pixel rounding must not be mistaken for a keyboard.
+    globalThis.visualViewport = { height: 843.4, offsetTop: 0 };
+    assert.equal(api.keyboardOverlap(), 0);
+
+    // Keyboard up: iOS keeps the layout viewport at 844 and shrinks only the
+    // visual viewport — this delta is what the bar must be lifted by.
+    globalThis.visualViewport = { height: 508, offsetTop: 0 };
+    assert.equal(api.keyboardOverlap(), 336);
+
+    // No visualViewport support at all: never lift.
+    globalThis.visualViewport = undefined;
+    assert.equal(api.keyboardOverlap(), 0);
+  } finally {
+    globalThis.visualViewport = previousVV;
+    globalThis.innerHeight = previousIH;
+    restore();
+  }
+});
+
+test('syncDock publishes lift/height vars and drops the safe-area pad while the keyboard is up', () => {
+  const previousVV = globalThis.visualViewport;
+  const previousIH = globalThis.innerHeight;
+  const props = new Map();
+  const { api, restore } = loadFresh({
+    document: {
+      documentElement: { style: { setProperty: (k, v) => props.set(k, v) } },
+      createElement: () => ({ style: {}, classList: { toggle() {}, add() {}, remove() {} }, setAttribute() {}, appendChild() {} }),
+      querySelector: () => null,
+      getElementById: () => null,
+      head: { appendChild() {} },
+    },
+  });
+  try {
+    globalThis.innerHeight = 844;
+    globalThis.visualViewport = { height: 508, offsetTop: 0 };
+    assert.equal(api.syncDock(), 336);
+    assert.equal(props.get('--keybar-lift'), '336px');
+    assert.equal(props.get('--keybar-pad-bottom'), '4px');
+
+    globalThis.visualViewport = { height: 844, offsetTop: 0 };
+    assert.equal(api.syncDock(), 0);
+    assert.equal(props.get('--keybar-lift'), '0px');
+    assert.equal(props.get('--keybar-pad-bottom'), '');   // falls back to safe-area inset
+    assert.ok(props.has('--keybar-height'));
+  } finally {
+    globalThis.visualViewport = previousVV;
+    globalThis.innerHeight = previousIH;
+    restore();
+  }
+});

@@ -63,18 +63,29 @@
   ];
 
   var STYLE_TEXT = [
-    '.mobile-keybar{display:none;flex:0 0 auto;min-width:0;background:var(--bg-header,#0D1117);border-top:1px solid var(--border,#2A3040);padding:4px 4px max(4px,env(safe-area-inset-bottom));z-index:12;}',
+    // Docked to the VISUAL viewport, not the layout viewport: iOS Safari overlays the
+    // software keyboard instead of shrinking the layout viewport, so a bar positioned
+    // at the layout bottom is drawn *under* the keyboard exactly when it is needed
+    // most. JS keeps --keybar-lift equal to the keyboard's overlap so the bar rides
+    // directly above it (and sits on the safe-area gutter when no keyboard is up).
+    '.mobile-keybar{display:none;position:fixed;left:0;right:0;bottom:0;transform:translateY(calc(-1 * var(--keybar-lift,0px)));background:var(--bg-header,#0D1117);border-top:1px solid var(--border,#2A3040);padding:4px max(14px,env(safe-area-inset-right)) var(--keybar-pad-bottom,max(4px,env(safe-area-inset-bottom))) max(14px,env(safe-area-inset-left));z-index:24;}',
     '.mobile-keybar__group{display:flex;align-items:center;gap:4px;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;touch-action:pan-x;padding:0 1px;}',
     '.mobile-keybar__group::-webkit-scrollbar{display:none;}',
     '.mobile-keybar__key{appearance:none;-webkit-appearance:none;flex:0 0 auto;min-width:42px;height:38px;padding:0 9px;border:1px solid var(--border,#2A3040);border-radius:6px;background:var(--bg-surface,#1A1F2B);color:var(--text,#F0F6FF);font:600 12px/1 var(--font-ui,system-ui,-apple-system,sans-serif);white-space:nowrap;user-select:none;-webkit-user-select:none;touch-action:manipulation;}',
+    // Rounded display corners physically clip the outermost keys: give the first and
+    // last key extra width so their reachable area matches the others.
+    '.mobile-keybar__group>.mobile-keybar__key:first-child{min-width:56px;padding-left:16px;}',
+    '.mobile-keybar__group>.mobile-keybar__key:last-child{min-width:56px;padding-right:16px;}',
     '.mobile-keybar__key:active{background:var(--accent-dim,rgba(0,217,245,.15));border-color:var(--accent,#00D9F5);transform:translateY(1px);}',
     '.mobile-keybar__key:focus-visible{outline:2px solid var(--accent,#00D9F5);outline-offset:1px;}',
     '.mobile-keybar__key--escape{border-color:rgba(241,166,64,.75);color:var(--bell,#F1A640);}',
     '.mobile-keybar__key--modifier{border-color:rgba(0,217,245,.55);color:var(--accent,#00D9F5);}',
     '.mobile-keybar__setting-label{display:flex;flex-direction:column;align-items:flex-start;gap:2px;}',
     '.mobile-keybar__setting-note{font-size:11px;font-weight:400;color:var(--text-muted,#8E95A3);}',
-    '@media (max-width:899px) and (hover:none),(pointer:coarse){.mobile-keybar.mobile-keybar--enabled{display:block;}body.muxplex-mobile-keybar-enabled #session-pill:not(.hidden){bottom:calc(54px + env(safe-area-inset-bottom));}}',
-    '@media (max-height:500px) and (orientation:landscape){.mobile-keybar{padding:2px 3px;}.mobile-keybar__key{height:32px;min-width:38px;padding:0 7px;font-size:11px;}body.muxplex-mobile-keybar-enabled #session-pill:not(.hidden){bottom:39px;}}',
+    '@media (max-width:899px) and (hover:none),(pointer:coarse){.mobile-keybar.mobile-keybar--enabled{display:block;}body.muxplex-mobile-keybar-enabled #session-pill:not(.hidden){bottom:calc(var(--keybar-lift,0px) + var(--keybar-height,54px) + 8px);}}',
+    // The bar is fixed (out of flow) — reserve its height so it never covers terminal rows.
+    'body.muxplex-mobile-keybar-enabled .terminal-wrapper{padding-bottom:var(--keybar-height,0px);}',
+    '@media (max-height:500px) and (orientation:landscape){.mobile-keybar{padding-top:2px;padding-bottom:var(--keybar-pad-bottom,2px);}.mobile-keybar__key{height:32px;min-width:38px;padding:0 7px;font-size:11px;}.mobile-keybar__group>.mobile-keybar__key:first-child,.mobile-keybar__group>.mobile-keybar__key:last-child{min-width:50px;}}',
     '@media (prefers-reduced-motion:reduce){.mobile-keybar__key:active{transform:none;}}',
   ].join('\n');
 
@@ -320,11 +331,39 @@
     } catch (_) { return toolbar.offsetHeight || 0; }
   }
 
+  // How much of the layout viewport the software keyboard (or other browser UI) is
+  // covering at the bottom. iOS Safari does NOT shrink the layout viewport for the
+  // keyboard, so this is the only reliable signal; it is 0 with no keyboard up.
+  function keyboardOverlap() {
+    var visualViewport = root.visualViewport;
+    if (!visualViewport) return 0;
+    var layoutHeight = root.innerHeight || visualViewport.height;
+    var covered = layoutHeight - (visualViewport.height + (visualViewport.offsetTop || 0));
+    if (!isFinite(covered) || covered < 2) return 0;   // sub-2px is rounding noise
+    return Math.round(covered);
+  }
+
+  function syncDock() {
+    var doc = getDocument();
+    if (!doc || !doc.documentElement) return 0;
+    var overlap = keyboardOverlap();
+    var style = doc.documentElement.style;
+    try {
+      style.setProperty('--keybar-lift', overlap + 'px');
+      // With the keyboard up, the home-indicator gutter is covered by the keyboard —
+      // padding for it there would just waste a row of screen.
+      style.setProperty('--keybar-pad-bottom', overlap > 0 ? '4px' : '');
+      style.setProperty('--keybar-height', toolbarHeight() + 'px');
+    } catch (_) {}
+    return overlap;
+  }
+
   function resizeForVisualViewport() {
     resizeFrame = null;
     var doc = getDocument();
     var visualViewport = root.visualViewport;
     var container = doc && doc.getElementById('terminal-container');
+    syncDock();
     if (!visualViewport || !container || !getTerminal()) return;
 
     var headerHeight = 44;
@@ -363,7 +402,12 @@
     viewportHandler = scheduleViewportFit;
     windowResizeHandler = scheduleViewportFit;
     try {
-      if (root.visualViewport) root.visualViewport.addEventListener('resize', viewportHandler);
+      if (root.visualViewport) {
+        root.visualViewport.addEventListener('resize', viewportHandler);
+        // iOS reports keyboard show/hide as a visual-viewport *scroll* (offsetTop
+        // change) as often as a resize; without this the bar lags behind the keyboard.
+        root.visualViewport.addEventListener('scroll', viewportHandler);
+      }
       root.addEventListener('resize', windowResizeHandler);
       root.addEventListener('orientationchange', windowResizeHandler);
     } catch (_) {}
@@ -371,7 +415,10 @@
 
   function unbindViewportHandlers() {
     try {
-      if (viewportHandler && root.visualViewport) root.visualViewport.removeEventListener('resize', viewportHandler);
+      if (viewportHandler && root.visualViewport) {
+        root.visualViewport.removeEventListener('resize', viewportHandler);
+        root.visualViewport.removeEventListener('scroll', viewportHandler);
+      }
       if (windowResizeHandler) {
         root.removeEventListener('resize', windowResizeHandler);
         root.removeEventListener('orientationchange', windowResizeHandler);
@@ -439,5 +486,7 @@
     arrowSequence: arrowSequence,
     activateKey: activateKey,
     resizeForVisualViewport: resizeForVisualViewport,
+    keyboardOverlap: keyboardOverlap,
+    syncDock: syncDock,
   };
 });
