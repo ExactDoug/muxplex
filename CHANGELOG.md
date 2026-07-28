@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.9.6.dev5 (2026-07-28) — dev build
+
+Adds a mobile terminal keybar. Still a **dev/experimental** build: it also carries the
+Mouse Lab harness (7 levers) from v0.9.6.dev2–dev4, which has no CHANGELOG entry because
+no fix has been baked in yet. Last released version remains v0.9.5.
+
+### Features
+
+- **Mobile terminal keybar.** Phones and tablets get a one-row bar of terminal control
+  keys the stock software keyboard doesn't offer: Esc, Tab, arrows, PgUp/PgDn, Home/End,
+  Del, and a Ctrl group (Ctrl+B/A/C/D/L/R/U/W/Z/[/\\) that swaps in place. Enable it under
+  **Settings → Display → Mobile terminal keybar**. The preference is **stored per browser**,
+  not on the server — it is a per-device ergonomic choice, and a device-local toggle means
+  turning it off on your phone can't disturb any other client or federated peer. The whole
+  feature lives in `muxplex/frontend/mobile-keyboard.js` and is fail-soft: if it errors
+  during init it disables itself rather than taking the terminal down with it. Arrow keys
+  respect the terminal's application-cursor-keys mode, so they work in the shell and in
+  full-screen TUI apps alike. Design notes:
+  `docs/plans/2026-07-27-mobile-terminal-keybar.md`.
+
+### Fixes
+
+- **The software keyboard no longer buries the keybar.** iOS Safari does *not* shrink the
+  layout viewport when the on-screen keyboard appears — it draws the keyboard *over* it.
+  So a bar anchored to the bottom of the page was covered by the keyboard exactly when its
+  Esc and Ctrl keys were most needed, which made the feature nearly unusable. The bar is
+  now docked to the **visual** viewport: it measures how much the keyboard is covering
+  (`innerHeight - (visualViewport.height + offsetTop)`) and lifts itself by that amount, so
+  it rides directly above the keyboard and returns to the gutter when the keyboard closes.
+  It also stops reserving space for the home-indicator gutter while the keyboard is up (the
+  keyboard already covers it), and it watches the visual viewport's *scroll* events as well
+  as resizes — iOS reports the keyboard appearing as a scroll as often as a resize, and
+  without that the bar lagged behind it.
+- **Rounded display corners no longer swallow the outer keys.** The bar sits in the
+  home-indicator gutter, where a rounded-corner display puts part of the first and last
+  key behind the corner arc — physically nonexistent screen, so those taps did nothing.
+  The bar now insets its sides past the arc and gives the outermost keys extra width.
+
 ## v0.9.5 (2026-06-19)
 
 Actually fixes the "returning to the terminal selects a huge block of text" bug

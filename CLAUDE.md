@@ -5,9 +5,11 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.6.dev4** (on branch `feat/v0.9-session-ux`) — a
-**dev/experimental** build carrying the Mouse Lab selection-fix harness (see below); last
-released version is **0.9.5**.
+improvements. Current version: **0.9.6.dev5**, on **`main`** — a **dev/experimental**
+build carrying the Mouse Lab selection-fix harness *and* the mobile terminal keybar (both
+below); last released version is **0.9.5**. The v0.9 session-UX and mobile-keybar branches
+are merged (PRs #8, #9); `feat/v0.9-session-ux` and `agent/mobile-terminal-keyboard` are
+spent — start new work from `main`.
 
 **v0.9 session UX (DONE on `feat/v0.9-session-ux`)** — see `CHANGELOG.md` v0.9.0–v0.9.2:
 (1) new sessions reliably auto-open (createNewSession poll now keys off the canonical
@@ -53,7 +55,16 @@ lever 7). dev4 added **lever 6 `rightClickPassThru`** (default OFF): when an app
 mouse, muxplex suppresses the browser menu but lets the forwarded right-click reach the app
 instead of also pasting. The Mouse Lab now has **7 levers + 7 profiles**. Open question the
 lever-6 test settles: ON makes double→single ⇒ fix confirmed; double→zero ⇒ muxplex was
-double-sending (different fix). Current version: **0.9.6.dev4**.
+double-sending (different fix).
+
+**v0.9.6.dev5 (MERGED, PR #9): mobile terminal keybar** — a one-row bar of terminal
+control keys (Esc/Tab/arrows/PgUp/PgDn/Home/End/Del + a swap-in-place Ctrl group) for
+phones, all in `muxplex/frontend/mobile-keyboard.js`, enabled per-browser via Settings →
+Display. Two iPhone-only bugs were found and fixed on-device (neither reproduces in
+desktop device-emulation): rounded display corners clipped the outermost keys, and the
+software keyboard buried the whole bar — see **contract #7** below for the
+visual-viewport rule that came out of it. Design doc:
+`docs/plans/2026-07-27-mobile-terminal-keybar.md`. Current version: **0.9.6.dev5**.
 
 ## Running locally (development)
 
@@ -95,6 +106,7 @@ regressions; diff failing test names against a clean checkout before blaming a c
 | Views model (mutual exclusion with hidden) | `muxplex/views.py` |
 | Frontend app (grid, sidebar, views UI, settings) | `muxplex/frontend/app.js` |
 | Frontend terminal (xterm, WS protocol, clipboard) | `muxplex/frontend/terminal.js` |
+| Mobile keybar (self-contained; own DOM + styles) | `muxplex/frontend/mobile-keyboard.js` |
 
 ## Hard-won frontend contracts (do NOT re-litigate; tests enforce them)
 
@@ -186,6 +198,26 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    Unparseable `.git` files fall back to the worktree dir's own name. Pure-Python, no
    `git` subprocess. Do NOT revert `resolve_git_repo` to stopping at the first `.git`.
 
+7. **Bottom-docked mobile UI must ride the VISUAL viewport** (v0.9.6.dev5,
+   `mobile-keyboard.js`) — **iOS Safari does not shrink the layout viewport when the
+   software keyboard opens; it overlays it.** `window.innerHeight` and `100dvh` are
+   unchanged, and normal flow knows nothing about the keyboard, so anything anchored to
+   the bottom of the page is *guaranteed* to be drawn underneath it. The keybar therefore
+   is `position:fixed; bottom:0` and lifts itself by
+   `innerHeight - (visualViewport.height + visualViewport.offsetTop)` (published as
+   `--keybar-lift` by `syncDock()`), riding directly above the keyboard. Three parts that
+   look optional and are not: (a) listen to `visualViewport`'s **`scroll`** as well as
+   `resize` — iOS signals keyboard show/hide via an `offsetTop` change as often as a
+   resize, and without it the bar lags visibly; (b) **drop `safe-area-inset-bottom` while
+   the keyboard is up** — the keyboard already covers the home-indicator gutter, so
+   padding for it wastes a row; (c) keep the bar a **DOM child of `.terminal-wrapper`**
+   despite being `position:fixed`, so `#view-expanded.hidden`'s `display:none !important`
+   hides it on the dashboard with no extra gating. Also: on rounded-corner displays the
+   gutter's corner arc physically clips the outermost keys, hence the
+   `max(14px, env(safe-area-inset-left/right))` side inset and the wider first/last keys.
+   Any future bottom-docked affordance should reuse `--keybar-lift` rather than
+   re-deriving it. Details: `docs/plans/2026-07-27-mobile-terminal-keybar.md`.
+
 ## Documentation map
 
 - `CHANGELOG.md` — user-facing release history (newest first)
@@ -233,3 +265,8 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
   Research artifact that prompted the reframing: `docs/Claude Code + tmux + Mouse.md` (NOT
   muxplex-specific; its env-var fixes don't apply — different stack). No CHANGELOG entry yet
   (dev build, no release).
+- Mobile terminal keybar (v0.9.6.dev5, DONE — PR #9):
+  `docs/plans/2026-07-27-mobile-terminal-keybar.md` — module shape, the per-browser
+  enablement rationale, and the two iPhone-only bugs (rounded-corner key clipping; the
+  software keyboard burying the bar) with the visual-viewport dock that fixes the second.
+  See contract #7. Shipped in `CHANGELOG.md` v0.9.6.dev5.
