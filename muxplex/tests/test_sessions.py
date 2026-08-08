@@ -3,6 +3,8 @@ Tests for coordinator/sessions.py — tmux session enumeration and helpers.
 All 6 acceptance-criteria tests are defined here.
 """
 
+import asyncio
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -417,3 +419,157 @@ def test_validate_session_name_rejects_control_chars():
 def test_validate_session_name_rejects_duplicate():
     assert validate_session_name("taken", existing=["taken", "other"]) is not None
     assert validate_session_name("fresh", existing=["taken", "other"]) is None
+
+
+# ---------------------------------------------------------------------------
+# snapshot_all bounded concurrency (plan item 1.2a)
+# ---------------------------------------------------------------------------
+
+
+class _ConcurrencyProbe:
+    """capture_pane stand-in that records concurrent in-flight calls."""
+
+    def __init__(self, hold: bool = True):
+        self.current = 0
+        self.max_seen = 0
+        self.calls: list[str] = []
+        self._hold = hold
+
+    async def __call__(self, name, lines=30):
+        self.calls.append(name)
+        self.current += 1
+        self.max_seen = max(self.max_seen, self.current)
+        try:
+            if self._hold:
+                # Yield enough times that every task that *can* start does so
+                # before any finishes — otherwise a serial-looking schedule
+                # would masquerade as bounded concurrency.
+                for _ in range(5):
+                    await asyncio.sleep(0)
+            return f"output-for-{name}"
+        finally:
+            self.current -= 1
+
+
+async def test_snapshot_all_bounds_concurrency_at_large_n():
+    """N >> limit: exactly N captures, never more than the limit in flight."""
+    limit = sessions_mod._SNAPSHOT_CONCURRENCY
+    names = [f"s{i}" for i in range(limit * 4)]
+    probe = _ConcurrencyProbe()
+
+    with patch("muxplex.sessions.capture_pane", new=probe):
+        result = await snapshot_all(names)
+
+    assert len(result) == len(names)
+    assert result["s0"] == "output-for-s0"
+    # Spawn COUNT is unchanged — one capture per session, no retries, no skips.
+    assert len(probe.calls) == len(names)
+    assert sorted(probe.calls) == sorted(names)
+    assert probe.max_seen <= limit, f"observed {probe.max_seen} in flight"
+    # And it really is concurrent up to the bound, not serialized.
+    assert probe.max_seen == limit
+
+
+async def test_snapshot_all_small_n_is_fully_concurrent():
+    """N below the limit behaves exactly as the old unbounded gather did."""
+    limit = sessions_mod._SNAPSHOT_CONCURRENCY
+    names = [f"s{i}" for i in range(limit - 1)]
+    probe = _ConcurrencyProbe()
+
+    with patch("muxplex.sessions.capture_pane", new=probe):
+        result = await snapshot_all(names)
+
+    assert len(result) == len(names)
+    assert len(probe.calls) == len(names)
+    assert probe.max_seen == len(names), "small N must all be in flight at once"
+
+
+async def test_snapshot_all_failure_isolated_under_bounded_concurrency():
+    """One failing capture still maps to '' and does not abort the batch."""
+    limit = sessions_mod._SNAPSHOT_CONCURRENCY
+    names = [f"s{i}" for i in range(limit * 2)]
+    bad = names[limit + 1]
+    seen: list[str] = []
+
+    async def mock_capture(name, lines=30):
+        seen.append(name)
+        await asyncio.sleep(0)
+        if name == bad:
+            raise RuntimeError("pane not found")
+        return f"output-for-{name}"
+
+    with patch("muxplex.sessions.capture_pane", side_effect=mock_capture):
+        result = await snapshot_all(names)
+
+    assert result[bad] == ""
+    assert all(result[n] == f"output-for-{n}" for n in names if n != bad)
+    assert len(seen) == len(names)
+
+
+def test_snapshot_all_semaphore_is_not_bound_to_one_event_loop():
+    """The limiter must be per-call — module-level would bind to one loop."""
+    probe = _ConcurrencyProbe(hold=False)
+
+    async def run():
+        with patch("muxplex.sessions.capture_pane", new=probe):
+            return await snapshot_all(["a", "b"])
+
+    # Two *separate* event loops, as the wider test suite creates.
+    first = asyncio.run(run())
+    second = asyncio.run(run())
+    assert first == second == {"a": "output-for-a", "b": "output-for-b"}
+
+
+# ---------------------------------------------------------------------------
+# Cache accessor copy semantics (plan item 2.5a)
+# ---------------------------------------------------------------------------
+
+
+def test_get_snapshots_returns_a_copy_not_the_module_global():
+    """Mutating the returned dict must not corrupt the module cache."""
+    sessions_mod._snapshots = {"a": "text-a"}
+
+    got = get_snapshots()
+    assert got is not sessions_mod._snapshots
+    got["b"] = "injected"
+    del got["a"]
+
+    assert sessions_mod._snapshots == {"a": "text-a"}
+
+
+def test_get_snapshots_copy_is_shallow():
+    """The copy shares its (immutable str) values — no deep copy of pane text."""
+    text = "a" * 64
+    sessions_mod._snapshots = {"a": text}
+
+    got = get_snapshots()
+
+    assert got["a"] is text, "pane text must not be duplicated"
+
+
+def test_update_session_cache_rebinds_rather_than_mutating():
+    """A held reference stays a consistent view of its own poll cycle."""
+    sessions_mod._snapshots = {}
+    update_session_cache(["a"], {"a": "cycle-1"})
+    held = get_snapshots()
+    before = sessions_mod._snapshots
+
+    update_session_cache(["a"], {"a": "cycle-2"})
+
+    assert held == {"a": "cycle-1"}, "old reference must not see the new cycle"
+    assert before == {"a": "cycle-1"}, "update must rebind, not mutate in place"
+    assert get_snapshots() == {"a": "cycle-2"}
+
+
+def test_get_session_list_and_paths_return_copies():
+    """The other two accessors copy for the same reason (documented, unchanged)."""
+    sessions_mod._session_list = ["a"]
+    sessions_mod._session_paths = {"a": "/x"}
+
+    names = get_session_list()
+    paths = sessions_mod.get_session_paths()
+    names.append("injected")
+    paths["b"] = "/y"
+
+    assert sessions_mod._session_list == ["a"]
+    assert sessions_mod._session_paths == {"a": "/x"}

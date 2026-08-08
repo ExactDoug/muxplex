@@ -3915,20 +3915,127 @@ test('openSession gates connect/PATCH writes behind reconcileOnly', () => {
   assert.ok(openTermIdx !== -1, 'openSession must still mount the terminal in the reconcile path');
 });
 
-test('reconcileViewingSession follows server active_session WITHOUT re-issuing /connect', () => {
+test('reconcileViewingSession follows the server active_session WITHOUT re-issuing /connect', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const fnStart = source.indexOf('async function reconcileViewingSession');
   assert.ok(fnStart !== -1, 'reconcileViewingSession must exist');
   const fnEnd = source.indexOf('\n}', fnStart);
   const fnBody = source.substring(fnStart, fnEnd + 2);
+  // The server's active session now arrives FOLDED ONTO the poll response
+  // (X-Muxplex-Active-* headers) instead of costing a second GET /api/state
+  // every 2s per fullscreen tab. The hint takes precedence when present...
+  assert.ok(/async function reconcileViewingSession\(viewing\)/.test(fnBody),
+    'reconcileViewingSession must accept the active-session hint folded onto the poll response');
+  assert.ok(/if \(viewing\)/.test(fnBody),
+    'the folded hint must be used in preference to a second request');
+  // ...but the /api/state read stays as the FALLBACK, so convergence still
+  // happens if a proxy strips the header or the server predates it.
   assert.ok(fnBody.includes('/api/state'),
-    'reconcileViewingSession must read the shared active_session from GET /api/state');
+    'reconcileViewingSession must still fall back to GET /api/state when no hint is available — never silently stop converging');
+  // Convergence contract (v0.9.1), unchanged:
   assert.ok(fnBody.includes('reconcileOnly: true'),
     'reconcileViewingSession must adopt the server session via a reconcileOnly open');
+  assert.ok(fnBody.includes('serverName === _viewingSession'),
+    'reconcileViewingSession must no-op when already displaying the server session');
   assert.ok(fnBody.includes('RECONCILE_GRACE_MS'),
     'reconcileViewingSession must skip within the post-local-open grace window (stale-read race guard)');
   assert.ok(!fnBody.includes('/connect'),
     'reconcileViewingSession must NOT re-issue /connect — that would kill+respawn the shared ttyd and disrupt the client that made the switch');
+});
+
+test('readViewingHeaders decodes the folded active-session headers', () => {
+  const mk = (h) => ({ headers: { get: (k) => (k in h ? h[k] : null) } });
+  assert.deepEqual(
+    app.readViewingHeaders(mk({ 'X-Muxplex-Active-Session': 'pr%C3%B8ve%20m%C3%BC', 'X-Muxplex-Active-Remote-Id': 'dev-2' })),
+    { name: 'prøve mü', remoteId: 'dev-2' },
+    'percent-encoded header values must be decoded (session names may be non-ASCII)');
+  assert.deepEqual(
+    app.readViewingHeaders(mk({ 'X-Muxplex-Active-Session': '', 'X-Muxplex-Active-Remote-Id': '' })),
+    { name: null, remoteId: '' },
+    'empty header means no active session — a valid answer, not a missing one');
+  assert.equal(app.readViewingHeaders(mk({})), null,
+    'absent headers must return null so the caller falls back to GET /api/state');
+  assert.equal(app.readViewingHeaders({ ok: true }), null,
+    'a response without a headers object must not throw');
+});
+
+test('pollSessions does NOT issue a second /api/state request when the poll response carries the hint', async () => {
+  const fetchedUrls = [];
+  const mockEl = { textContent: '', className: '' };
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => (id === 'connection-status' ? mockEl : null);
+  globalThis.fetch = async (url) => {
+    fetchedUrls.push(url);
+    return {
+      ok: true,
+      headers: { get: (k) => (k === 'X-Muxplex-Active-Session' ? 'alpha' : '') },
+      json: async () => [],
+    };
+  };
+  app._setLastLocalOpenAt(0); // outside the post-local-open grace window
+  app._setViewMode('fullscreen');
+  app._setViewingSession('alpha');
+
+  await app.pollSessions();
+
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  globalThis.document.getElementById = origGetById;
+  globalThis.fetch = undefined;
+
+  assert.ok(fetchedUrls.includes('/api/sessions'), 'the poll itself must still happen');
+  assert.ok(!fetchedUrls.includes('/api/state'),
+    'the redundant per-poll GET /api/state must be gone — the active session rides on the poll response');
+});
+
+test('pollSessions falls back to GET /api/state when the poll response carries no hint', async () => {
+  const fetchedUrls = [];
+  const mockEl = { textContent: '', className: '' };
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => (id === 'connection-status' ? mockEl : null);
+  globalThis.fetch = async (url) => {
+    fetchedUrls.push(url);
+    // No headers at all — older server, or a proxy that strips them.
+    return { ok: true, json: async () => (url === '/api/state' ? { active_session: 'alpha' } : []) };
+  };
+  app._setLastLocalOpenAt(0); // outside the post-local-open grace window
+  app._setViewMode('fullscreen');
+  app._setViewingSession('alpha');
+
+  await app.pollSessions();
+
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  globalThis.document.getElementById = origGetById;
+  globalThis.fetch = undefined;
+
+  assert.ok(fetchedUrls.includes('/api/state'),
+    'without the folded hint the client must still read the shared active session, or two browsers stop converging');
+});
+
+test('reconcileViewingSession converges on the hinted server session (cross-browser switch)', async () => {
+  const fetchedUrls = [];
+  globalThis.fetch = async (url) => {
+    fetchedUrls.push(url);
+    return { ok: true, json: async () => ({}) };
+  };
+  app._setLastLocalOpenAt(0);
+  app._setViewingSession('alpha');
+  app._setViewingRemoteId('');
+
+  // Same session as the server's -> no-op, no work.
+  await app.reconcileViewingSession({ name: 'alpha', remoteId: '' });
+  assert.deepEqual(fetchedUrls, [], 'reconcile must do nothing while already on the server session');
+
+  // Server moved to 'beta' -> adopt it, still without a /api/state read.
+  await app.reconcileViewingSession({ name: 'beta', remoteId: '' });
+  assert.ok(!fetchedUrls.includes('/api/state'),
+    'the hint must be used instead of a second request');
+  assert.equal(app._getViewingSession(), 'beta',
+    'reconcile must adopt the server session so the sidebar tracks the truly-displayed session');
+
+  app._setViewingSession(null);
+  globalThis.fetch = undefined;
 });
 
 test('pollSessions reconciles the displayed session only in fullscreen view', () => {

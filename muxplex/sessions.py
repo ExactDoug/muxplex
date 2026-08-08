@@ -38,7 +38,18 @@ def get_session_list() -> list[str]:
 
 
 def get_snapshots() -> dict[str, str]:
-    """Return a copy of the cached pane-snapshot dict."""
+    """Return a SHALLOW copy of the cached pane-snapshot dict.
+
+    Deliberately shallow (and cheap): the values are immutable ``str`` pane
+    text, so only the outer dict needs protecting from caller mutation. This
+    copies N pointers, NOT the N × 30 lines of ANSI text — do not "optimize" it
+    into a bare ``return _snapshots``, which would hand every HTTP handler a
+    live reference to the module global.
+
+    Callers may safely hold the returned dict across a poll cycle:
+    ``update_session_cache`` REBINDS ``_snapshots`` rather than mutating it, so
+    a held reference stays a consistent view of its own cycle.
+    """
     return dict(_snapshots)
 
 
@@ -305,8 +316,28 @@ def resolve_git_repo(cwd: str) -> str | None:
     return repo
 
 
+# Maximum number of `tmux capture-pane` subprocesses in flight at once.
+#
+# The total number of spawns is unchanged (still exactly one per session) —
+# only how many run *simultaneously*. Without a bound, a 100-session fleet
+# forks 100 processes at once every poll cycle (~2 s): a thundering herd of
+# fork/exec, page-table and fd churn, all contending on the single tmux server
+# that services them serially anyway.
+#
+# 32 is chosen so that today's real-world fleets (tens of sessions) are
+# completely unaffected — below the limit the gather is exactly as concurrent
+# as before, so there is no latency regression at small N — while a large
+# fleet is capped at a fixed, modest process footprint.
+_SNAPSHOT_CONCURRENCY = 32
+
+
 async def snapshot_all(names: list[str]) -> dict[str, str]:
     """Capture all sessions concurrently and return a name→text mapping.
+
+    Concurrency is bounded to _SNAPSHOT_CONCURRENCY simultaneous
+    `capture-pane` subprocesses; the total number of captures is still exactly
+    one per name. When len(names) <= _SNAPSHOT_CONCURRENCY the behavior is
+    identical to an unbounded gather.
 
     Uses asyncio.gather with return_exceptions=True so that individual
     failures do not abort the whole batch.  Failed sessions map to ''.
@@ -316,8 +347,19 @@ async def snapshot_all(names: list[str]) -> dict[str, str]:
     """
     if not names:
         return {}
+
+    # Created per call, not at module import: an asyncio.Semaphore binds to the
+    # event loop that first awaits it, and the test suite runs many separate
+    # loops. A per-call instance is a trivially cheap object and is correct on
+    # every loop.
+    limiter = asyncio.Semaphore(_SNAPSHOT_CONCURRENCY)
+
+    async def _limited(name: str) -> str:
+        async with limiter:
+            return await capture_pane(name)
+
     results = await asyncio.gather(
-        *[capture_pane(name) for name in names],
+        *[_limited(name) for name in names],
         return_exceptions=True,
     )
     snapshots: dict[str, str] = {}

@@ -364,21 +364,58 @@ function setConnectionStatus(level) {
  * would kill+respawn the shared ttyd and disrupt the client that made the switch.
  * Skipped within RECONCILE_GRACE_MS of a local open so our own in-flight PATCH
  * isn't read back stale. Only called while a session is open (fullscreen view).
+ *
+ * The server's active session now rides ALONG WITH the poll response (the
+ * X-Muxplex-Active-* headers set by /api/sessions and /api/federation/sessions),
+ * so the common path costs ZERO extra requests — this used to issue a second
+ * GET /api/state every 2s per fullscreen tab, doubling the request rate and
+ * adding a blocking state read server-side. *viewing* is that folded hint.
+ * When no hint is available (header stripped by a proxy, or an older server)
+ * we fall back to the original GET /api/state read so convergence still
+ * happens — never silently stop reconciling.
+ * @param {{name: string|null, remoteId: string}|null} [viewing] folded server state
  * @returns {Promise<void>}
  */
-async function reconcileViewingSession() {
+async function reconcileViewingSession(viewing) {
   if (Date.now() - _lastLocalOpenAt < RECONCILE_GRACE_MS) return;
   try {
-    const res = await api('GET', '/api/state');
-    const state = await res.json();
-    const serverName = state.active_session || null;
+    let serverName, serverRid;
+    if (viewing) {
+      serverName = viewing.name || null;
+      serverRid = viewing.remoteId || '';
+    } else {
+      const res = await api('GET', '/api/state');
+      const state = await res.json();
+      serverName = state.active_session || null;
+      serverRid = state.active_remote_id || '';
+    }
     if (!serverName) return;
-    const serverRid = state.active_remote_id || '';
     if (serverName === _viewingSession && serverRid === (_viewingRemoteId || '')) return;
     await openSession(serverName, { remoteId: serverRid, skipAnimation: true, reconcileOnly: true });
   } catch (err) {
     // Non-fatal: pollSessions owns connection-status; a failed reconcile just
     // leaves local state as-is until the next poll retries.
+  }
+}
+
+/**
+ * Read the server's shared active session out of a poll response's headers.
+ * Values are percent-encoded (session names may be non-ASCII; HTTP header
+ * values are latin-1). Returns null when the headers are absent — the caller
+ * then falls back to GET /api/state.
+ * @param {Response} res
+ * @returns {{name: string|null, remoteId: string}|null}
+ */
+function readViewingHeaders(res) {
+  try {
+    const h = res && res.headers;
+    if (!h || typeof h.get !== 'function') return null;
+    const rawName = h.get('X-Muxplex-Active-Session');
+    if (rawName === null || rawName === undefined) return null;
+    const rawRid = h.get('X-Muxplex-Active-Remote-Id') || '';
+    return { name: decodeURIComponent(rawName) || null, remoteId: decodeURIComponent(rawRid) };
+  } catch (_) {
+    return null;
   }
 }
 
@@ -395,6 +432,9 @@ async function pollSessions() {
       ? '/api/federation/sessions'
       : '/api/sessions';
     const res = await api('GET', endpoint);
+    // Shared active-session state rides on the poll response headers (item 2.6)
+    // so reconcile below needs no second request.
+    const viewing = readViewingHeaders(res);
     const sessions = await res.json();
     const prev = _currentSessions;
     _currentSessions = sessions;
@@ -418,7 +458,7 @@ async function pollSessions() {
     updatePageTitle();
     // Follow cross-browser session switches: while viewing a session, adopt the
     // server's shared active_session if another client repointed the shared ttyd.
-    if (_viewMode === 'fullscreen' && _viewingSession != null) await reconcileViewingSession();
+    if (_viewMode === 'fullscreen' && _viewingSession != null) await reconcileViewingSession(viewing);
   } catch (err) {
     _pollFailCount++;
     setConnectionStatus(_pollFailCount <= 2 ? 'warn' : 'err');
@@ -3841,6 +3881,16 @@ function _setViewingSession(name) {
   _viewingSession = name;
 }
 
+/** Test-only helper: set _lastLocalOpenAt (the reconcile grace window). */
+function _setLastLocalOpenAt(ts) {
+  _lastLocalOpenAt = ts;
+}
+
+/** Test-only helper: read _viewingSession directly. */
+function _getViewingSession() {
+  return _viewingSession;
+}
+
 /** Test-only helper: set _viewingRemoteId directly. */
 function _setViewingRemoteId(rid) {
   _viewingRemoteId = rid;
@@ -6810,9 +6860,13 @@ if (typeof module !== 'undefined' && module.exports) {
     updatePillBell,
     openSession,
     closeSession,
+    reconcileViewingSession,
+    readViewingHeaders,
     _findZoomTile,
     _clearZoomTileStyles,
     _setViewingSession,
+    _getViewingSession,
+    _setLastLocalOpenAt,
     handleGlobalKeydown,
     bindStaticEventListeners,
     openBottomSheet,

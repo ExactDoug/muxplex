@@ -445,6 +445,135 @@ def test_get_sessions_returns_empty_list_when_no_sessions(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/sessions — per-cycle shared payload cache (plan item 2.5a)
+# ---------------------------------------------------------------------------
+
+
+def _count_payload_builds(monkeypatch):
+    """Wrap main._build_session_items with a call counter; return the counter list."""
+    import muxplex.main as main_mod
+
+    calls = []
+    real = main_mod._build_session_items
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(main_mod, "_build_session_items", counting)
+    return calls
+
+
+def test_get_sessions_builds_payload_once_per_cycle(client, monkeypatch):
+    """Two polls within one cycle share ONE build + ONE serialization.
+
+    B browser tabs polling every 2s used to cost B identical rebuilds and B
+    serializations of the same ~40KB payload.
+    """
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha", "beta"])
+    monkeypatch.setattr(
+        "muxplex.main.get_snapshots", lambda: {"alpha": "aaa", "beta": "bbb"}
+    )
+    calls = _count_payload_builds(monkeypatch)
+
+    first = client.get("/api/sessions")
+    second = client.get("/api/sessions")
+
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content
+    assert [i["name"] for i in first.json()] == ["alpha", "beta"]
+    assert [i["snapshot"] for i in first.json()] == ["aaa", "bbb"]
+    assert first.headers["content-type"].startswith("application/json")
+    assert len(calls) == 1, f"payload rebuilt {len(calls)} times, expected 1"
+
+
+def test_get_sessions_rebuilds_when_snapshots_change(client, monkeypatch):
+    """A changed snapshot must not be served from the cache."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {"alpha": "old"})
+    calls = _count_payload_builds(monkeypatch)
+    assert client.get("/api/sessions").json()[0]["snapshot"] == "old"
+
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {"alpha": "new"})
+    assert client.get("/api/sessions").json()[0]["snapshot"] == "new"
+    assert len(calls) == 2
+
+
+def test_bell_hook_is_visible_in_the_very_next_sessions_response(client, monkeypatch):
+    """A bell fired via the tmux hook shows up with NO poll cycle in between.
+
+    POST /api/sessions/{name}/bell is the PRIMARY bell path and mutates state
+    OUTSIDE the poll cycle. A cache keyed only on a cycle counter would delay
+    the bell by up to 2 seconds — a UX regression. The payload key is derived
+    from bell content, so the mutation invalidates it by construction.
+    """
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {"alpha": "same text"})
+
+    before = client.get("/api/sessions").json()[0]["bell"]["unseen_count"] or 0
+
+    assert client.post("/api/sessions/alpha/bell").status_code == 200
+
+    after = client.get("/api/sessions").json()[0]["bell"]
+    assert after["unseen_count"] == before + 1
+    assert after["last_fired_at"] is not None
+
+    # ...and clearing it is equally immediate.
+    assert client.post("/api/sessions/alpha/bell/clear").status_code == 200
+    assert client.get("/api/sessions").json()[0]["bell"]["unseen_count"] == 0
+
+
+def test_get_sessions_carries_active_session_headers(client, monkeypatch):
+    """The shared active session rides on the poll response (plan item 2.6).
+
+    Carried as headers, not body fields, because /api/federation/sessions
+    merges remote session bodies verbatim — a body field would be clobbered
+    with the remote's idea of "active".
+    """
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {"alpha": "text"})
+
+    res = client.get("/api/sessions")
+    assert res.headers["X-Muxplex-Active-Session"] == ""
+    assert res.headers["X-Muxplex-Active-Remote-Id"] == ""
+
+    client.patch("/api/state", json={"active_session": "alpha"})
+
+    res2 = client.get("/api/sessions")
+    assert res2.headers["X-Muxplex-Active-Session"] == "alpha"
+    # Body is unchanged and may legitimately come from the cache; the headers
+    # are recomputed from freshly-read state on EVERY request.
+    assert res2.json()[0]["name"] == "alpha"
+
+
+def test_active_session_headers_are_percent_encoded(client, monkeypatch):
+    """Session names may be non-ASCII; HTTP header values are latin-1."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {})
+
+    client.patch("/api/state", json={"active_session": "prøve mü"})
+
+    res = client.get("/api/sessions")
+    from urllib.parse import unquote
+
+    assert unquote(res.headers["X-Muxplex-Active-Session"]) == "prøve mü"
+
+
+def test_federation_sessions_carries_active_session_headers(client, monkeypatch):
+    """multi_device clients poll /api/federation/sessions — it needs the headers too."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {"alpha": "text"})
+    monkeypatch.setattr("muxplex.main.load_settings", lambda: {"remote_instances": []})
+
+    client.patch("/api/state", json={"active_session": "alpha"})
+
+    res = client.get("/api/federation/sessions")
+    assert res.status_code == 200
+    assert res.headers["X-Muxplex-Active-Session"] == "alpha"
+    assert [i["name"] for i in res.json()] == ["alpha"]
+
+
+# ---------------------------------------------------------------------------
 # POST /api/sessions/{name}/connect
 # ---------------------------------------------------------------------------
 
