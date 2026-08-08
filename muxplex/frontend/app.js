@@ -2071,13 +2071,13 @@ function _renderSettingsEpoch(mobile) {
     ds.activityIndicator !== undefined ? ds.activityIndicator : 'both',
     ds.showDeviceBadges !== false ? '1' : '0',
     (_serverSettings && _serverSettings.multi_device_enabled) ? '1' : '0'
-  ].join('');
+  ].join('\u0001');
 }
 
 /** Stable identity for a rendered session node (sessionKey + remoteId). */
 function _renderNodeKey(session) {
   var rid = session.remoteId != null ? String(session.remoteId) : '';
-  return (session.sessionKey || session.name || '') + ' ' + rid;
+  return (session.sessionKey || session.name || '') + '\u0000' + rid;
 }
 
 /**
@@ -2108,7 +2108,7 @@ function _tileSignature(session, epoch) {
     sessionPriority(session),
     session.snapshot || '',
     epoch
-  ].join('');
+  ].join('\u0001');
 }
 
 /**
@@ -2136,7 +2136,7 @@ function _sidebarSignature(session, epoch, currentSession, currentRemoteId) {
     isActive ? 'active' : '',
     session.snapshot || '',
     epoch
-  ].join('');
+  ].join('\u0001');
 }
 
 /**
@@ -2188,12 +2188,16 @@ function _reconcileKeyedList(container, items, keyOf, sigOf, buildHtml, trailing
   }
 
   var desired = [];
+  var reused = Object.create(null);
   var rebuilt = 0;
   for (var j = 0; j < items.length; j++) {
     var key = keyOf(items[j]);
     var sig = sigOf(items[j]);
     var reuse = existing[key];
     if (reuse && reuse._mxSig === sig) {
+      // Mark the NODE as reused, not merely its key as present.  See the
+      // removal loop below for why that distinction is load-bearing.
+      reused[reuse._mxKey] = true;
       desired.push(reuse);
       continue;
     }
@@ -2205,12 +2209,17 @@ function _reconcileKeyedList(container, items, keyOf, sigOf, buildHtml, trailing
     rebuilt++;
   }
 
-  var seen = Object.create(null);
-  for (var d = 0; d < desired.length; d++) seen[desired[d]._mxKey] = true;
-
+  // Remove any keyed node that was NOT reused.  This must key off actual reuse,
+  // NOT off "the key appears in desired" — when a tile's signature changes we
+  // build a REPLACEMENT node under the SAME key, so a key-presence test leaves
+  // the superseded node in the DOM while insertBefore adds its replacement.
+  // That produced a duplicate tile per signature change, unbounded: an active
+  // session whose snapshot changes every poll accumulated one stale node every
+  // 2 seconds (verified 1 -> 2 -> 3 nodes over three cycles). The trailing-HTML
+  // cleanup below only masks it when trailingHtml happens to change.
   for (var k = kids.length - 1; k >= 0; k--) {
     var old = kids[k];
-    if (old._mxKey != null && !seen[old._mxKey]) container.removeChild(old);
+    if (old._mxKey != null && !reused[old._mxKey]) container.removeChild(old);
   }
 
   for (var p = 0; p < desired.length; p++) {

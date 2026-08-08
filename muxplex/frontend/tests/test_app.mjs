@@ -7659,10 +7659,45 @@ test('renderGrid reconciler: one snapshot change rebuilds ONLY that tile', () =>
     const next = [mxSession('a', 'one'), mxSession('b', 'CHANGED'), mxSession('c', 'three')];
     app.renderGrid(next);
     assert.strictEqual(_mxCreated, 1, 'exactly one tile rebuilt');
+    assert.strictEqual(env.grid.children.length, 3, 'the superseded node is REMOVED, not left alongside its replacement');
     assert.strictEqual(env.grid.children[0], before[0], 'unchanged tile a keeps node identity');
     assert.strictEqual(env.grid.children[2], before[2], 'unchanged tile c keeps node identity');
     assert.notStrictEqual(env.grid.children[1], before[1], 'changed tile b is a new node');
     assert.ok(env.grid.children[1].outerHTML.includes('CHANGED'), 'rebuilt tile shows new snapshot');
+  } finally {
+    env.restore();
+  }
+});
+
+// Regression: opencode review finding (RFR round 1) — the reconciler removed a
+// node only when its KEY vanished from `desired`. A tile whose signature changed
+// is replaced under the SAME key, so the superseded node was never removed while
+// insertBefore added its replacement: one orphan per signature change, forever.
+// An active session repainting every poll grew the DOM by a node every 2s.
+// The identity assertions above passed throughout, because the orphan was pushed
+// to the tail and no test checked children.length. Hence this test walks several
+// cycles and pins the count.
+test('renderGrid reconciler: repeated signature changes never accumulate stale nodes', () => {
+  const env = mxInstall();
+  try {
+    app.renderGrid([mxSession('a', 'v0'), mxSession('b', 'steady')]);
+    assert.strictEqual(env.grid.children.length, 2, 'baseline');
+    const steadyNode = env.grid.children[1];
+
+    // Ten polls in which session 'a' repaints every time (spinner / log tail).
+    for (let i = 1; i <= 10; i++) {
+      app.renderGrid([mxSession('a', 'v' + i), mxSession('b', 'steady')]);
+      assert.strictEqual(
+        env.grid.children.length, 2,
+        'grid must hold exactly one node per session after poll ' + i +
+        ' (saw ' + env.grid.children.length + ' — stale nodes are accumulating)');
+    }
+
+    assert.strictEqual(env.grid.children[1], steadyNode, 'the unchanged tile is still reused after 10 cycles');
+    assert.ok(env.grid.children[0].outerHTML.includes('v10'), 'the live tile shows the latest snapshot');
+
+    const keys = env.grid.children.map((n) => n._mxKey);
+    assert.strictEqual(new Set(keys).size, keys.length, 'no duplicate keys among the grid children');
   } finally {
     env.restore();
   }

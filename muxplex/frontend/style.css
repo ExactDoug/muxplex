@@ -2179,6 +2179,13 @@ body {
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none; /* Firefox — minimum layout may still overflow; strip scrolls */
+  /* Required by _epWidthCacheKey() in app.js, which caches measured pill widths
+     under a key with digits normalized to '0' — that is only sound if every
+     digit renders the same width. --font-ui is a proportional system stack
+     (system-ui / SF / Segoe UI) whose figure width is NOT guaranteed, so pin
+     tabular figures here rather than leaving the cache font-dependent.
+     Bonus: counts no longer jitter as they change width. */
+  font-variant-numeric: tabular-nums;
 }
 
 .expanded-pills::-webkit-scrollbar {
