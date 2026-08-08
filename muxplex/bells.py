@@ -55,7 +55,7 @@ async def poll_bell_flag(session_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def poll_all_bell_flags() -> dict[str, bool]:
+async def poll_all_bell_flags() -> dict[str, bool] | None:
     """Poll the tmux bell flag for every live session in ONE subprocess.
 
     ONE subprocess per call:
@@ -80,16 +80,22 @@ async def poll_all_bell_flags() -> dict[str, bool]:
     field and always 0/1, so `rsplit("\\t", 1)` is the safe parse.
 
     Returns a mapping of session_name → bool.  Sessions absent from the mapping
-    should be treated as False by callers.  Returns {} when tmux is unavailable
-    (mirroring the old per-session `except RuntimeError: return False`, widened
-    to FileNotFoundError since there is now a single total failure point).
+    should be treated as False by callers — tmux answered, and simply did not
+    report a bell for them.
+
+    Returns **None** when the query itself failed (tmux unavailable).  That is
+    deliberately distinct from an empty mapping: a failure is "unknown", not
+    "no bells", and callers must not use it to drive 1→0 transitions.  The
+    old per-session helper could only say False here, which conflated the two;
+    with a single batched call the distinction is both cheap and necessary,
+    since one failure now covers every session at once.
     """
     try:
         output = await run_tmux(
             "list-windows", "-a", "-F", "#{session_name}\t#{window_bell_flag}"
         )
     except (RuntimeError, FileNotFoundError):
-        return {}
+        return None
 
     flags: dict[str, bool] = {}
     for line in output.splitlines():
@@ -146,6 +152,15 @@ async def process_bell_flags(session_names: list[str], state: dict) -> bool:
             state["sessions"][name] = {}
         if "bell" not in state["sessions"][name]:
             state["sessions"][name]["bell"] = empty_bell()
+
+        # None means the query FAILED — as opposed to {} / a missing key, which
+        # mean "tmux answered: no bell".  Treating a failure as "no bell" would
+        # reset the 1→0 latch below, so a flag that is still set gets counted as
+        # a fresh 0→1 transition on the next successful poll and unseen_count
+        # over-counts.  (Nothing is ever LOST: unseen_count is never decremented
+        # here.)  Skip transition processing entirely and re-read next cycle.
+        if all_flags is None:
+            continue
 
         bell = state["sessions"][name]["bell"]
         flag_set = all_flags.get(name, False)

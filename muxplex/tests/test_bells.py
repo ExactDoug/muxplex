@@ -376,20 +376,69 @@ async def test_poll_all_bell_flags_parses_session_names_containing_spaces():
     assert flags == {"my session name": True, "other session": False}
 
 
-async def test_poll_all_bell_flags_returns_empty_on_runtime_error():
-    """A tmux failure yields an empty map (callers default to False)."""
+async def test_poll_all_bell_flags_returns_none_on_runtime_error():
+    """A tmux failure yields None — "unknown", NOT "no bells".
+
+    Returning {} here would be indistinguishable from tmux answering with no
+    bells set, which drives a spurious 1->0 transition. See
+    test_process_bell_flags_query_failure_preserves_latch.
+    """
     with patch(
         "muxplex.bells.run_tmux", new=AsyncMock(side_effect=RuntimeError("boom"))
     ):
-        assert await poll_all_bell_flags() == {}
+        assert await poll_all_bell_flags() is None
 
 
-async def test_poll_all_bell_flags_returns_empty_on_file_not_found():
-    """tmux missing from PATH yields an empty map, not an exception."""
+async def test_poll_all_bell_flags_returns_none_on_file_not_found():
+    """tmux missing from PATH yields None, not an exception and not {}."""
     with patch(
         "muxplex.bells.run_tmux", new=AsyncMock(side_effect=FileNotFoundError())
     ):
-        assert await poll_all_bell_flags() == {}
+        assert await poll_all_bell_flags() is None
+
+
+async def test_process_bell_flags_query_failure_preserves_latch():
+    """A failed bell query must not reset the seen-latch or over-count.
+
+    RFR round 2 finding. With the flag genuinely still set, a failed poll that
+    reported "no bells" would clear the latch, so the next SUCCESSFUL poll would
+    read the still-set flag as a fresh 0->1 transition and increment
+    unseen_count a second time for one real bell.
+    """
+    state = {"sessions": {}}
+
+    # Cycle 1: a real bell fires. unseen_count -> 1, latch set.
+    with patch(
+        "muxplex.bells.poll_all_bell_flags", new=AsyncMock(return_value={"s": True})
+    ):
+        await process_bell_flags(["s"], state)
+    assert state["sessions"]["s"]["bell"]["unseen_count"] == 1
+
+    # Cycle 2: tmux is briefly unavailable — the query FAILS.
+    with patch("muxplex.bells.poll_all_bell_flags", new=AsyncMock(return_value=None)):
+        changed = await process_bell_flags(["s"], state)
+    assert changed is False, "a failed query is not a state change"
+    assert state["sessions"]["s"]["bell"]["unseen_count"] == 1, (
+        "nothing is lost on failure — unseen_count is never decremented"
+    )
+
+    # Cycle 3: tmux recovers, flag STILL set (nobody looked at the window).
+    with patch(
+        "muxplex.bells.poll_all_bell_flags", new=AsyncMock(return_value={"s": True})
+    ):
+        await process_bell_flags(["s"], state)
+    assert state["sessions"]["s"]["bell"]["unseen_count"] == 1, (
+        "one real bell must count once — a failed poll in between must not make "
+        "the still-set flag look like a second 0->1 transition"
+    )
+
+
+async def test_process_bell_flags_query_failure_still_creates_bell_entries():
+    """Even when the query fails, session bell scaffolding is created."""
+    state = {"sessions": {}}
+    with patch("muxplex.bells.poll_all_bell_flags", new=AsyncMock(return_value=None)):
+        await process_bell_flags(["fresh"], state)
+    assert state["sessions"]["fresh"]["bell"] == empty_bell()
 
 
 async def test_poll_all_bell_flags_skips_malformed_rows():

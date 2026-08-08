@@ -7703,6 +7703,55 @@ test('renderGrid reconciler: repeated signature changes never accumulate stale n
   }
 });
 
+// RFR round 2 finding (LOW/testing): the reconciler's insert + remove + reorder
+// + signature-change paths were only ever exercised one at a time. The removal
+// bug found in round 1 lived in exactly that untested intersection, so pin the
+// combined case: all four operations in a single reconcile pass.
+test('renderGrid reconciler: simultaneous insert + remove + reorder + resnapshot', () => {
+  const env = mxInstall();
+  try {
+    app.renderGrid([
+      mxSession('a', 'A0'),
+      mxSession('b', 'B0'),
+      mxSession('c', 'C0'),
+      mxSession('d', 'D0'),
+    ]);
+    const before = {};
+    env.grid.children.forEach((n) => { before[n._mxKey] = n; });
+    assert.strictEqual(env.grid.children.length, 4, 'baseline');
+
+    // In one pass: 'b' removed, 'e' inserted, order shuffled, 'c' resnapshotted,
+    // 'a' and 'd' untouched.
+    app.renderGrid([
+      mxSession('d', 'D0'),
+      mxSession('c', 'C-CHANGED'),
+      mxSession('e', 'E0'),
+      mxSession('a', 'A0'),
+    ]);
+
+    const keys = env.grid.children.map((n) => n._mxKey);
+    assert.strictEqual(env.grid.children.length, 4, 'exactly four nodes remain');
+    assert.strictEqual(new Set(keys).size, 4, 'no duplicate keys');
+    assert.ok(!keys.some((k) => /(^|:)b$/.test(String(k))), 'removed session b has no node left');
+
+    // Untouched sessions keep node identity even though they moved position.
+    const byKey = {};
+    env.grid.children.forEach((n) => { byKey[n._mxKey] = n; });
+    const aKey = Object.keys(before).find((k) => /(^|:)a$/.test(k));
+    const dKey = Object.keys(before).find((k) => /(^|:)d$/.test(k));
+    assert.strictEqual(byKey[aKey], before[aKey], 'reordered-but-unchanged tile a is MOVED, not rebuilt');
+    assert.strictEqual(byKey[dKey], before[dKey], 'reordered-but-unchanged tile d is MOVED, not rebuilt');
+
+    // Order matches the requested order.
+    assert.ok(env.grid.children[0].outerHTML.includes('D0'), 'd first');
+    assert.ok(env.grid.children[1].outerHTML.includes('C-CHANGED'), 'c second, with new snapshot');
+    assert.ok(env.grid.children[2].outerHTML.includes('E0'), 'e third');
+    assert.ok(env.grid.children[3].outerHTML.includes('A0'), 'a last');
+  } finally {
+    env.restore();
+  }
+});
+
 test('renderGrid reconciler: a bell change rebuilds the affected tile', () => {
   const env = mxInstall();
   try {

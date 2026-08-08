@@ -199,8 +199,14 @@ async def _sync_settings_with_remotes(
 async def _run_poll_cycle() -> None:
     """Perform one full poll cycle, all operations executed under state_lock."""
     global _settings_sync_counter, _poll_generation
-    _poll_generation += 1
     async with state_lock:
+        # Bump INSIDE the lock.  Bumping before acquiring it opens a window in
+        # which a request reads pre-cycle content but stamps it with the new
+        # generation.  The content-derived key members below make that harmless
+        # for anything they cover, but the generation exists precisely to bound
+        # staleness for inputs they do NOT enumerate (gitRepo resolved behind an
+        # unchanged cwd), and a pre-lock bump widens exactly that window.
+        _poll_generation += 1
         # 1. Enumerate live tmux sessions
         names = await enumerate_sessions()
         name_set = set(names)
@@ -735,10 +741,22 @@ def _sessions_payload_key(
     Deliberately content-based rather than "invalidate here and there": a
     mutation anywhere (poll cycle, bell hook, bell/clear, rename, delete)
     necessarily changes one of these values, so the body can never go stale
-    without anyone having to remember to invalidate.  Compared with ``==``,
-    never hashed — tuple equality short-circuits on object identity, so the
-    snapshot strings (the only large members) compare in O(N) pointer checks
-    within a cycle, and bell dicts compare by value.
+    without anyone having to remember to invalidate.
+
+    Compared with ``==``, never hashed.  CPython's ``str.__eq__`` happens to
+    check identity first, so within a single cycle the snapshot strings usually
+    compare in O(N); that is an implementation detail, not a guarantee, and
+    ACROSS cycles ``load_state``/``capture_pane`` yield fresh objects so the
+    comparison is a genuine O(N x len) value compare.  Snapshots are capped at
+    30 lines, so this is cheap either way — do not rely on the identity fast
+    path.
+
+    The bell member MUST be normalized through ``empty_bell()`` exactly as
+    ``_build_session_items`` does.  The body renders a missing bell entry as
+    ``empty_bell()`` while a raw ``.get("bell")`` would yield ``None``; keeping
+    the two representations in step by coincidence is how a future refactor of
+    one side silently desynchronizes the key from the body it claims to
+    describe.
     """
     sessions_state = state.get("sessions") or {}
     return (
@@ -747,7 +765,9 @@ def _sessions_payload_key(
         tuple(names),
         tuple(snapshots.get(n, "") for n in names),
         tuple(paths.get(n) for n in names),
-        tuple((sessions_state.get(n) or {}).get("bell") for n in names),
+        tuple(
+            (sessions_state.get(n) or {}).get("bell") or empty_bell() for n in names
+        ),
     )
 
 
