@@ -11,6 +11,7 @@ import pytest
 from muxplex.bells import (
     _bell_seen,
     apply_bell_clear_rule,
+    poll_all_bell_flags,
     poll_bell_flag,
     process_bell_flags,
     should_clear_bell,
@@ -70,7 +71,10 @@ async def test_process_bell_flags_increments_unseen_count_on_new_bell():
     state = empty_state()
     state["sessions"]["session-a"] = {"bell": empty_bell()}
 
-    with patch("muxplex.bells.poll_bell_flag", new=AsyncMock(return_value=True)):
+    with patch(
+        "muxplex.bells.poll_all_bell_flags",
+        new=AsyncMock(return_value={"session-a": True}),
+    ):
         changed = await process_bell_flags(["session-a"], state)
 
     assert changed is True
@@ -83,7 +87,10 @@ async def test_process_bell_flags_does_not_double_count_persistent_flag():
     state = empty_state()
     state["sessions"]["session-a"] = {"bell": empty_bell()}
 
-    with patch("muxplex.bells.poll_bell_flag", new=AsyncMock(return_value=True)):
+    with patch(
+        "muxplex.bells.poll_all_bell_flags",
+        new=AsyncMock(return_value={"session-a": True}),
+    ):
         # First poll — 0→1 transition
         await process_bell_flags(["session-a"], state)
         # Second poll — 1→1 (persistent), should NOT increment again
@@ -100,8 +107,14 @@ async def test_process_bell_flags_resets_tracking_when_flag_clears():
 
     # side_effect drives three sequential calls: 0→1, 1→0, 0→1
     with patch(
-        "muxplex.bells.poll_bell_flag",
-        new=AsyncMock(side_effect=[True, False, True]),
+        "muxplex.bells.poll_all_bell_flags",
+        new=AsyncMock(
+            side_effect=[
+                {"session-a": True},
+                {"session-a": False},
+                {"session-a": True},
+            ]
+        ),
     ):
         for _ in range(3):
             await process_bell_flags(["session-a"], state)
@@ -114,7 +127,10 @@ async def test_process_bell_flags_no_change_returns_false():
     state = empty_state()
     state["sessions"]["session-a"] = {"bell": empty_bell()}
 
-    with patch("muxplex.bells.poll_bell_flag", new=AsyncMock(return_value=False)):
+    with patch(
+        "muxplex.bells.poll_all_bell_flags",
+        new=AsyncMock(return_value={"session-a": False}),
+    ):
         changed = await process_bell_flags(["session-a"], state)
 
     assert changed is False
@@ -126,7 +142,10 @@ async def test_process_bell_flags_creates_bell_entry_if_missing():
     state = empty_state()
     state["sessions"]["session-a"] = {}  # no 'bell' key
 
-    with patch("muxplex.bells.poll_bell_flag", new=AsyncMock(return_value=False)):
+    with patch(
+        "muxplex.bells.poll_all_bell_flags",
+        new=AsyncMock(return_value={"session-a": False}),
+    ):
         await process_bell_flags(["session-a"], state)
 
     assert "bell" in state["sessions"]["session-a"]
@@ -316,3 +335,119 @@ def test_apply_bell_clear_rule_resets_bell_seen_tracking():
     apply_bell_clear_rule(state)
 
     assert _bell_seen.get("session-a") is False
+
+
+# ---------------------------------------------------------------------------
+# poll_all_bell_flags tests (batched bell poll — plan item 1.1)
+# ---------------------------------------------------------------------------
+
+
+async def test_poll_all_bell_flags_ors_across_windows():
+    """A bell in a NON-active window still marks the session as belling (OR)."""
+    output = "session-a\t0\nsession-a\t1\nsession-b\t0\n"
+    with patch("muxplex.bells.run_tmux", new=AsyncMock(return_value=output)) as rt:
+        flags = await poll_all_bell_flags()
+
+    assert flags == {"session-a": True, "session-b": False}
+    # No -f '#{window_active}' parity filter: every window is considered.
+    assert "-f" not in rt.call_args.args
+
+
+async def test_poll_all_bell_flags_uses_tab_delimiter_and_one_call():
+    """Format string is tab-delimited and exactly one tmux call is made."""
+    with patch("muxplex.bells.run_tmux", new=AsyncMock(return_value="")) as rt:
+        await poll_all_bell_flags()
+
+    assert rt.await_count == 1
+    assert rt.call_args.args == (
+        "list-windows",
+        "-a",
+        "-F",
+        "#{session_name}\t#{window_bell_flag}",
+    )
+
+
+async def test_poll_all_bell_flags_parses_session_names_containing_spaces():
+    """Session names may contain spaces — tab-delimited parsing must survive them."""
+    output = "my session name\t1\nother session\t0\n"
+    with patch("muxplex.bells.run_tmux", new=AsyncMock(return_value=output)):
+        flags = await poll_all_bell_flags()
+
+    assert flags == {"my session name": True, "other session": False}
+
+
+async def test_poll_all_bell_flags_returns_empty_on_runtime_error():
+    """A tmux failure yields an empty map (callers default to False)."""
+    with patch(
+        "muxplex.bells.run_tmux", new=AsyncMock(side_effect=RuntimeError("boom"))
+    ):
+        assert await poll_all_bell_flags() == {}
+
+
+async def test_poll_all_bell_flags_returns_empty_on_file_not_found():
+    """tmux missing from PATH yields an empty map, not an exception."""
+    with patch(
+        "muxplex.bells.run_tmux", new=AsyncMock(side_effect=FileNotFoundError())
+    ):
+        assert await poll_all_bell_flags() == {}
+
+
+async def test_poll_all_bell_flags_skips_malformed_rows():
+    """Rows without a tab are ignored rather than corrupting the map."""
+    output = "no-tab-row\nsession-a\t1\n\n"
+    with patch("muxplex.bells.run_tmux", new=AsyncMock(return_value=output)):
+        flags = await poll_all_bell_flags()
+
+    assert flags == {"session-a": True}
+
+
+# ---------------------------------------------------------------------------
+# process_bell_flags — batched-path behaviour (plan items 1.1 / 4.1)
+# ---------------------------------------------------------------------------
+
+
+async def test_process_bell_flags_session_absent_from_output_defaults_false():
+    """A session missing from the batched result is treated as no-bell."""
+    state = empty_state()
+    state["sessions"]["session-a"] = {"bell": empty_bell()}
+    state["sessions"]["session-b"] = {"bell": empty_bell()}
+
+    with patch(
+        "muxplex.bells.poll_all_bell_flags",
+        new=AsyncMock(return_value={"session-b": True}),
+    ):
+        changed = await process_bell_flags(["session-a", "session-b"], state)
+
+    assert changed is True
+    assert state["sessions"]["session-a"]["bell"]["unseen_count"] == 0
+    assert state["sessions"]["session-b"]["bell"]["unseen_count"] == 1
+
+
+async def test_process_bell_flags_makes_exactly_one_tmux_call_for_many_sessions():
+    """The bell path is O(1) tmux spawns regardless of session count."""
+    names = [f"session-{i}" for i in range(50)]
+    state = empty_state()
+    output = "".join(f"{n}\t0\n" for n in names)
+
+    with patch("muxplex.bells.run_tmux", new=AsyncMock(return_value=output)) as rt:
+        await process_bell_flags(names, state)
+
+    assert rt.await_count == 1
+
+
+async def test_process_bell_flags_evicts_bell_seen_for_dead_sessions():
+    """_bell_seen is pruned down to the live session set."""
+    state = empty_state()
+    state["sessions"]["session-a"] = {"bell": empty_bell()}
+    _bell_seen["gone-session"] = True
+    _bell_seen["renamed-away"] = False
+
+    with patch(
+        "muxplex.bells.poll_all_bell_flags",
+        new=AsyncMock(return_value={"session-a": True}),
+    ):
+        await process_bell_flags(["session-a"], state)
+
+    assert "gone-session" not in _bell_seen
+    assert "renamed-away" not in _bell_seen
+    assert _bell_seen["session-a"] is True

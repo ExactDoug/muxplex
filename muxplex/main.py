@@ -79,7 +79,11 @@ from muxplex.settings import (
     save_settings,
 )
 from muxplex.pruning import load_pruning_state, save_pruning_state
-from muxplex.views import normalize_session_keys, prune_stale_keys, rename_session_key
+from muxplex.views import (
+    normalize_session_keys_tracked,
+    prune_stale_keys,
+    rename_session_key,
+)
 from muxplex.identity import load_device_id
 from muxplex.ttyd import kill_orphan_ttyd, kill_ttyd, spawn_ttyd, TTYD_PORT
 
@@ -297,10 +301,16 @@ async def _run_poll_cycle() -> None:
         _sessions_for_normalize = [
             {"name": _n, "sessionKey": f"{_norm_device_id}:{_n}"} for _n in names
         ]
-        _norm_before = json.dumps(_norm_settings, sort_keys=True)
-        normalize_session_keys(_norm_settings, _sessions_for_normalize)
-        _norm_after = json.dumps(_norm_settings, sort_keys=True)
-        if _norm_before != _norm_after:
+        # normalize_session_keys_tracked() reports mutation directly (list
+        # inequality per stored list, which also catches pure dedups).  It
+        # replaces a pair of throwaway json.dumps() of the WHOLE settings dict
+        # that ran every 2s purely to diff before/after — normalization touches
+        # only hidden_sessions and view["sessions"], so the full serialization
+        # was never load-bearing.
+        _norm_settings, _norm_mutated = normalize_session_keys_tracked(
+            _norm_settings, _sessions_for_normalize
+        )
+        if _norm_mutated:
             # DELIBERATELY does NOT bump settings_updated_at (so this write does
             # NOT win LWW and is NOT pushed to peers).  Normalization is a purely
             # LOCAL schema migration: it rewrites legacy bare names into
@@ -343,13 +353,31 @@ async def _run_poll_cycle() -> None:
             _live_keys.add(_name)
             _live_keys.add(f"{_local_device_id}:{_name}")
 
+        # Snapshot the bookkeeping BEFORE the call: prune_stale_keys() mutates
+        # first_missed_at in place (and injects it if absent), so a snapshot
+        # taken afterwards would always compare equal.  A shallow dict() copy is
+        # sufficient — first_missed_at is a flat dict[str, float], and all four
+        # of prune_stale_keys()'s mutation sites (pop-on-revive, set-on-first-
+        # miss, del-on-prune, GC-of-unreferenced) add/remove/replace entries in
+        # exactly this dict, never a nested structure.
+        _prune_first_missed_before = dict(_prune_state.get("first_missed_at", {}))
+
         _prune_settings, _prune_state, _prune_changed = prune_stale_keys(
             _prune_settings,
             _live_keys,
             pruning_state=_prune_state,
             grace_seconds=_grace_seconds,
         )
-        save_pruning_state(_prune_state)
+
+        # Write pruning.json only when the BOOKKEEPING changed — NOT when
+        # _prune_changed.  _prune_changed is True only when a key was actually
+        # removed from settings, which is 1 of the 4 bookkeeping mutations.  In
+        # particular, "start the grace clock" (first_missed_at[key] = now)
+        # leaves it False; since _prune_state is re-read from disk every cycle,
+        # skipping that write would reset the clock to ~now forever and stale-key
+        # pruning would never fire again.  See plan item 2.1.
+        if dict(_prune_state.get("first_missed_at", {})) != _prune_first_missed_before:
+            save_pruning_state(_prune_state)
         if _prune_changed:
             # Stale keys were removed — persist AND bump settings_updated_at so
             # the deletion actually wins last-write-wins on the next sync cycle.
@@ -442,6 +470,21 @@ async def lifespan(app: FastAPI):
                 await _poll_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+        # Kill our ttyd child.  It is spawned with start_new_session=True, so it
+        # is NOT in our process group and would otherwise outlive the server,
+        # holding TTYD_PORT, a PTY and a `tmux attach` client until the next
+        # startup sweep (kill_orphan_ttyd) reaps it.
+        #
+        # This is a single-PID SIGTERM (see plan item 3.1): the tmux SERVER is
+        # never touched, the attached session merely detaches and every pane
+        # keeps running.  Do NOT escalate this to a process-group / cgroup-wide
+        # kill — that is the mechanism behind upstream issue #7, which destroys
+        # hosted tmux sessions and everything inside them.
+        try:
+            await kill_ttyd()
+        except Exception:
+            _log.exception("ttyd shutdown kill error")
 
 
 # ---------------------------------------------------------------------------

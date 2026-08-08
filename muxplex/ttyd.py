@@ -16,6 +16,7 @@ Public API:
 """
 
 import asyncio
+import logging
 import os
 import signal
 import subprocess as _subprocess
@@ -31,6 +32,8 @@ TTYD_PID_DIR: Path = Path(os.environ.get("TMUX_WEB_STATE_DIR", _default_ttyd_pid
 TTYD_PID_PATH: Path = TTYD_PID_DIR / "ttyd.pid"
 
 TTYD_PORT: int = 7682
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module state
@@ -216,9 +219,24 @@ async def spawn_ttyd(session_name: str) -> asyncio.subprocess.Process:
         start_new_session=True,  # detach from parent process group so ttyd survives independently
     )
 
-    # Write PID file (create parent dirs if needed)
-    TTYD_PID_DIR.mkdir(parents=True, exist_ok=True)
-    TTYD_PID_PATH.write_text(str(proc.pid))
+    # Write PID file (create parent dirs if needed).
+    #
+    # If this fails (read-only dir, disk full, …) the ttyd we just spawned is
+    # LIVE but untrackable: no PID file, and _active_process not yet assigned.
+    # The only remaining handle would be the `lsof -ti :PORT` fallback, which
+    # silently no-ops when lsof is absent.  Rather than leak it, kill the child
+    # we just created and re-raise so the caller sees the failure.
+    try:
+        TTYD_PID_DIR.mkdir(parents=True, exist_ok=True)
+        TTYD_PID_PATH.write_text(str(proc.pid))
+    except Exception:
+        _log.exception("failed to write ttyd PID file; killing untrackable ttyd")
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            _log.exception("failed to kill untrackable ttyd (pid %s)", proc.pid)
+        raise
 
     _active_process = proc
     return proc

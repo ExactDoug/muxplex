@@ -9,6 +9,7 @@ from muxplex.views import (
     hide,
     is_hidden,
     normalize_session_keys,
+    normalize_session_keys_tracked,
     prune_stale_keys,
     remove_from_all_views,
     remove_membership,
@@ -1064,3 +1065,98 @@ def test_rename_session_key_is_noop_for_unreferenced_session():
     rename_session_key(settings, "dev1:old", "dev1:new", "old")
     assert settings["views"][0]["sessions"] == ["dev1:a"]
     assert settings["hidden_sessions"] == []
+
+
+# ---------------------------------------------------------------------------
+# normalize_session_keys_tracked — the mutated flag (plan item 2.2)
+#
+# main.py used to detect normalization changes with two throwaway
+# json.dumps(settings) per poll cycle.  The replacement flag must be computed as
+# a LIST INEQUALITY, not "did any name->key lookup hit": upgrade() also collapses
+# duplicates, which is a real mutation with zero upgrades.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_tracked_reports_mutation_for_pure_dedup_hidden_sessions():
+    """Dedup with ZERO key upgrades must still report mutated=True.
+
+    This is the case a naive "any name_to_key lookup hit" flag gets wrong — the
+    write would be skipped and the duplicates would persist forever.
+    """
+    sessions = [_session("a")]
+    settings = {"hidden_sessions": ["dev1:a", "dev1:a"], "views": []}
+    result, mutated = normalize_session_keys_tracked(settings, sessions)
+    assert result["hidden_sessions"] == ["dev1:a"]
+    assert mutated is True
+
+
+def test_normalize_tracked_reports_mutation_for_pure_dedup_in_view():
+    sessions = [_session("a")]
+    settings = {
+        "hidden_sessions": [],
+        "views": [{"name": "V", "sessions": ["dev1:a", "dev1:a", "dev1:b"]}],
+    }
+    _, mutated = normalize_session_keys_tracked(settings, sessions)
+    assert settings["views"][0]["sessions"] == ["dev1:a", "dev1:b"]
+    assert mutated is True
+
+
+def test_normalize_tracked_reports_mutation_in_a_later_view_only():
+    """Accumulation must not stop at the first clean list."""
+    sessions = [_session("a")]
+    settings = {
+        "hidden_sessions": ["dev1:a"],  # clean
+        "views": [
+            {"name": "Clean", "sessions": ["dev1:a"]},
+            {"name": "Dirty", "sessions": ["a"]},  # needs upgrade
+        ],
+    }
+    _, mutated = normalize_session_keys_tracked(settings, sessions)
+    assert settings["views"][1]["sessions"] == ["dev1:a"]
+    assert mutated is True
+
+
+def test_normalize_tracked_reports_no_mutation_when_already_canonical():
+    sessions = [_session("a"), _session("b")]
+    settings = {
+        "hidden_sessions": ["dev1:a"],
+        "views": [{"name": "V", "sessions": ["dev1:b"]}],
+    }
+    _, mutated = normalize_session_keys_tracked(settings, sessions)
+    assert mutated is False
+
+
+def test_normalize_tracked_second_pass_is_clean():
+    """Idempotence: the second call reports mutated=False (no write storm)."""
+    sessions = [_session("a"), _session("b")]
+    settings = {
+        "hidden_sessions": ["a", "a"],
+        "views": [{"name": "V", "sessions": ["b"]}],
+    }
+    _, first = normalize_session_keys_tracked(settings, sessions)
+    _, second = normalize_session_keys_tracked(settings, sessions)
+    assert first is True
+    assert second is False
+
+
+def test_normalize_tracked_no_mutation_on_empty_settings():
+    _, mutated = normalize_session_keys_tracked({}, [])
+    assert mutated is False
+
+
+# --- the 6 existing-caller shapes still work unchanged -----------------------
+
+
+def test_normalize_wrapper_still_returns_the_settings_dict():
+    """The wrapper must keep returning the (same, mutated-in-place) dict.
+
+    Six call sites do `result = normalize_session_keys(...)` then subscript
+    `result["hidden_sessions"]`; returning a bool or a tuple would break them.
+    """
+    sessions = [_session("a")]
+    settings = {"hidden_sessions": ["a"], "views": [{"name": "V", "sessions": ["a"]}]}
+    result = normalize_session_keys(settings, sessions)
+    assert result is settings
+    assert isinstance(result, dict)
+    assert result["hidden_sessions"] == ["dev1:a"]
+    assert result["views"][0]["sessions"] == ["dev1:a"]

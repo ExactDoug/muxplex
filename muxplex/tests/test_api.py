@@ -34,6 +34,14 @@ def patch_startup_and_state(tmp_path, monkeypatch):
 
     monkeypatch.setattr("muxplex.main.kill_orphan_ttyd", _mock_kill_orphan)
 
+    # Mock kill_ttyd too — the lifespan SHUTDOWN path calls it, and the real
+    # implementation shells out to `lsof -ti :7682` and SIGTERMs whatever it
+    # finds, which on a developer machine is their own running ttyd.
+    async def _mock_kill_ttyd():
+        return False
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", _mock_kill_ttyd)
+
     # Replace _poll_loop with a no-op so tests don't spin up real poll cycles
     async def noop_poll_loop() -> None:
         pass
@@ -82,6 +90,40 @@ def client(monkeypatch):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_lifespan_shutdown_kills_ttyd(monkeypatch):
+    """The lifespan shutdown path must kill our ttyd child (plan item 3.1).
+
+    ttyd is spawned with start_new_session=True, so without this it outlives
+    the server holding the port, a PTY and a `tmux attach` client.
+    """
+    calls = []
+
+    async def _record_kill_ttyd():
+        calls.append("kill_ttyd")
+        return True
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", _record_kill_ttyd)
+    monkeypatch.setenv("MUXPLEX_PASSWORD", "test-password")
+
+    with TestClient(app):
+        assert calls == [], "kill_ttyd must not run during startup"
+
+    assert calls == ["kill_ttyd"], "kill_ttyd was not called on lifespan shutdown"
+
+
+def test_lifespan_shutdown_survives_kill_ttyd_failure(monkeypatch):
+    """A failing kill_ttyd must never break server shutdown (condition 2)."""
+
+    async def _boom_kill_ttyd():
+        raise RuntimeError("lsof exploded")
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", _boom_kill_ttyd)
+    monkeypatch.setenv("MUXPLEX_PASSWORD", "test-password")
+
+    with TestClient(app):
+        pass  # exiting the context runs shutdown; must not raise
 
 
 def test_health_returns_200(client):

@@ -96,6 +96,35 @@ async def test_spawn_ttyd_returns_process_object():
     assert result is mock_proc
 
 
+async def test_spawn_ttyd_kills_process_when_pid_write_fails(monkeypatch):
+    """A PID-file write failure must kill the just-spawned ttyd, not leak it.
+
+    Without the guard the ttyd is live but untrackable: no PID file, and
+    _active_process never assigned (plan item 3.3).
+    """
+    mock_proc = _make_mock_ttyd_process(pid=77777)
+    mock_proc.wait = AsyncMock(return_value=0)
+
+    def _boom(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(type(ttyd_mod.TTYD_PID_PATH), "write_text", _boom, raising=False)
+
+    ttyd_mod._active_process = None
+
+    with patch(
+        "asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=mock_proc),
+    ):
+        with pytest.raises(OSError):
+            await spawn_ttyd("doomed-session")
+
+    mock_proc.kill.assert_called_once()
+    mock_proc.wait.assert_awaited_once()
+    assert ttyd_mod._active_process is None
+    assert not ttyd_mod.TTYD_PID_PATH.exists()
+
+
 # ---------------------------------------------------------------------------
 # kill_ttyd tests
 # ---------------------------------------------------------------------------

@@ -39,6 +39,14 @@ def patch_startup_and_state(tmp_path, monkeypatch):
 
     monkeypatch.setattr("muxplex.main.kill_orphan_ttyd", _mock_kill_orphan)
 
+    # Mock kill_ttyd too — the lifespan SHUTDOWN path calls it, and the real
+    # implementation shells out to `lsof -ti :7682` and SIGTERMs whatever it
+    # finds, which on a developer machine is their own running ttyd.
+    async def _mock_kill_ttyd():
+        return False
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", _mock_kill_ttyd)
+
     async def noop_poll_loop() -> None:
         pass
 
