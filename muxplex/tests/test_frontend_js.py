@@ -3756,7 +3756,10 @@ def test_flyout_menu_uses_fixed_positioning() -> None:
 
 def test_flyout_delegated_on_tile_container() -> None:
     """A delegated click listener must handle .tile-options-btn clicks."""
-    assert "tile-options-btn" in _JS.split("bindStaticEventListeners")[1], (
+    bind_body = _JS.split("function bindStaticEventListeners")[1].split("\nfunction ")[
+        0
+    ]
+    assert "tile-options-btn" in bind_body, (
         "bindStaticEventListeners must handle .tile-options-btn clicks via delegation"
     )
 
@@ -4011,18 +4014,26 @@ def test_tile_click_handler_guards_options_btn() -> None:
     Clicking ⋮ triggered BOTH flyout opening AND openSession() navigation.
     Fix: guard must check .tile-options-btn to stop event from reaching openSession().
     """
-    # The tile click handler is inside renderGrid — find it
-    render_grid_body = _JS.split("function renderGrid")[1].split("\nfunction ")[0]
-    assert "tile-options-btn" in render_grid_body, (
-        "Tile click handler must guard against .tile-options-btn clicks — "
-        "clicking ⋮ must NOT trigger openSession()"
+    # The tile click handler is now DELEGATED on #session-grid and lives in
+    # bindStaticEventListeners (resource-efficiency plan 1.3 step 1) — binding it
+    # per-tile inside renderGrid stacks a listener per render behind a render guard.
+    bind_body = _JS.split("function bindStaticEventListeners")[1].split("\nfunction ")[
+        0
+    ]
+    grid_handler = bind_body.split("$('session-grid')")[1].split("$('sidebar-list')")[0]
+    assert "tile-options-btn" in grid_handler, (
+        "Delegated #session-grid click handler must guard against .tile-options-btn "
+        "clicks — clicking ⋮ must NOT trigger openSession()"
     )
     # Confirm the old broken guard is gone
-    assert (
-        "'tile-delete'" not in render_grid_body
-        and '"tile-delete"' not in render_grid_body
-        or ("tile-options-btn" in render_grid_body)
-    ), "Guard must use .tile-options-btn, not the old .tile-delete which was removed"
+    assert "tile-delete" not in grid_handler, (
+        "Guard must use .tile-options-btn, not the old .tile-delete which was removed"
+    )
+    # And renderGrid must no longer bind click/keydown per tile.
+    render_grid_body = _JS.split("function renderGrid")[1].split("\nfunction ")[0]
+    assert "on(tile, 'click'" not in render_grid_body, (
+        "renderGrid must not bind per-tile click listeners (handler-stacking hazard)"
+    )
 
 
 def test_flyout_delegation_handler_no_stop_propagation() -> None:
@@ -4746,15 +4757,23 @@ def test_build_sidebar_html_options_btn_has_aria_haspopup() -> None:
 
 def test_render_sidebar_click_handler_guards_tile_options_btn() -> None:
     """renderSidebar click handler must guard against tile-options-btn clicks."""
+    # Delegated on #sidebar-list in bindStaticEventListeners (plan 1.3 step 1).
+    bind_body = _JS.split("function bindStaticEventListeners")[1].split("\nfunction ")[
+        0
+    ]
+    sidebar_handler = bind_body.split("$('sidebar-list')")[1]
+    assert "tile-options-btn" in sidebar_handler, (
+        "Delegated #sidebar-list click handler must guard against .tile-options-btn "
+        "clicks so clicking ⋮ doesn't also trigger openSession() — "
+        "use: if (e.target.closest('.tile-options-btn')) return;"
+    )
+    # renderSidebar must no longer bind per-item listeners.
     match = re.search(
         r"function renderSidebar\s*\(.*?\)\s*\{(.*?)(?=\nfunction |\n// )",
         _JS,
         re.DOTALL,
     )
     assert match, "renderSidebar function not found"
-    body = match.group(1)
-    assert "tile-options-btn" in body, (
-        "renderSidebar click handler must guard against .tile-options-btn clicks "
-        "so clicking ⋮ doesn't also trigger openSession() — "
-        "use: if (e.target.closest('.tile-options-btn')) return;"
-    )
+    assert "addEventListener" not in match.group(1) and "on(item," not in match.group(
+        1
+    ), "renderSidebar must not bind per-item listeners (handler-stacking hazard)"

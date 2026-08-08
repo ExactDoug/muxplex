@@ -6736,14 +6736,18 @@ test('bulkHideOp hides all keys and removes them from every view', () => {
 });
 
 test('grid tile click toggles selection instead of opening in select mode (source contract)', () => {
-  const start = appSource.indexOf("document.querySelectorAll('.session-tile').forEach");
+  // Activation lives in _activateTile (shared by the delegated click + keydown
+  // handlers on #session-grid); the highlight reapply stays in renderGrid.
+  const start = appSource.indexOf('function _activateTile(');
   assert.ok(start !== -1);
-  const snippet = appSource.slice(start, start + 1700);
+  const snippet = appSource.slice(start, start + 700);
   assert.ok(snippet.includes('_selectMode') && snippet.includes('_toggleTileSelection(tile)'),
-    'tile click handler must branch on _selectMode before openSession');
+    'tile activation must branch on _selectMode before openSession');
   assert.ok(snippet.indexOf('_toggleTileSelection') < snippet.indexOf('openSession(tile.dataset.session'),
     'selection branch must come before the open call');
-  assert.ok(snippet.includes('session-tile--selected'),
+  const hlStart = appSource.indexOf("document.querySelectorAll('.session-tile').forEach");
+  assert.ok(hlStart !== -1);
+  assert.ok(appSource.slice(hlStart, hlStart + 500).includes('session-tile--selected'),
     'selection highlight must be reapplied across poll re-renders');
 });
 
@@ -7204,4 +7208,545 @@ test('search click-outside guard ignores detached targets (source contract)', ()
   const closeIdx = snippet.indexOf('closeSearch()');
   assert.ok(guardIdx !== -1 && guardIdx < closeIdx,
     'detached-target guard must run before closeSearch()');
+});
+
+// ============================================================================
+// Delegated tile / sidebar activation (resource-efficiency plan 1.3 step 1)
+// ============================================================================
+
+/** Build a fake element that records its own listeners. */
+function _mkRecorder(id) {
+  const el = {
+    id,
+    _events: {},
+    _listenerCount: {},
+    style: {},
+    textContent: '',
+    dataset: {},
+    innerHTML: '',
+    classList: { add: () => {}, remove: () => {}, toggle: () => {}, contains: () => false },
+    addEventListener: (ev, fn) => {
+      (el._events[ev] = el._events[ev] || []).push(fn);
+      el._listenerCount[ev] = (el._listenerCount[ev] || 0) + 1;
+    },
+    removeEventListener: () => {},
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    getAttribute: () => null,
+    setAttribute: () => {},
+    closest: () => null,
+    appendChild: () => {},
+    focus: () => {},
+  };
+  return el;
+}
+
+/**
+ * Install a mocked document whose getElementById returns recorder elements,
+ * run bindStaticEventListeners(), and hand back the recorders.
+ */
+function _withBoundListeners(fn) {
+  const els = {};
+  const origGetById = globalThis.document.getElementById;
+  const origQS = globalThis.document.querySelector;
+  const origQSA = globalThis.document.querySelectorAll;
+  const origDocAdd = globalThis.document.addEventListener;
+  globalThis.document.getElementById = (id) => (els[id] = els[id] || _mkRecorder(id));
+  globalThis.document.querySelector = () => null;
+  globalThis.document.querySelectorAll = () => [];
+  globalThis.document.addEventListener = () => {};
+  try {
+    app.bindStaticEventListeners();
+    return fn(els);
+  } finally {
+    globalThis.document.getElementById = origGetById;
+    globalThis.document.querySelector = origQS;
+    globalThis.document.querySelectorAll = origQSA;
+    globalThis.document.addEventListener = origDocAdd;
+  }
+}
+
+/** Fake tile that counts classList add/remove (i.e. handler invocations). */
+function _mkTile(sessionKey, name) {
+  const tile = {
+    dataset: { session: name, sessionKey, remoteId: '' },
+    _hits: 0,
+    classList: {
+      add: () => { tile._hits++; },
+      remove: () => { tile._hits++; },
+      contains: () => false,
+    },
+  };
+  tile.closest = (sel) => (sel === '.session-tile' ? tile : null);
+  return tile;
+}
+
+test('grid tile activation is delegated: exactly one click + one keydown listener on #session-grid', () => {
+  _withBoundListeners((els) => {
+    const grid = els['session-grid'];
+    assert.strictEqual(grid._listenerCount.click, 1, 'one delegated click listener');
+    assert.strictEqual(grid._listenerCount.keydown, 1, 'one delegated keydown listener');
+  });
+});
+
+test('re-rendering the grid N times does NOT multiply handler invocations', () => {
+  _withBoundListeners((els) => {
+    const grid = els['session-grid'];
+    // Enter select mode so activation is observable without running openSession.
+    app.toggleSelectMode();
+    try {
+      const sessions = [{ name: 'alpha', sessionKey: 'alpha', bell: {} }];
+      // Simulate 20 poll cycles worth of re-renders.
+      for (let i = 0; i < 20; i++) app.renderGrid(sessions);
+      // Still exactly one listener — renderGrid must never bind per tile.
+      assert.strictEqual(grid._listenerCount.click, 1, 'renders must not stack listeners');
+
+      const tile = _mkTile('alpha', 'alpha');
+      grid._events.click.forEach((fn) => fn({ target: tile }));
+      assert.strictEqual(tile._hits, 1, 'one click must fire the action exactly once');
+    } finally {
+      app.exitSelectMode();
+    }
+  });
+});
+
+test('delegated grid click on a nested child resolves to the owning tile', () => {
+  _withBoundListeners((els) => {
+    const grid = els['session-grid'];
+    app.toggleSelectMode();
+    try {
+      const tile = _mkTile('dev:beta', 'beta');
+      const child = { closest: (sel) => (sel === '.session-tile' ? tile : null) };
+      grid._events.click.forEach((fn) => fn({ target: child }));
+      assert.strictEqual(tile._hits, 1, 'nested-child click must activate its tile');
+    } finally {
+      app.exitSelectMode();
+    }
+  });
+});
+
+test('delegated grid click ignores the ⋮ options button and non-tile targets', () => {
+  _withBoundListeners((els) => {
+    const grid = els['session-grid'];
+    app.toggleSelectMode();
+    try {
+      const tile = _mkTile('alpha', 'alpha');
+      const btn = { closest: (sel) => (sel === '.tile-options-btn' ? btn : (sel === '.session-tile' ? tile : null)) };
+      grid._events.click.forEach((fn) => fn({ target: btn }));
+      assert.strictEqual(tile._hits, 0, 'options-button clicks must not activate the tile');
+
+      const outside = { closest: () => null };
+      grid._events.click.forEach((fn) => fn({ target: outside }));
+      assert.strictEqual(tile._hits, 0, 'non-tile clicks must be ignored');
+    } finally {
+      app.exitSelectMode();
+    }
+  });
+});
+
+test('delegated grid keydown activates on Enter and Space only', () => {
+  _withBoundListeners((els) => {
+    const grid = els['session-grid'];
+    app.toggleSelectMode();
+    try {
+      const tile = _mkTile('alpha', 'alpha');
+      grid._events.keydown.forEach((fn) => fn({ key: 'Enter', target: tile }));
+      assert.strictEqual(tile._hits, 1, 'Enter activates');
+      grid._events.keydown.forEach((fn) => fn({ key: ' ', target: tile }));
+      assert.strictEqual(tile._hits, 2, 'Space activates');
+      grid._events.keydown.forEach((fn) => fn({ key: 'a', target: tile }));
+      grid._events.keydown.forEach((fn) => fn({ key: 'Escape', target: tile }));
+      assert.strictEqual(tile._hits, 2, 'other keys must not activate');
+    } finally {
+      app.exitSelectMode();
+    }
+  });
+});
+
+test('_activateTile skips error/status tiles and tiles with no session', () => {
+  const errTile = { dataset: { session: 'x' }, classList: { contains: (c) => c === 'source-tile--error' } };
+  const noSession = { dataset: {}, classList: { contains: () => false } };
+  // Neither should throw nor reach openSession (which would need a DOM).
+  app._activateTile(errTile);
+  app._activateTile(noSession);
+});
+
+test('sidebar activation is delegated: exactly one click listener on #sidebar-list', () => {
+  _withBoundListeners((els) => {
+    assert.strictEqual(els['sidebar-list']._listenerCount.click, 1);
+  });
+});
+
+test('delegated sidebar click reads the active session at EVENT time, not bind time', () => {
+  _withBoundListeners((els) => {
+    const list = els['sidebar-list'];
+    const header = globalThis.document.getElementById('expanded-session-name');
+    const mkItem = (name) => {
+      const item = { dataset: { session: name, remoteId: '' } };
+      item.closest = (sel) => (sel === '.sidebar-item' ? item : null);
+      return item;
+    };
+
+    // Active session is 'alpha' — clicking alpha must be a no-op.
+    app._setViewingSession('alpha');
+    app._setViewingRemoteId('');
+    header.textContent = '';
+    list._events.click.forEach((fn) => fn({ target: mkItem('alpha') }));
+    assert.strictEqual(header.textContent, '', 'clicking the active session must not re-open it');
+
+    // Change the active session AFTER bind time — the handler must see it.
+    app._setViewingSession('beta');
+    list._events.click.forEach((fn) => fn({ target: mkItem('alpha') }));
+    assert.strictEqual(header.textContent, 'alpha', 'handler must read _viewingSession at event time');
+  });
+  try { app.closeSession(); } catch { /* restoring module state only */ }
+  app._setViewingSession(null);
+  app._setViewingRemoteId('');
+});
+
+test('renderSidebar binds no per-item listeners (delegation only)', () => {
+  const origGetById = globalThis.document.getElementById;
+  const bound = [];
+  const list = {
+    innerHTML: '',
+    querySelectorAll: () => [
+      { dataset: { session: 'a', remoteId: '' }, addEventListener: (ev) => bound.push(ev) },
+    ],
+  };
+  globalThis.document.getElementById = (id) => (id === 'sidebar-list' ? list : null);
+  try {
+    app._setViewingSession('a');
+    // renderSidebar early-returns outside fullscreen; drive it through openSession's
+    // path indirectly by calling it directly — it is exported.
+    app.renderSidebar([{ name: 'a', sessionKey: 'a', bell: {} }], 'a', '');
+    assert.deepStrictEqual(bound, [], 'renderSidebar must not addEventListener per item');
+  } finally {
+    globalThis.document.getElementById = origGetById;
+    app._setViewingSession(null);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Per-tile keyed reconciliation (resource-efficiency plan item 1.3 step 3)
+// ---------------------------------------------------------------------------
+
+// Minimal DOM used by the reconciler: children array + insert/remove/append and an
+// innerHTML setter that parses top-level <article> elements into nodes.
+let _mxCreated = 0;
+
+function mxParse(html) {
+  const out = [];
+  const re = /<article\b([^>]*)>/g;
+  const hits = [];
+  let m;
+  while ((m = re.exec(html)) !== null) hits.push([m.index, m[1]]);
+  for (let i = 0; i < hits.length; i++) {
+    const start = hits[i][0];
+    const attrs = hits[i][1];
+    const end = i + 1 < hits.length ? hits[i + 1][0] : html.length;
+    const node = mxEl('article', false);
+    node.outerHTML = html.slice(start, end);
+    const cls = /class="([^"]*)"/.exec(attrs);
+    node.className = cls ? cls[1] : '';
+    const dre = /data-([a-z-]+)="([^"]*)"/g;
+    let d;
+    while ((d = dre.exec(attrs)) !== null) {
+      const key = d[1].replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      node.dataset[key] = d[2];
+    }
+    out.push(node);
+  }
+  return out;
+}
+
+function mxEl(tag, counted) {
+  if (counted) _mxCreated++;
+  const kids = [];
+  const el = {
+    tagName: tag,
+    dataset: {},
+    style: {},
+    className: '',
+    outerHTML: '',
+    classList: { add: () => {}, remove: () => {}, contains: () => false },
+    children: kids,
+    appendChild(n) { kids.push(n); return n; },
+    insertBefore(n, ref) {
+      const cur = kids.indexOf(n);
+      if (cur >= 0) kids.splice(cur, 1);
+      const at = ref ? kids.indexOf(ref) : kids.length;
+      kids.splice(at < 0 ? kids.length : at, 0, n);
+      return n;
+    },
+    removeChild(n) {
+      const i = kids.indexOf(n);
+      if (i >= 0) kids.splice(i, 1);
+      return n;
+    },
+    get innerHTML() { return el._html || ''; },
+    set innerHTML(v) {
+      el._html = v;
+      kids.length = 0;
+      for (const n of mxParse(v)) kids.push(n);
+    },
+  };
+  return el;
+}
+
+function mxSession(name, snapshot, extra) {
+  return Object.assign({ name, sessionKey: 'local:' + name, snapshot: snapshot || '' }, extra || {});
+}
+
+// Installs a real-enough document for reconciliation; returns { grid, restore }.
+function mxInstall() {
+  const grid = mxEl('div', false);
+  const empty = { style: {}, classList: { add: () => {}, remove: () => {} } };
+  const orig = {
+    getElementById: globalThis.document.getElementById,
+    createElement: globalThis.document.createElement,
+    querySelectorAll: globalThis.document.querySelectorAll,
+  };
+  globalThis.document.getElementById = (id) => {
+    if (id === 'session-grid') return grid;
+    if (id === 'empty-state') return empty;
+    return null;
+  };
+  globalThis.document.createElement = (tag) => mxEl(tag, true);
+  globalThis.document.querySelectorAll = () => [];
+  _mxCreated = 0;
+  return {
+    grid,
+    restore() {
+      globalThis.document.getElementById = orig.getElementById;
+      globalThis.document.createElement = orig.createElement;
+      globalThis.document.querySelectorAll = orig.querySelectorAll;
+      app._setServerSettings({});
+    },
+  };
+}
+
+test('renderGrid reconciler: nothing changed → no tile rebuilt and no DOM churn', () => {
+  const env = mxInstall();
+  try {
+    const sessions = [mxSession('a', 'one'), mxSession('b', 'two')];
+    app.renderGrid(sessions);
+    assert.strictEqual(env.grid.children.length, 2, 'two tiles rendered');
+    const before = env.grid.children.slice();
+    _mxCreated = 0;
+    app.renderGrid(sessions.map((s) => Object.assign({}, s)));  // fresh objects, same data
+    assert.strictEqual(_mxCreated, 0, 'no buildTileHTML/parse work on an unchanged poll');
+    assert.strictEqual(env.grid.children[0], before[0], 'tile 0 node survives');
+    assert.strictEqual(env.grid.children[1], before[1], 'tile 1 node survives');
+  } finally {
+    env.restore();
+  }
+});
+
+test('renderGrid reconciler: one snapshot change rebuilds ONLY that tile', () => {
+  const env = mxInstall();
+  try {
+    const sessions = [mxSession('a', 'one'), mxSession('b', 'two'), mxSession('c', 'three')];
+    app.renderGrid(sessions);
+    const before = env.grid.children.slice();
+    _mxCreated = 0;
+    const next = [mxSession('a', 'one'), mxSession('b', 'CHANGED'), mxSession('c', 'three')];
+    app.renderGrid(next);
+    assert.strictEqual(_mxCreated, 1, 'exactly one tile rebuilt');
+    assert.strictEqual(env.grid.children[0], before[0], 'unchanged tile a keeps node identity');
+    assert.strictEqual(env.grid.children[2], before[2], 'unchanged tile c keeps node identity');
+    assert.notStrictEqual(env.grid.children[1], before[1], 'changed tile b is a new node');
+    assert.ok(env.grid.children[1].outerHTML.includes('CHANGED'), 'rebuilt tile shows new snapshot');
+  } finally {
+    env.restore();
+  }
+});
+
+test('renderGrid reconciler: a bell change rebuilds the affected tile', () => {
+  const env = mxInstall();
+  try {
+    const base = [mxSession('a', 'x'), mxSession('b', 'y')];
+    app.renderGrid(base);
+    const before = env.grid.children.slice();
+    _mxCreated = 0;
+    app.renderGrid([
+      mxSession('a', 'x'),
+      mxSession('b', 'y', { bell: { unseen_count: 3, seen_at: null, last_fired_at: 5 } }),
+    ]);
+    assert.strictEqual(_mxCreated, 1, 'only the belled tile rebuilds');
+    assert.strictEqual(env.grid.children[0], before[0], 'tile a survives');
+    assert.ok(env.grid.children[1].className.includes('session-tile--bell'), 'tile b gets bell class');
+  } finally {
+    env.restore();
+  }
+});
+
+test('renderGrid reconciler: insert, remove and reorder produce correct DOM', () => {
+  const env = mxInstall();
+  try {
+    app.renderGrid([mxSession('a', '1'), mxSession('b', '2')]);
+    const nodeA = env.grid.children[0];
+    const nodeB = env.grid.children[1];
+
+    // insert
+    app.renderGrid([mxSession('a', '1'), mxSession('b', '2'), mxSession('c', '3')]);
+    assert.deepStrictEqual(
+      env.grid.children.map((n) => n.dataset.session), ['a', 'b', 'c'], 'insert appends c');
+    assert.strictEqual(env.grid.children[0], nodeA, 'a survives an insert');
+
+    // reorder
+    app.renderGrid([mxSession('c', '3'), mxSession('a', '1'), mxSession('b', '2')]);
+    assert.deepStrictEqual(
+      env.grid.children.map((n) => n.dataset.session), ['c', 'a', 'b'], 'reorder applied');
+    assert.strictEqual(env.grid.children[1], nodeA, 'reorder moves existing nodes, does not rebuild');
+    assert.strictEqual(env.grid.children[2], nodeB, 'reorder moves existing nodes, does not rebuild');
+
+    // remove
+    app.renderGrid([mxSession('c', '3'), mxSession('b', '2')]);
+    assert.deepStrictEqual(
+      env.grid.children.map((n) => n.dataset.session), ['c', 'b'], 'removed session drops out');
+  } finally {
+    env.restore();
+  }
+});
+
+test('renderGrid reconciler: a display-settings change rebuilds every tile', () => {
+  const env = mxInstall();
+  try {
+    const sessions = [mxSession('a', '1'), mxSession('b', '2')];
+    app.renderGrid(sessions);
+    const before = env.grid.children.slice();
+    _mxCreated = 0;
+    app._setServerSettings({ activityIndicator: 'dot' });
+    app.renderGrid(sessions);
+    assert.strictEqual(_mxCreated, 2, 'settingsEpoch change rebuilds all tiles');
+    assert.notStrictEqual(env.grid.children[0], before[0], 'tile 0 replaced');
+    assert.notStrictEqual(env.grid.children[1], before[1], 'tile 1 replaced');
+  } finally {
+    env.restore();
+  }
+});
+
+test('renderGrid reconciler: status tiles stay appended after the session tiles', () => {
+  const env = mxInstall();
+  try {
+    const sessions = [mxSession('a', '1'), { name: 'Box', status: 'unreachable', deviceName: 'Box' }];
+    app.renderGrid(sessions);
+    assert.strictEqual(env.grid.children.length, 2, 'one tile + one status tile');
+    assert.ok(env.grid.children[1].className.includes('source-tile--offline'), 'status tile last');
+    const tileA = env.grid.children[0];
+    _mxCreated = 0;
+    app.renderGrid(sessions);
+    assert.strictEqual(_mxCreated, 0, 'unchanged status tiles are not re-parsed');
+    assert.strictEqual(env.grid.children[0], tileA, 'session tile still survives alongside status tiles');
+  } finally {
+    env.restore();
+  }
+});
+
+test('renderGrid guard-invariant prologue still runs when the reconciler skips everything', () => {
+  const env = mxInstall();
+  const origGetById = globalThis.document.getElementById;
+  const bellCalls = [];
+  globalThis.document.getElementById = (id) => {
+    if (id === 'session-pill-bell') {
+      return { classList: { add: () => bellCalls.push('add'), remove: () => bellCalls.push('remove') } };
+    }
+    return origGetById(id);
+  };
+  try {
+    const sessions = [mxSession('a', '1'), mxSession('h', 'x', { bell: { unseen_count: 2, seen_at: null, last_fired_at: 9 } })];
+    app._setViewMode('fullscreen');
+    app._setCurrentSessions(sessions);
+    app.renderGrid(sessions);
+    bellCalls.length = 0;
+    _mxCreated = 0;
+    app.renderGrid(sessions);
+    assert.strictEqual(_mxCreated, 0, 'guard skipped every tile');
+    assert.ok(bellCalls.length > 0, 'updatePillBell still ran from the guard-invariant prologue');
+  } finally {
+    globalThis.document.getElementById = origGetById;
+    app._setViewMode('grid');
+    app._setCurrentSessions([]);
+    env.restore();
+  }
+});
+
+test('renderGrid keeps the whole-grid rebuild in grouped/cwd modes (scope limit)', () => {
+  const env = mxInstall();
+  try {
+    app._setGridViewMode('grouped');
+    app.renderGrid([mxSession('a', '1', { deviceName: 'Laptop' })]);
+    assert.ok(env.grid.innerHTML.includes('device-group-header'), 'grouped mode still writes whole-grid HTML');
+    app._setGridViewMode('flat');
+    app.renderGrid([mxSession('a', '1', { deviceName: 'Laptop' })]);
+    assert.strictEqual(env.grid.children.length, 1, 'flat mode recovers cleanly after a grouped render');
+    assert.strictEqual(env.grid.children[0].dataset.session, 'a', 'flat tile rebuilt correctly');
+  } finally {
+    app._setGridViewMode('flat');
+    env.restore();
+  }
+});
+
+test('renderSidebar reconciler: unchanged cards survive, active-session change rebuilds', () => {
+  const list = mxEl('div', false);
+  const origGetById = globalThis.document.getElementById;
+  const origCreate = globalThis.document.createElement;
+  globalThis.document.getElementById = (id) => (id === 'sidebar-list' ? list : null);
+  globalThis.document.createElement = (tag) => mxEl(tag, true);
+  try {
+    app._setViewMode('fullscreen');
+    const sessions = [mxSession('a', '1'), mxSession('b', '2')];
+    app.renderSidebar(sessions, 'a', '');
+    assert.strictEqual(list.children.length, 2, 'two sidebar cards');
+    const before = list.children.slice();
+    _mxCreated = 0;
+    app.renderSidebar(sessions, 'a', '');
+    assert.strictEqual(_mxCreated, 0, 'unchanged sidebar does no work');
+    assert.strictEqual(list.children[0], before[0], 'card a survives');
+
+    _mxCreated = 0;
+    app.renderSidebar(sessions, 'b', '');
+    assert.strictEqual(_mxCreated, 2, 'active-session change rebuilds both cards');
+    assert.ok(list.children[1].className.includes('sidebar-item--active'), 'b is now active');
+  } finally {
+    app._setViewMode('grid');
+    globalThis.document.getElementById = origGetById;
+    globalThis.document.createElement = origCreate;
+  }
+});
+
+test('renderSidebar guards the empty-state write', () => {
+  let writes = 0;
+  const list = mxEl('div', false);
+  Object.defineProperty(list, 'innerHTML', {
+    get() { return ''; },
+    set(v) { writes++; },
+    configurable: true,
+  });
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => (id === 'sidebar-list' ? list : null);
+  try {
+    app._setViewMode('fullscreen');
+    app.renderSidebar([], null, '');
+    app.renderSidebar([], null, '');
+    app.renderSidebar([], null, '');
+    assert.strictEqual(writes, 1, 'empty state written once, not once per poll');
+  } finally {
+    app._setViewMode('grid');
+    globalThis.document.getElementById = origGetById;
+  }
+});
+
+// --- item 4.2: _pillWidthCache key normalization ---
+
+test('_epWidthCacheKey collapses session counts so the cache key space is bounded', () => {
+  const a = '<span class="view-pill">work <b>3</b></span>';
+  const b = '<span class="view-pill">work <b>7</b></span>';
+  const c = '<span class="view-pill">work <b>12</b></span>';
+  assert.strictEqual(app._epWidthCacheKey(a), app._epWidthCacheKey(b),
+    'same digit-width counts share one cache entry');
+  assert.notStrictEqual(app._epWidthCacheKey(a), app._epWidthCacheKey(c),
+    'a wider count is measured separately');
+  assert.notStrictEqual(app._epWidthCacheKey(a), app._epWidthCacheKey(a.replace('work', 'other')),
+    'different label text still keys separately');
 });
