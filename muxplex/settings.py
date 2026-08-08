@@ -126,6 +126,13 @@ def save_settings(data: dict) -> None:
     Creates parent directories as needed. Writes JSON with indent=2 and a
     trailing newline.
 
+    The write is ATOMIC: it goes to a sibling ``.tmp`` file which is then
+    ``os.replace``d over SETTINGS_PATH (same pattern as state.save_state), so a
+    concurrent reader can never observe a partially-written file. A truncated
+    read makes load_settings() fall back to DEFAULT_SETTINGS — empty views and
+    hidden_sessions — and a PATCH landing in that window would destroy them
+    permanently. Do NOT revert to a bare write_text.
+
     The `_schema_version` field is always written as the current
     SCHEMA_VERSION regardless of *data*. Clients do not get to write older
     versions — that would defeat the version field's purpose as a marker for
@@ -137,7 +144,9 @@ def save_settings(data: dict) -> None:
             merged[key] = data[key]
     merged["_schema_version"] = SCHEMA_VERSION
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_PATH.write_text(json.dumps(merged, indent=2) + "\n")
+    tmp = Path(str(SETTINGS_PATH) + ".tmp")
+    tmp.write_text(json.dumps(merged, indent=2) + "\n")
+    os.replace(tmp, SETTINGS_PATH)
 
 
 def patch_settings(patch: dict) -> dict:

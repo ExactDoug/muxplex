@@ -270,3 +270,126 @@ def test_sync_put_response_calls_raise_for_status():
         "_sync_settings_with_remotes must call raise_for_status() on the PUT response "
         "so non-2xx errors propagate to the outer exception handler"
     )
+
+
+# ---------------------------------------------------------------------------
+# Prune write must win LWW (plan item 0.2)
+#
+# save_settings() does not touch settings_updated_at, so the poll cycle's
+# stale-key prune write must bump it explicitly or the deletion never syncs to
+# peers (and gets pushed back by any peer with a higher timestamp).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def poll_cycle_env(monkeypatch, tmp_path):
+    """Neutralize every side effect of _run_poll_cycle except the prune step.
+
+    Returns a helper that runs one poll cycle with a given live session list and
+    a given prune_stale_keys() outcome, and reports what was saved.
+    """
+    import muxplex.identity as identity_mod
+    import muxplex.pruning as pruning_mod
+    import muxplex.state as state_mod
+
+    monkeypatch.setattr(state_mod, "STATE_PATH", tmp_path / "state.json", raising=False)
+    monkeypatch.setattr(
+        pruning_mod, "PRUNING_STATE_PATH", tmp_path / "pruning.json", raising=False
+    )
+    monkeypatch.setattr(
+        identity_mod, "IDENTITY_PATH", tmp_path / "identity.json", raising=False
+    )
+
+    state_stub = {
+        "session_order": [],
+        "sessions": {},
+        "active_session": None,
+        "devices": {},
+    }
+
+    monkeypatch.setattr(main_mod, "enumerate_sessions", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main_mod, "snapshot_all", AsyncMock(return_value={}))
+    monkeypatch.setattr(main_mod, "update_session_cache", MagicMock())
+    monkeypatch.setattr(main_mod, "list_session_paths", AsyncMock(return_value={}))
+    monkeypatch.setattr(main_mod, "update_session_paths", MagicMock())
+    monkeypatch.setattr(main_mod, "load_state", MagicMock(return_value=state_stub))
+    monkeypatch.setattr(main_mod, "save_state", MagicMock())
+    monkeypatch.setattr(main_mod, "process_bell_flags", AsyncMock())
+    monkeypatch.setattr(main_mod, "apply_bell_clear_rule", MagicMock())
+    monkeypatch.setattr(main_mod, "prune_devices", MagicMock())
+    monkeypatch.setattr(main_mod, "load_device_id", MagicMock(return_value="devA"))
+    monkeypatch.setattr(main_mod, "load_pruning_state", MagicMock(return_value={}))
+    monkeypatch.setattr(main_mod, "save_pruning_state", MagicMock())
+    monkeypatch.setattr(main_mod, "_federation_client", None)
+
+    async def run(*, prune_changed, on_disk):
+        settings_mod.save_settings(on_disk)
+        before = settings_mod.load_settings()["settings_updated_at"]
+
+        pruned = {k: v for k, v in on_disk.items()}
+        if prune_changed:
+            pruned["hidden_sessions"] = []
+
+        def fake_prune(settings, live_keys, **kwargs):
+            settings["hidden_sessions"] = pruned.get("hidden_sessions", [])
+            return settings, {"first_missed_at": {}}, prune_changed
+
+        monkeypatch.setattr(main_mod, "prune_stale_keys", fake_prune)
+        await main_mod._run_poll_cycle()
+        after = settings_mod.load_settings()["settings_updated_at"]
+        return before, after
+
+    return run
+
+
+async def test_prune_write_bumps_settings_updated_at(poll_cycle_env):
+    """A prune that actually removes a key must bump settings_updated_at (wins LWW)."""
+    before, after = await poll_cycle_env(
+        prune_changed=True,
+        on_disk={
+            "settings_updated_at": 100.0,
+            "hidden_sessions": ["devA:dead"],
+            "views": [],
+        },
+    )
+    assert before == 100.0
+    assert after > before, (
+        "prune write must bump settings_updated_at or the deletion never wins "
+        "last-write-wins and peers push the dead key back"
+    )
+
+
+async def test_prune_noop_does_not_bump_settings_updated_at(poll_cycle_env):
+    """No prune => no timestamp bump (sync-storm guard).
+
+    The prune branch runs every poll cycle (~2s). If it bumped the timestamp
+    unconditionally, every device would push its settings to every peer on every
+    cycle forever.
+    """
+    before, after = await poll_cycle_env(
+        prune_changed=False,
+        on_disk={
+            "settings_updated_at": 100.0,
+            "hidden_sessions": ["devA:alive"],
+            "views": [],
+        },
+    )
+    assert before == 100.0
+    assert after == 100.0, (
+        "settings_updated_at must NOT be bumped when nothing was pruned — "
+        "that would push settings to every peer every poll cycle"
+    )
+
+
+def test_normalize_write_does_not_bump_timestamp_by_design():
+    """The normalize write is deliberately local-only and must stay documented as such."""
+    import inspect
+
+    source = inspect.getsource(main_mod._run_poll_cycle)
+    norm_block = source.split("# 13b.")[1].split("# 14.")[0]
+    assert "settings_updated_at" not in norm_block.replace(
+        "does NOT bump settings_updated_at", ""
+    ), "normalize write must not bump settings_updated_at"
+    assert "DELIBERATELY does NOT bump settings_updated_at" in norm_block, (
+        "the decision not to sync the normalize write must stay explicitly commented"
+    )

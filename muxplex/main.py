@@ -301,6 +301,15 @@ async def _run_poll_cycle() -> None:
         normalize_session_keys(_norm_settings, _sessions_for_normalize)
         _norm_after = json.dumps(_norm_settings, sort_keys=True)
         if _norm_before != _norm_after:
+            # DELIBERATELY does NOT bump settings_updated_at (so this write does
+            # NOT win LWW and is NOT pushed to peers).  Normalization is a purely
+            # LOCAL schema migration: it rewrites legacy bare names into
+            # "<this device's id>:<name>" form.  Every peer runs the same
+            # migration against its OWN device id, so pushing our stamped keys
+            # would relabel sessions the peer owns and the two devices would
+            # ping-pong conflicting prefixes forever.  The write is idempotent
+            # (the next cycle's before/after compare is equal), so it happens
+            # once per legacy key, not every cycle.
             save_settings(_norm_settings)
     except Exception:
         _log.exception("session-key normalize cycle error")
@@ -342,7 +351,23 @@ async def _run_poll_cycle() -> None:
         )
         save_pruning_state(_prune_state)
         if _prune_changed:
-            # Stale keys were removed — persist (triggers LWW sync on next cycle).
+            # Stale keys were removed — persist AND bump settings_updated_at so
+            # the deletion actually wins last-write-wins on the next sync cycle.
+            #
+            # save_settings() does NOT touch settings_updated_at (only
+            # patch_settings() does), so without this explicit bump the prune
+            # write lands on disk with an unchanged timestamp: it never wins
+            # LWW, is never pushed to peers, and any peer with a higher
+            # timestamp pushes the dead key straight back via
+            # apply_synced_settings() — the pruned key resurrects and
+            # ping-pongs indefinitely.
+            #
+            # No sync storm: prune_stale_keys() reports changed=True ONLY when a
+            # key was actually removed from hidden_sessions/view.sessions, and it
+            # deletes that key's first_missed_at bookkeeping at the same time, so
+            # the same key cannot be pruned twice.  Steady state (nothing stale)
+            # leaves the timestamp untouched.
+            _prune_settings["settings_updated_at"] = time.time()
             save_settings(_prune_settings)
     except Exception:
         _log.exception("stale-key prune cycle error")

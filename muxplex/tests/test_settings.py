@@ -4,6 +4,8 @@ Tests for muxplex/settings.py — server-side settings management.
 """
 
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -1171,3 +1173,104 @@ def test_stale_key_grace_hours_is_not_pruning_state():
     assert "first_missed_at" not in SYNCABLE_KEYS, (
         "first_missed_at must never be in SYNCABLE_KEYS (it is local-only bookkeeping)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Atomic write (mirrors test_state.py's atomicity tests)
+#
+# A truncated settings.json makes load_settings() catch JSONDecodeError and
+# silently return DEFAULT_SETTINGS (empty views / hidden_sessions).  A PATCH
+# landing in that window destroys the user's views permanently, so the write
+# MUST be atomic.
+# ---------------------------------------------------------------------------
+
+
+def test_save_settings_is_atomic_no_tmp_file_left(redirect_settings_path):
+    """After save_settings(), no .tmp file may remain on disk."""
+    save_settings({"device_name": "box"})
+    tmp_file = Path(str(redirect_settings_path) + ".tmp")
+    assert not tmp_file.exists(), "save_settings left a .tmp file behind"
+
+
+def test_save_settings_never_exposes_partial_file(redirect_settings_path, monkeypatch):
+    """The target path must go straight from old content to new via os.replace.
+
+    A spy on os.replace asserts that, at the instant the rename happens, the
+    destination still holds the *previous* complete, parseable content — i.e.
+    the new bytes were staged in a separate temp file, never written over the
+    live file in place.
+    """
+    save_settings({"views": [{"name": "secops", "sessions": ["a:b"]}]})
+    before = redirect_settings_path.read_text()
+
+    observed = {}
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        observed["src"] = str(src)
+        observed["dst_content_at_replace"] = Path(dst).read_text()
+        observed["src_content"] = Path(src).read_text()
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(settings_mod.os, "replace", spy_replace)
+    save_settings({"views": [{"name": "other", "sessions": []}]})
+
+    assert observed, "save_settings did not use os.replace"
+    # Staged in a sibling temp file in the SAME directory (os.replace is only
+    # atomic within one filesystem).
+    assert Path(observed["src"]).parent == redirect_settings_path.parent
+    assert observed["src"] != str(redirect_settings_path)
+    # The live file was untouched and still fully valid right up to the rename.
+    assert observed["dst_content_at_replace"] == before
+    json.loads(observed["dst_content_at_replace"])
+    # And the staged file was complete before the rename.
+    json.loads(observed["src_content"])
+
+
+def test_concurrent_saves_do_not_corrupt(redirect_settings_path):
+    """Concurrent save_settings() calls always leave complete, parseable JSON."""
+    import threading
+
+    a = {"views": [{"name": "aaa", "sessions": ["x:%d" % i for i in range(200)]}]}
+    b = {"views": [{"name": "bbb", "sessions": ["y:%d" % i for i in range(400)]}]}
+
+    save_settings(a)
+    errors = []
+    stop = threading.Event()
+
+    def writer():
+        while not stop.is_set():
+            save_settings(a)
+            save_settings(b)
+
+    def reader():
+        while not stop.is_set():
+            try:
+                text = redirect_settings_path.read_text()
+                json.loads(text)
+            except FileNotFoundError:
+                errors.append("settings.json vanished during write")
+            except json.JSONDecodeError:
+                errors.append("reader observed a partially-written settings.json")
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    for t in threads:
+        t.start()
+    time.sleep(0.5)
+    stop.set()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors[:3]
+    final = load_settings()
+    assert final["views"] in (a["views"], b["views"])
+
+
+def test_save_settings_creates_parent_dir(tmp_path, monkeypatch):
+    """save_settings() still creates missing parent directories."""
+    nested = tmp_path / "nested" / "dir" / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", nested)
+    assert not nested.parent.exists()
+    save_settings({"device_name": "box"})
+    assert nested.exists()
+    assert json.loads(nested.read_text())["device_name"] == "box"

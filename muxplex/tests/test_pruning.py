@@ -10,6 +10,7 @@ The pruning sidecar (pruning.json) is NEVER synced to peers.  These tests verify
 """
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -175,3 +176,90 @@ def test_save_overwrites_previous_state(redirect_pruning_state_path):
     assert loaded == {"first_missed_at": {"dev1:new": 222.0}}, (
         f"save must overwrite previous state; got: {loaded!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Atomic write (mirrors test_state.py / test_settings.py atomicity tests)
+# ---------------------------------------------------------------------------
+
+
+def test_save_pruning_state_is_atomic_no_tmp_file_left(redirect_pruning_state_path):
+    """After save_pruning_state(), no .tmp file may remain on disk."""
+    save_pruning_state({"first_missed_at": {"dev1:x": 1.0}})
+    tmp_file = Path(str(redirect_pruning_state_path) + ".tmp")
+    assert not tmp_file.exists(), "save_pruning_state left a .tmp file behind"
+
+
+def test_save_pruning_state_never_exposes_partial_file(
+    redirect_pruning_state_path, monkeypatch
+):
+    """New bytes are staged in a sibling temp file, then os.replace'd into place."""
+    save_pruning_state({"first_missed_at": {"dev1:old": 111.0}})
+    before = redirect_pruning_state_path.read_text()
+
+    observed = {}
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        observed["src"] = str(src)
+        observed["dst_content_at_replace"] = Path(dst).read_text()
+        observed["src_content"] = Path(src).read_text()
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(pruning_mod.os, "replace", spy_replace)
+    save_pruning_state({"first_missed_at": {"dev1:new": 222.0}})
+
+    assert observed, "save_pruning_state did not use os.replace"
+    assert Path(observed["src"]).parent == redirect_pruning_state_path.parent
+    assert observed["src"] != str(redirect_pruning_state_path)
+    assert observed["dst_content_at_replace"] == before
+    json.loads(observed["dst_content_at_replace"])
+    json.loads(observed["src_content"])
+
+
+def test_concurrent_pruning_saves_do_not_corrupt(redirect_pruning_state_path):
+    """Concurrent save_pruning_state() calls always leave complete JSON."""
+    import threading
+    import time
+
+    a = {"first_missed_at": {"dev1:a%d" % i: float(i) for i in range(200)}}
+    b = {"first_missed_at": {"dev1:b%d" % i: float(i) for i in range(400)}}
+
+    save_pruning_state(a)
+    errors = []
+    stop = threading.Event()
+
+    def writer():
+        while not stop.is_set():
+            save_pruning_state(a)
+            save_pruning_state(b)
+
+    def reader():
+        while not stop.is_set():
+            try:
+                json.loads(redirect_pruning_state_path.read_text())
+            except FileNotFoundError:
+                errors.append("pruning.json vanished during write")
+            except json.JSONDecodeError:
+                errors.append("reader observed a partially-written pruning.json")
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    for t in threads:
+        t.start()
+    time.sleep(0.5)
+    stop.set()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors[:3]
+    assert load_pruning_state() in (a, b)
+
+
+def test_save_pruning_state_creates_parent_dir(tmp_path, monkeypatch):
+    """save_pruning_state() still creates missing parent directories."""
+    nested = tmp_path / "nested" / "dir" / "pruning.json"
+    monkeypatch.setattr(pruning_mod, "PRUNING_STATE_PATH", nested)
+    assert not nested.parent.exists()
+    save_pruning_state({"first_missed_at": {"dev1:x": 1.0}})
+    assert nested.exists()
+    assert load_pruning_state() == {"first_missed_at": {"dev1:x": 1.0}}
