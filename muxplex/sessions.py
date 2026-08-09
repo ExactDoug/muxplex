@@ -537,11 +537,14 @@ async def snapshot_all(
     to_capture: list[str] = []
     for name in names:
         key = None if change_keys is None else change_keys.get(name)
+        # Every clause below is a REUSE precondition; failing any one of them
+        # falls through to the else branch and captures.  Read them as "reuse
+        # only if ...", not as descriptions of when we capture.
         if (
-            not force_all
-            and key  # unknown/unparseable key -> capture (fail safe)
-            and name in cached  # new session -> capture
-            and _snapshot_keys.get(name) == key
+            not force_all  # reuse only if this is not a forced-sweep cycle
+            and key  # ... and the key is known and parseable
+            and name in cached  # ... and we actually have a cached snapshot
+            and _snapshot_keys.get(name) == key  # ... and the pane has not moved
         ):
             reused[name] = cached[name]
         else:
