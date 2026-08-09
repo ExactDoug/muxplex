@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.9.6.dev6 (2026-08-09) — dev build
+
+### Bug fixes
+
+- **A session whose process exits no longer leaves the terminal in an endless
+  "Reconnecting…".** Quitting the shell (or Claude Code, or whatever the session was
+  invoked to run) destroys the tmux session, so the `tmux attach` that ttyd runs fails
+  instantly and the connection can never be re-established. The terminal used to retry
+  every ~15 seconds forever, with no explanation and no way back. It now recognises the
+  404 that `POST /api/sessions/{name}/connect` already returns for a session that no
+  longer exists — and, for federated sessions, the peer's 404 proxied as a 502 — and
+  shows **"Session ended."** with a **Back to sessions** button. Reconnects are
+  additionally capped at 8 attempts (~75 s), so an unrecoverable connection of any other
+  kind ends with "Lost connection to this session." rather than spinning. Genuinely
+  transient failures (an unreachable peer, a server restart, a network blip) still
+  reconnect as before.
+
 ## v0.9.6.dev5 (2026-07-28) — dev build
 
 Adds a mobile terminal keybar. Still a **dev/experimental** build: it also carries the
