@@ -211,15 +211,25 @@ async def _run_poll_cycle() -> None:
         names = await enumerate_sessions()
         name_set = set(names)
 
-        # 2. Capture pane snapshots and update in-memory snapshot cache
-        new_snapshots = await snapshot_all(names)
-        update_session_cache(names, new_snapshots)
-
-        # 2b. Refresh active-pane cwd per session (universal search metadata)
+        # 2. Refresh active-pane cwd per session (universal search metadata).
+        #    ORDERING IS LOAD-BEARING: this must run BEFORE the snapshot step.
+        #    The same single `tmux list-panes -a` that yields the cwd map also
+        #    yields each session's snapshot CHANGE KEY (item 1.2c), which
+        #    `snapshot_all` picks up through the freshness handshake in
+        #    sessions.py.  Keys must describe the panes as they are NOW —
+        #    reusing the previous cycle's keys would make every skip decision
+        #    one cycle (2 s) stale, i.e. a visibly stale tile.  If this call
+        #    fails, no fresh keys are published and the snapshot step captures
+        #    everything.
         try:
             update_session_paths(await list_session_paths())
         except Exception:
             _log.exception("session-path refresh error")
+
+        # 2b. Capture pane snapshots (only those whose change key moved since
+        #     their cached snapshot) and update the in-memory snapshot cache.
+        new_snapshots = await snapshot_all(names)
+        update_session_cache(names, new_snapshots)
 
         # 3. Load current persisted state
         state = load_state()

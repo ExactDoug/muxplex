@@ -15,7 +15,8 @@ Public API:
     run_tmux(*args)                       → str   (raises RuntimeError on nonzero exit)
     enumerate_sessions()                  → list[str]
     capture_pane(name, lines)             → str
-    snapshot_all(names)                   → dict[str, str]
+    snapshot_all(names, change_keys)      → dict[str, str]
+    list_session_panes()                  → (dict[str, str], dict[str, str])
     list_session_paths()                  → dict[str, str]
     resolve_git_repo(cwd)                 → str | None
 """
@@ -180,39 +181,118 @@ async def capture_pane(session_name: str, lines: int = 30) -> str:
         return ""
 
 
+# Format string for the ONE batched `list-panes -a` call.
+#
+# CRITICAL ORDERING CONSTRAINT: `#{pane_current_path}` MUST stay LAST, and
+# every field added here must go BEFORE it.  The parser splits with a maxsplit
+# so that the path — the only field that can legitimately contain a TAB — is
+# the whole remainder of the line.  Adding a field after the path, or forgetting
+# to bump `_PANE_FIELD_MAXSPLIT`, silently corrupts cwd parsing for tabbed
+# paths (and therefore auto-view grouping and universal search).
+_PANE_FORMAT = (
+    "#{session_name}\t"
+    "#{window_active}\t"
+    "#{pane_active}\t"
+    "#{window_activity}\t"
+    "#{pane_id}\t"
+    "#{pane_width}\t"
+    "#{pane_height}\t"
+    "#{pane_current_path}"
+)
+
+# Number of TAB-separated fields in _PANE_FORMAT.
+_PANE_FIELD_COUNT = 8
+# maxsplit for `str.split("\t", n)` — one less than the field count, so the
+# trailing path keeps any tabs it contains.
+_PANE_FIELD_MAXSPLIT = _PANE_FIELD_COUNT - 1
+
+
+async def list_session_panes() -> tuple[dict[str, str], dict[str, str]]:
+    """Return ({session: cwd}, {session: change-key}) for all sessions.
+
+    ONE subprocess per call — the same single `tmux list-panes -a` that has
+    always fed the cwd map, now also carrying the fields the snapshot path
+    needs to tell "this pane provably has not changed" from "capture it".
+    Adding them costs ZERO extra spawns.
+
+    Only rows where both the window and the pane are active are kept (the
+    session's "current" pane — the same pane `capture_pane` targets).
+
+    The CHANGE KEY is composite, not just a timestamp::
+
+        window_activity | pane_id | pane_width | pane_height
+
+    * ``window_activity`` — time of last activity in the active window; this
+      is the actual "new output" signal.  (NOT ``window_activity_flag``, which
+      is the alert flag and is gated on ``monitor-activity``; not
+      ``session_activity``, which tmux also bumps on client attach.)
+    * ``pane_id`` — `capture_pane` targets ``-t <session>``, which tmux
+      resolves to the session's CURRENT window's ACTIVE pane.  Switching the
+      active window or pane changes what a capture returns with no new output
+      at all, and does not move ``window_activity``.
+    * ``pane_width`` / ``pane_height`` — a resize reflows the visible content
+      with no new output.
+
+    A session whose row is missing or unparseable is simply absent from the
+    change-key map, which the snapshot path treats as UNKNOWN and therefore
+    captures (fail toward capturing, never toward staleness).
+
+    Returns ({}, {}) when tmux is unavailable — again forcing a full capture.
+
+    SIDE EFFECT: publishes the change-key map for `snapshot_all` to consume
+    (see `_publish_pane_change_keys`).  That handoff is a one-shot freshness
+    handshake, not a plain cache — `snapshot_all` uses the keys only if this
+    call produced them since the last snapshot.
+    """
+    try:
+        output = await run_tmux("list-panes", "-a", "-F", _PANE_FORMAT)
+    except (RuntimeError, FileNotFoundError):
+        _publish_pane_change_keys({})
+        return {}, {}
+
+    paths: dict[str, str] = {}
+    change_keys: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split("\t", _PANE_FIELD_MAXSPLIT)
+        if len(parts) != _PANE_FIELD_COUNT:
+            continue
+        (
+            name,
+            window_active,
+            pane_active,
+            window_activity,
+            pane_id,
+            pane_width,
+            pane_height,
+            path,
+        ) = parts
+        if window_active != "1" or pane_active != "1":
+            continue
+        if not name:
+            continue
+        if path:
+            paths[name] = path
+        # Only record a key when every component is present.  A partially
+        # empty key would compare equal across a real change.
+        if window_activity and pane_id and pane_width and pane_height:
+            change_keys[name] = "|".join(
+                (window_activity, pane_id, pane_width, pane_height)
+            )
+    _publish_pane_change_keys(change_keys)
+    return paths, change_keys
+
+
 async def list_session_paths() -> dict[str, str]:
     """Return {session_name: active-pane cwd} for all sessions.
 
-    ONE subprocess per call:
-        tmux list-panes -a -F '#{session_name}\\t#{window_active}\\t#{pane_active}\\t#{pane_current_path}'
-    keeping only rows where both the window and the pane are active (the
-    session's "current" pane). Sessions whose row can't be parsed are simply
-    omitted. Returns {} when tmux is unavailable.
+    Thin wrapper over `list_session_panes()` (which also returns snapshot
+    change keys) for callers that only want the cwd map.
 
-    Note: the cwd is split off with maxsplit on the FIRST three tabs, so paths
-    containing tabs survive; session names containing tabs do not (tmux itself
-    barely tolerates those).
+    Note: the cwd is split off with maxsplit on the LAST tab boundary before
+    it, so paths containing tabs survive; session names containing tabs do not
+    (tmux itself barely tolerates those).
     """
-    try:
-        output = await run_tmux(
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{window_active}\t#{pane_active}\t#{pane_current_path}",
-        )
-    except (RuntimeError, FileNotFoundError):
-        return {}
-
-    paths: dict[str, str] = {}
-    for line in output.splitlines():
-        parts = line.split("\t", 3)
-        if len(parts) != 4:
-            continue
-        name, window_active, pane_active, path = parts
-        if window_active != "1" or pane_active != "1":
-            continue
-        if name and path:
-            paths[name] = path
+    paths, _ = await list_session_panes()
     return paths
 
 
@@ -331,22 +411,151 @@ def resolve_git_repo(cwd: str) -> str | None:
 _SNAPSHOT_CONCURRENCY = 32
 
 
-async def snapshot_all(names: list[str]) -> dict[str, str]:
-    """Capture all sessions concurrently and return a name→text mapping.
+# --- Change-detected snapshots (plan item 1.2c) ----------------------------
+#
+# Force a full capture sweep every Kth cycle regardless of change keys.  This
+# is a CORRECTNESS BACKSTOP, not an optimization: it caps any undiscovered way
+# a pane's visible content can change without moving the composite key at ONE
+# refresh interval (K x 2 s = 30 s), while still removing ~93% of the spawns.
+# Do not raise it casually and do not remove it.
+_SNAPSHOT_FULL_EVERY = 15
+
+# Change key of the pane as it was when its cached snapshot was captured.
+# Keyed by session name; only ever holds live sessions.
+_snapshot_keys: dict[str, str] = {}
+# Cycle counter driving the _SNAPSHOT_FULL_EVERY backstop.
+_snapshot_cycle: int = 0
+
+# --- Pane-key handoff (one-shot freshness handshake) -----------------------
+#
+# `list_session_panes` produces the change keys; `snapshot_all` consumes them.
+# They are passed through module state rather than an argument so that the
+# poll cycle's call shape (`snapshot_all(names)`) is unchanged.
+#
+# The FRESH flag is the safety property, and it is why this is a handshake and
+# not a cache: keys are usable ONLY if they were produced since the last
+# snapshot.  Consuming them clears the flag, so a `snapshot_all` that is not
+# immediately preceded by a `list_session_panes` in the same cycle sees no keys
+# and captures everything.  That makes call-ordering mistakes fail toward
+# capturing (a wasted fork) instead of toward a stale tile.
+_pane_change_keys: dict[str, str] = {}
+_pane_change_keys_fresh: bool = False
+
+
+def _publish_pane_change_keys(change_keys: dict[str, str]) -> None:
+    """Hand a freshly-measured change-key map to the next `snapshot_all`."""
+    global _pane_change_keys, _pane_change_keys_fresh
+    _pane_change_keys = change_keys
+    _pane_change_keys_fresh = True
+
+
+def _take_pane_change_keys() -> dict[str, str] | None:
+    """Consume the published keys; None when none were published since last use."""
+    global _pane_change_keys_fresh
+    if not _pane_change_keys_fresh:
+        return None
+    _pane_change_keys_fresh = False
+    return _pane_change_keys
+
+
+def reset_snapshot_change_tracking() -> None:
+    """Clear the change-detection bookkeeping (cached keys + cycle counter).
+
+    Exists for tests and for any caller that needs the next `snapshot_all` to
+    behave as a cold start.  Does not touch the snapshot cache itself.
+    """
+    global _snapshot_keys, _snapshot_cycle, _pane_change_keys, _pane_change_keys_fresh
+    _snapshot_keys = {}
+    _snapshot_cycle = 0
+    _pane_change_keys = {}
+    _pane_change_keys_fresh = False
+
+
+# Sentinel distinguishing "caller said nothing" (use the published keys, if
+# fresh) from an explicit `change_keys=None` (capture everything).
+_USE_PUBLISHED_KEYS: dict[str, str] = {}
+
+
+async def snapshot_all(
+    names: list[str],
+    change_keys: dict[str, str] | None = _USE_PUBLISHED_KEYS,
+) -> dict[str, str]:
+    """Capture sessions concurrently and return a name→text mapping.
+
+    CHANGE-DETECTED CAPTURE (item 1.2c).  *change_keys* normally comes from
+    the immediately preceding `list_session_panes()` (which costs no extra
+    spawn) via the freshness handshake — callers pass nothing.  When keys are
+    available, a session is SKIPPED —
+    its previous snapshot reused verbatim from the module cache — only when all
+    of these hold:
+
+      * it has a cached snapshot from a previous cycle (a NEW session always
+        captures), and
+      * its change key is KNOWN (an absent/unparseable key always captures),
+        and
+      * that key is byte-identical to the key recorded when the cached snapshot
+        was taken (any change in output time, active pane, or pane size
+        captures), and
+      * this is not the every-`_SNAPSHOT_FULL_EVERY`th backstop cycle.
+
+    Every ambiguous case resolves toward capturing: a missed capture is a
+    user-visible stale tile, an extra capture is a wasted fork.  When no keys
+    are available — none published, stale handshake, tmux query failed, or an
+    explicit ``change_keys=None`` — EVERY session is captured, exactly as
+    before this item.
 
     Concurrency is bounded to _SNAPSHOT_CONCURRENCY simultaneous
-    `capture-pane` subprocesses; the total number of captures is still exactly
-    one per name. When len(names) <= _SNAPSHOT_CONCURRENCY the behavior is
-    identical to an unbounded gather.
+    `capture-pane` subprocesses.  When the number of sessions actually being
+    captured is <= _SNAPSHOT_CONCURRENCY the behavior is identical to an
+    unbounded gather.
 
     Uses asyncio.gather with return_exceptions=True so that individual
     failures do not abort the whole batch.  Failed sessions map to ''.
 
-    Note: this function does not mutate module state — it does not update the module cache.
-    Callers are responsible for passing the result to update_session_cache.
+    Note: this function does not update the snapshot cache — callers pass the
+    result to `update_session_cache`.  It DOES maintain its own change-key
+    bookkeeping (`_snapshot_keys`), pruned to *names* on every call.
     """
+    global _snapshot_cycle, _snapshot_keys
+
+    if change_keys is _USE_PUBLISHED_KEYS:
+        change_keys = _take_pane_change_keys()
+    else:
+        # An explicit argument still consumes the handshake, so a later
+        # keyless call can't pick up keys measured before this one.
+        _take_pane_change_keys()
+
     if not names:
+        _snapshot_keys = {}
         return {}
+
+    _snapshot_cycle += 1
+    force_all = change_keys is None or (_snapshot_cycle % _SNAPSHOT_FULL_EVERY == 0)
+
+    cached = _snapshots
+    reused: dict[str, str] = {}
+    to_capture: list[str] = []
+    for name in names:
+        key = None if change_keys is None else change_keys.get(name)
+        if (
+            not force_all
+            and key  # unknown/unparseable key -> capture (fail safe)
+            and name in cached  # new session -> capture
+            and _snapshot_keys.get(name) == key
+        ):
+            reused[name] = cached[name]
+        else:
+            to_capture.append(name)
+
+    # Carry forward the keys of everything we are reusing; captured sessions
+    # get their (new) key recorded below, but only if the capture succeeded.
+    next_keys: dict[str, str] = {n: _snapshot_keys[n] for n in reused}
+
+    if not to_capture:
+        _snapshot_keys = next_keys
+        return reused
+
+    names = to_capture
 
     # Created per call, not at module import: an asyncio.Semaphore binds to the
     # event loop that first awaits it, and the test suite runs many separate
@@ -362,10 +571,21 @@ async def snapshot_all(names: list[str]) -> dict[str, str]:
         *[_limited(name) for name in names],
         return_exceptions=True,
     )
-    snapshots: dict[str, str] = {}
+    snapshots: dict[str, str] = dict(reused)
     for name, result in zip(names, results):
         if isinstance(result, BaseException):
             snapshots[name] = ""
-        else:
-            snapshots[name] = result
+            # Deliberately do NOT record a key for a failed capture: leaving it
+            # absent makes the next cycle retry instead of caching the '' until
+            # the pane happens to change.
+            continue
+        snapshots[name] = result
+        key = None if change_keys is None else change_keys.get(name)
+        # An empty capture is also treated as "don't trust it": `capture_pane`
+        # swallows RuntimeError and returns '' , so '' is indistinguishable
+        # from a failed spawn.  Not recording the key costs one recapture per
+        # cycle for a genuinely blank pane and removes a staleness hole.
+        if key and result:
+            next_keys[name] = key
+    _snapshot_keys = next_keys
     return snapshots
