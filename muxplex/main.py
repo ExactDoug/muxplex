@@ -1307,6 +1307,33 @@ def _ttyd_is_listening() -> bool:
         return False
 
 
+async def _relay_until_either_ends(*coros) -> None:
+    """Run the two relay directions and return as soon as EITHER one finishes.
+
+    ``asyncio.gather`` waits for BOTH, but the client→upstream direction blocks
+    in ``await websocket.receive()`` until the browser sends a frame or
+    disconnects.  If the upstream (ttyd / remote peer) dies while an idle tab is
+    open, gather would keep the handler task, both coroutines, the accepted
+    browser WebSocket and the upstream connection resident indefinitely — one
+    stranded connection per idle tab per ttyd restart.
+
+    So: wait for FIRST_COMPLETED, then cancel the survivor and await it, so no
+    pending task is left behind (which would trade one leak for another).
+    Cancellation raises CancelledError *inside* the relay coroutine; that is a
+    BaseException, so the relays' ``except Exception`` handlers do not catch it
+    and no spurious "relay closed" log is emitted.  ``gather(...,
+    return_exceptions=True)`` absorbs it here, so this helper never raises and
+    the caller's ``finally:`` close logic always runs.
+    """
+    tasks = [asyncio.create_task(c) for c in coros]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _ws_auth_check(websocket: WebSocket) -> bool:
     """Return True if the WebSocket caller is authorized.
 
@@ -1400,7 +1427,7 @@ async def terminal_ws_proxy(websocket: WebSocket) -> None:
                 except Exception as exc:
                     _log.debug("ws relay closed (ttyd_to_client): %s", exc)
 
-            await asyncio.gather(client_to_ttyd(), ttyd_to_client())
+            await _relay_until_either_ends(client_to_ttyd(), ttyd_to_client())
     except Exception as exc:
         _log.debug("ws proxy closed: %s", exc)
     finally:
@@ -1526,7 +1553,7 @@ async def federation_terminal_ws_proxy(websocket: WebSocket, device_id: str) -> 
                 except Exception as exc:
                     _log.debug("federation ws relay closed (remote_to_client): %s", exc)
 
-            await asyncio.gather(client_to_remote(), remote_to_client())
+            await _relay_until_either_ends(client_to_remote(), remote_to_client())
     except Exception as exc:
         _log.debug("federation ws proxy closed: %s", exc)
     finally:

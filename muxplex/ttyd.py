@@ -46,6 +46,24 @@ _active_process: asyncio.subprocess.Process | None = None
 # ---------------------------------------------------------------------------
 
 
+async def _wait_for_exit(pid: int, timeout: float) -> bool:
+    """Poll every 0.1 s for up to *timeout* seconds waiting for *pid* to exit.
+
+    Returns True as soon as the process is observed gone (ProcessLookupError, or
+    PermissionError — the PID was recycled by another user, so *our* process is
+    gone either way).  Returns False if the process is still alive when the
+    deadline passes.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return True
+        await asyncio.sleep(0.1)
+    return False
+
+
 def _kill_pids_on_port(port: int, sig: int) -> bool:
     """Find and signal all processes listening on *port* via lsof.
 
@@ -93,7 +111,11 @@ async def kill_ttyd() -> bool:
         If the file content is not a valid integer, removes the file and returns
         False.  Checks whether the process is alive via ``os.kill(pid, 0)``.  If
         already gone (ProcessLookupError), cleans up and proceeds.  Otherwise
-        sends SIGTERM and polls every 0.1 s for up to 2 s.
+        sends SIGTERM and polls every 0.1 s for up to 2 s.  If the process is
+        still alive after that, escalates to SIGKILL (to the SAME single PID —
+        never a process group) and confirms death for a further 0.5 s.  The PID
+        file is then removed either way; a survivor is still reachable via
+        Strategy 2.
 
     Strategy 2 — port-based fallback:
         After the PID-file kill, finds and kills any process still listening on
@@ -132,17 +154,43 @@ async def kill_ttyd() -> bool:
                 pid = None
             else:
                 # Process is alive — ask it to terminate.
+                #
+                # SINGLE-PID DISCIPLINE (do NOT widen): the signal goes to this
+                # one ttyd PID.  Never os.killpg, never a process group, never
+                # the tmux server — a group kill here destroys the user's live
+                # tmux sessions and everything running inside them (upstream
+                # issue #7).
                 os.kill(pid, signal.SIGTERM)
 
                 # Poll up to 2 s for the process to exit.
-                deadline = time.time() + 2.0
-                while time.time() < deadline:
+                if not await _wait_for_exit(pid, 2.0):
+                    # Wedged: SIGTERM ignored or the process is stuck.  Escalate
+                    # to SIGKILL (same single PID) so the port is actually
+                    # released — otherwise the next spawn_ttyd cannot bind.
+                    _log.warning(
+                        "ttyd pid %d did not exit 2 s after SIGTERM — escalating "
+                        "to SIGKILL",
+                        pid,
+                    )
                     try:
-                        os.kill(pid, 0)
+                        os.kill(pid, signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
-                        break
-                    await asyncio.sleep(0.1)
+                        pass  # exited in the gap, or not ours to signal
+                    else:
+                        if not await _wait_for_exit(pid, 0.5):
+                            _log.error(
+                                "ttyd pid %d still present after SIGKILL "
+                                "(unkillable/zombie); removing stale PID file "
+                                "anyway",
+                                pid,
+                            )
 
+                # The PID file is removed unconditionally: whether or not the
+                # process died, a PID file for a process we have already
+                # SIGTERMed+SIGKILLed is stale, and leaving it behind is worse
+                # than removing it.  (Enforced by
+                # test_kill_ttyd_removes_pid_file.)  Any survivor is still
+                # reachable via the port-based fallback below.
                 TTYD_PID_PATH.unlink(missing_ok=True)
                 killed = True
                 pid = None  # noqa: F841 (intentional)

@@ -3,8 +3,11 @@ Tests for coordinator/ttyd.py — ttyd process lifecycle management.
 All 11 acceptance-criteria tests are defined here.
 """
 
+import asyncio
 import signal
 from unittest.mock import AsyncMock, MagicMock, patch
+
+_real_asyncio_sleep = asyncio.sleep
 
 import pytest
 
@@ -192,6 +195,144 @@ async def test_kill_ttyd_handles_process_already_dead():
         "PID file should be removed when process was already dead"
     )
     assert ttyd_mod._active_process is None
+
+
+# ---------------------------------------------------------------------------
+# kill_ttyd SIGKILL escalation (plan item 3.2)
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """Virtual clock so the 2 s SIGTERM poll costs no real wall time.
+
+    Patched over ``muxplex.ttyd.time.time`` and ``muxplex.ttyd.asyncio.sleep``:
+    each awaited sleep advances the clock instead of blocking.
+    """
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def time(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        # Still yield to the loop (using the real sleep captured at import
+        # time) so patching does not starve anything else on the loop.
+        await _real_asyncio_sleep(0)
+
+
+async def test_kill_ttyd_escalates_to_sigkill_when_sigterm_ignored():
+    """A process that ignores SIGTERM is SIGKILLed — to the same single PID.
+
+    Also asserts the PID file is still removed (deliberate behaviour: a PID
+    file for a process we have already tried to kill is stale either way).
+    """
+    pid_path = ttyd_mod.TTYD_PID_PATH
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("12345")
+
+    clock = _FakeClock()
+    kill_calls: list[tuple[int, int]] = []
+    dead = {"yes": False}
+
+    def mock_os_kill(pid: int, sig: int) -> None:
+        kill_calls.append((pid, sig))
+        if sig == 0:
+            # Alive until SIGKILL lands; SIGTERM is ignored entirely.
+            if dead["yes"]:
+                raise ProcessLookupError
+            return
+        if sig == signal.SIGKILL:
+            dead["yes"] = True
+
+    with (
+        patch("os.kill", side_effect=mock_os_kill),
+        patch("muxplex.ttyd.time.time", clock.time),
+        patch("muxplex.ttyd.asyncio.sleep", clock.sleep),
+    ):
+        result = await kill_ttyd()
+
+    assert result is True
+
+    sigterms = [(p, s) for p, s in kill_calls if s == signal.SIGTERM]
+    sigkills = [(p, s) for p, s in kill_calls if s == signal.SIGKILL]
+    assert len(sigterms) == 1, "exactly one SIGTERM should be sent"
+    assert len(sigkills) == 1, "SIGTERM timeout must escalate to exactly one SIGKILL"
+    assert sigterms[0][0] == 12345
+    assert sigkills[0][0] == 12345, "SIGKILL must target the same single PID"
+
+    # Single-PID discipline: nothing may be signalled other than PID 12345,
+    # and never a negative PID (which would be a process-group kill and would
+    # take out the user's tmux server — upstream issue #7).
+    assert all(pid == 12345 for pid, _ in kill_calls), (
+        "kill_ttyd must only ever signal the one PID from the PID file"
+    )
+
+    assert not pid_path.exists(), (
+        "PID file must still be removed after the SIGKILL escalation"
+    )
+    assert ttyd_mod._active_process is None
+
+
+async def test_kill_ttyd_no_sigkill_when_sigterm_works():
+    """A process that exits on SIGTERM is never SIGKILLed."""
+    pid_path = ttyd_mod.TTYD_PID_PATH
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("12345")
+
+    clock = _FakeClock()
+    kill_calls: list[tuple[int, int]] = []
+    dead = {"yes": False}
+
+    def mock_os_kill(pid: int, sig: int) -> None:
+        kill_calls.append((pid, sig))
+        if sig == 0:
+            if dead["yes"]:
+                raise ProcessLookupError
+            return
+        if sig == signal.SIGTERM:
+            dead["yes"] = True
+
+    with (
+        patch("os.kill", side_effect=mock_os_kill),
+        patch("muxplex.ttyd.time.time", clock.time),
+        patch("muxplex.ttyd.asyncio.sleep", clock.sleep),
+    ):
+        result = await kill_ttyd()
+
+    assert result is True
+    assert not any(s == signal.SIGKILL for _, s in kill_calls), (
+        "SIGKILL must not be sent when SIGTERM already worked"
+    )
+    assert not pid_path.exists()
+
+
+async def test_kill_ttyd_removes_pid_file_even_if_sigkill_fails():
+    """An unkillable process still gets its stale PID file removed."""
+    pid_path = ttyd_mod.TTYD_PID_PATH
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("12345")
+
+    clock = _FakeClock()
+    kill_calls: list[tuple[int, int]] = []
+
+    def mock_os_kill(pid: int, sig: int) -> None:
+        # Never dies — sig=0 always succeeds.
+        kill_calls.append((pid, sig))
+
+    with (
+        patch("os.kill", side_effect=mock_os_kill),
+        patch("muxplex.ttyd.time.time", clock.time),
+        patch("muxplex.ttyd.asyncio.sleep", clock.sleep),
+    ):
+        result = await kill_ttyd()
+
+    assert result is True
+    assert any(s == signal.SIGKILL for _, s in kill_calls)
+    assert not pid_path.exists(), (
+        "PID file must be removed even when the process survives SIGKILL"
+    )
 
 
 # ---------------------------------------------------------------------------
