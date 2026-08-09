@@ -784,6 +784,17 @@ async def test_backstop_forces_a_full_sweep_every_kth_cycle():
     assert captures_per_cycle[1:-1] == [0] * (k - 2), "idle cycles capture nothing"
     assert captures_per_cycle[-1] == 2, f"cycle {k} must be a forced full sweep"
 
+    # RFR loop 2 finding: the original test stopped at cycle K, so a backstop
+    # that never released (e.g. a counter that latched instead of wrapping)
+    # would have passed while silently capturing everything forever after —
+    # reverting the whole optimization with no test failing.
+    probe = _CaptureCounter()
+    await _cycle(names, keys, probe)
+    assert len(probe.calls) == 0, (
+        f"cycle {k + 1} must resume skipping after the forced sweep — a backstop "
+        "that does not release turns every cycle into a full capture"
+    )
+
 
 async def test_change_key_bookkeeping_is_pruned_to_live_sessions():
     """Dead sessions must not accumulate keys forever."""

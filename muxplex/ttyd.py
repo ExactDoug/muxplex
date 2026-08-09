@@ -54,8 +54,12 @@ async def _wait_for_exit(pid: int, timeout: float) -> bool:
     gone either way).  Returns False if the process is still alive when the
     deadline passes.
     """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    # monotonic(), NOT time(): this is a TIMEOUT, and wall-clock time can step
+    # backwards (an NTP correction mid-poll would stretch the SIGTERM grace
+    # period past its 2 s budget) or forwards (cutting it short and escalating
+    # to SIGKILL early).  monotonic() cannot be adjusted.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
             os.kill(pid, 0)
         except (ProcessLookupError, PermissionError):
@@ -129,6 +133,16 @@ async def kill_ttyd() -> bool:
     Returns:
         True  — a process was killed (or was already dead) via either strategy.
         False — no PID file found and no process was listening on the port.
+
+    The return value means "there was something to clean up and it has been
+    dealt with" — NOT "the process is confirmed dead".  It is deliberately True
+    for an already-dead process (see
+    test_kill_ttyd_returns_true_when_process_already_gone), and it stays True in
+    the pathological case where a process survives even SIGKILL (uninterruptible
+    I/O / unreapable zombie), which is logged at ERROR.  Do not branch on this
+    value to decide whether the port is free — nothing does today, and
+    ``spawn_ttyd`` independently SIGKILLs whatever holds the port immediately
+    before binding, which is the check that actually matters.
     """
     global _active_process
 
@@ -160,7 +174,16 @@ async def kill_ttyd() -> bool:
                 # the tmux server — a group kill here destroys the user's live
                 # tmux sessions and everything running inside them (upstream
                 # issue #7).
-                os.kill(pid, signal.SIGTERM)
+                # Guarded for the same reason the SIGKILL below is: the process
+                # can exit in the window between the liveness probe above and
+                # this signal, and an unguarded ProcessLookupError would
+                # propagate out of kill_ttyd() — aborting the caller (e.g. the
+                # WS-proxy auto-spawn path) over a process that is already gone,
+                # which is precisely the outcome we wanted.
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass  # exited in the gap, or not ours to signal
 
                 # Poll up to 2 s for the process to exit.
                 if not await _wait_for_exit(pid, 2.0):

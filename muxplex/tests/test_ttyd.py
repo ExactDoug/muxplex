@@ -197,6 +197,36 @@ async def test_kill_ttyd_handles_process_already_dead():
     assert ttyd_mod._active_process is None
 
 
+async def test_kill_ttyd_survives_process_dying_between_probe_and_sigterm():
+    """The liveness probe and the SIGTERM are two syscalls with a gap.
+
+    RFR loop 2 finding. If the process exits in that window, the SIGTERM raises
+    ProcessLookupError. Unguarded, that propagated out of kill_ttyd() and
+    aborted the caller — e.g. the WS-proxy auto-spawn path would fail the
+    browser's connection — over a process that was already gone, which is
+    exactly the state we were trying to reach. The SIGKILL escalation was
+    already guarded; this closes the same hole on the SIGTERM.
+    """
+    pid_path = ttyd_mod.TTYD_PID_PATH
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("12345")
+
+    calls: list[int] = []
+
+    def fake_kill(pid, sig):
+        calls.append(sig)
+        if sig == 0 and len(calls) == 1:
+            return  # first probe: alive
+        raise ProcessLookupError  # died in the gap — SIGTERM and onward
+
+    with patch("os.kill", side_effect=fake_kill):
+        result = await kill_ttyd()  # must not raise
+
+    assert result is True
+    assert not pid_path.exists(), "stale PID file is still cleared"
+    assert signal.SIGTERM in calls, "SIGTERM was still attempted"
+
+
 # ---------------------------------------------------------------------------
 # kill_ttyd SIGKILL escalation (plan item 3.2)
 # ---------------------------------------------------------------------------
@@ -205,7 +235,7 @@ async def test_kill_ttyd_handles_process_already_dead():
 class _FakeClock:
     """Virtual clock so the 2 s SIGTERM poll costs no real wall time.
 
-    Patched over ``muxplex.ttyd.time.time`` and ``muxplex.ttyd.asyncio.sleep``:
+    Patched over ``muxplex.ttyd.time.monotonic`` and ``muxplex.ttyd.asyncio.sleep``:
     each awaited sleep advances the clock instead of blocking.
     """
 
@@ -248,7 +278,7 @@ async def test_kill_ttyd_escalates_to_sigkill_when_sigterm_ignored():
 
     with (
         patch("os.kill", side_effect=mock_os_kill),
-        patch("muxplex.ttyd.time.time", clock.time),
+        patch("muxplex.ttyd.time.monotonic", clock.time),
         patch("muxplex.ttyd.asyncio.sleep", clock.sleep),
     ):
         result = await kill_ttyd()
@@ -296,7 +326,7 @@ async def test_kill_ttyd_no_sigkill_when_sigterm_works():
 
     with (
         patch("os.kill", side_effect=mock_os_kill),
-        patch("muxplex.ttyd.time.time", clock.time),
+        patch("muxplex.ttyd.time.monotonic", clock.time),
         patch("muxplex.ttyd.asyncio.sleep", clock.sleep),
     ):
         result = await kill_ttyd()
@@ -323,7 +353,7 @@ async def test_kill_ttyd_removes_pid_file_even_if_sigkill_fails():
 
     with (
         patch("os.kill", side_effect=mock_os_kill),
-        patch("muxplex.ttyd.time.time", clock.time),
+        patch("muxplex.ttyd.time.monotonic", clock.time),
         patch("muxplex.ttyd.asyncio.sleep", clock.sleep),
     ):
         result = await kill_ttyd()
