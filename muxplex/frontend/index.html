@@ -99,6 +99,15 @@
       </div>
     </div>
     <div id="reconnect-overlay" class="reconnect-overlay hidden" aria-live="polite">Reconnecting&hellip;</div>
+    <!-- Terminal state: shown instead of an endless "Reconnecting…" when the
+         session can never come back (its process exited, so tmux destroyed it)
+         or when reconnects hit their cap. See endTerminalSession in terminal.js. -->
+    <div id="session-ended-overlay" class="reconnect-overlay session-ended-overlay hidden" role="status" aria-live="polite">
+      <div class="session-ended__box">
+        <div id="session-ended-msg" class="session-ended__msg">Session ended.</div>
+        <button id="session-ended-back" class="session-ended__back" type="button">Back to sessions</button>
+      </div>
+    </div>
   </div>
 
   <!-- ── Expanded-header pill dropdown (shared, fixed-positioned) ───────── -->

@@ -1376,3 +1376,244 @@ test('openTerminal uses passed fontSize to configure xterm.js Terminal construct
 });
 
 
+
+// ─── "Reconnecting…" infinite-loop regression (2026-08-09) ───────────────────
+//
+// Killing the process a tmux session was invoked to run destroys the tmux
+// session (`exit-empty on`). ttyd's `tmux attach -t <name>` then fails forever,
+// so the browser's WebSocket can never reopen. The reconnect path had no notion
+// of session liveness AND no attempt cap, so it retried every ~15s indefinitely
+// and the user stared at "Reconnecting…" for good.
+//
+// Two independent stops are asserted here:
+//   1. POST /connect answering 404 ("Session 'x' not found") ends the terminal.
+//   2. A hard attempt cap ends it even when nothing ever answers 404.
+
+/**
+ * Environment for the reconnect-loop tests: adds a controllable fetch mock and
+ * stub DOM nodes for the "session ended" overlay on top of the usual stubs.
+ */
+function createReconnectEnv(fetchImpl) {
+  const modulePath = join(__dirname, '..', 'terminal.js');
+  delete require.cache[require.resolve(modulePath)];
+
+  const wsInstances = [];
+  class MockWS {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 1;
+      this.binaryType = '';
+      this._handlers = {};
+      this.closeCalled = false;
+      this.sentMessages = [];
+      wsInstances.push(this);
+    }
+    addEventListener(ev, fn) { this._handlers[ev] = fn; }
+    close() { this.closeCalled = true; }
+    send(d) { this.sentMessages.push(d); }
+  }
+  MockWS.OPEN = 1;
+
+  const mockTerm = {
+    cols: 80, rows: 24,
+    open: () => {}, onData: () => {}, onResize: () => {}, loadAddon: () => {},
+    dispose: () => {}, focus: () => {}, write: () => {},
+    attachCustomKeyEventHandler: () => {}, getSelection: () => '',
+    onSelectionChange: () => {}, parser: { registerOscHandler: () => {} },
+  };
+
+  // Track overlay visibility through the classList calls terminal.js makes.
+  const overlays = {
+    'reconnect-overlay': { hidden: true },
+    'session-ended-overlay': { hidden: true },
+  };
+  function overlayEl(id) {
+    return {
+      classList: {
+        add: (c) => { if (c === 'hidden') overlays[id].hidden = true; },
+        remove: (c) => { if (c === 'hidden') overlays[id].hidden = false; },
+      },
+    };
+  }
+  const endedMsg = { textContent: '' };
+  let backClicks = 0;
+
+  // NOTE: unlike the older harnesses in this file, this container stub carries
+  // addEventListener. terminal.js's module-level attach-once IIFEs
+  // (initRightClickCopyPaste et al., contract #3) subscribe to it at require
+  // time; a bare {appendChild} throws there — which is the single root cause of
+  // this file's 27 pre-existing harness failures.
+  const container = {
+    appendChild: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    style: {},
+    classList: { add: () => {}, remove: () => {}, contains: () => false },
+    getBoundingClientRect: () => ({ top: 0, left: 0, width: 800, height: 600 }),
+  };
+
+  let pendingTimer = null;
+  const origSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, _ms) => { pendingTimer = fn; return 0; };
+
+  globalThis.WebSocket = MockWS;
+  globalThis.location = { protocol: 'http:', host: 'localhost' };
+  const fetchCalls = [];
+  globalThis.fetch = (url, opts) => {
+    fetchCalls.push({ url, opts });
+    return Promise.resolve(fetchImpl(url, opts));
+  };
+  globalThis.document = {
+    getElementById: (id) => {
+      if (id === 'terminal-container') return container;
+      if (id === 'reconnect-overlay' || id === 'session-ended-overlay') return overlayEl(id);
+      if (id === 'session-ended-msg') return endedMsg;
+      if (id === 'back-btn') return { click: () => { backClicks++; } };
+      return null;
+    },
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    addEventListener: () => {},
+    createElement: () => ({ style: {}, classList: { add: () => {}, remove: () => {} } }),
+  };
+  globalThis.window = {
+    addEventListener: () => {},
+    location: { href: '' },
+    innerWidth: 1024,
+    Terminal: function() { return mockTerm; },
+    FitAddon: { FitAddon: function() { return { fit: () => {} }; } },
+  };
+
+  require(modulePath);
+  globalThis.setTimeout = origSetTimeout;
+
+  const env = {
+    get wsInstances() { return wsInstances; },
+    get fetchCalls() { return fetchCalls; },
+    get endedVisible() { return !overlays['session-ended-overlay'].hidden; },
+    get endedMessage() { return endedMsg.textContent; },
+    get backClicks() { return backClicks; },
+    get hasPendingTimer() { return pendingTimer !== null; },
+
+    withTimeout(fn) {
+      const orig = globalThis.setTimeout;
+      globalThis.setTimeout = (cb, _ms) => { pendingTimer = cb; return 0; };
+      try { fn(); } finally { globalThis.setTimeout = orig; }
+    },
+    open(name, remoteId) {
+      env.withTimeout(() => globalThis.window._openTerminal(name, remoteId));
+    },
+    /** Fire the close handler of the most recent WebSocket. */
+    fireClose() {
+      const ws = wsInstances[wsInstances.length - 1];
+      pendingTimer = null;
+      env.withTimeout(() => { if (ws && ws._handlers['close']) ws._handlers['close'](); });
+    },
+    /** Run the pending timer callback (reconnect, or the 800ms post-/connect settle). */
+    runTimer() {
+      const fn = pendingTimer;
+      pendingTimer = null;
+      if (fn) env.withTimeout(fn);
+    },
+    /** Let the /connect fetch promise chain settle. */
+    async flush() { for (let i = 0; i < 10; i++) await Promise.resolve(); },
+    /** Drive one full close→reconnect round trip, resolving any /connect fetch. */
+    async cycle() {
+      env.fireClose();
+      env.runTimer();      // the backoff timer → connect()
+      await env.flush();   // resolve /connect if this attempt took that branch
+      if (env.hasPendingTimer) env.runTimer(); // the 800ms settle → new WS
+    },
+  };
+  return env;
+}
+
+test('POST /connect returning 404 ends the terminal instead of reconnecting forever', async () => {
+  // The tmux session was destroyed, so main.py connect_session raises
+  // 404 "Session 'x' not found". Before the fix this response was never even
+  // inspected (the fetch chain put .catch() BEFORE .then(), so the success path
+  // ran unconditionally) and the loop continued indefinitely.
+  const env = createReconnectEnv(() => ({
+    ok: false, status: 404, json: () => Promise.resolve({ detail: "Session 'dead' not found" }),
+  }));
+  env.open('dead');
+
+  // Attempt 1 reconnects directly; attempt 2 is the one that POSTs /connect.
+  await env.cycle();
+  await env.cycle();
+
+  assert.strictEqual(env.fetchCalls.length, 1, '/connect must have been POSTed once');
+  assert.match(env.fetchCalls[0].url, /\/api\/sessions\/dead\/connect$/);
+  assert.ok(env.endedVisible, 'a 404 from /connect must show the session-ended overlay');
+  assert.strictEqual(env.endedMessage, 'Session ended.');
+
+  // The decisive assertion: nothing further is scheduled, and further closes
+  // (e.g. the WS teardown we just triggered) cannot restart the loop.
+  const wsCountAfterEnd = env.wsInstances.length;
+  assert.ok(!env.hasPendingTimer, 'no reconnect may remain scheduled after the session ended');
+  await env.cycle();
+  assert.strictEqual(env.wsInstances.length, wsCountAfterEnd,
+    'no further WebSocket may be opened once the session has ended');
+  assert.strictEqual(env.fetchCalls.length, 1, 'no further /connect may be POSTed');
+});
+
+test('reconnect attempts are capped — an unanswerable session stops retrying', async () => {
+  // Safety net independent of the 404: /connect keeps succeeding but the socket
+  // never delivers data, so the terminal must still give up rather than spin.
+  const env = createReconnectEnv(() => ({
+    ok: true, status: 200, json: () => Promise.resolve({}),
+  }));
+  env.open('wedged');
+
+  for (let i = 0; i < 30; i++) {
+    await env.cycle();
+    if (env.endedVisible) break;
+  }
+
+  assert.ok(env.endedVisible, 'reconnects must be bounded — the terminal has to stop eventually');
+  assert.strictEqual(env.endedMessage, 'Lost connection to this session.');
+  assert.ok(env.wsInstances.length <= 10,
+    `retry cap must bound socket creation (created ${env.wsInstances.length})`);
+});
+
+test('federated /connect: a peer-side 404 (proxied as 502) ends the terminal', async () => {
+  // federation_connect translates any non-2xx from the peer into 502
+  // "Remote returned <code>", so a dead remote session arrives as 502/404-in-detail.
+  const env = createReconnectEnv(() => ({
+    ok: false, status: 502, json: () => Promise.resolve({ detail: 'Remote returned 404' }),
+  }));
+  env.open('gone', 'peer-1');
+
+  await env.cycle();
+  await env.cycle();
+
+  assert.match(env.fetchCalls[0].url, /\/api\/federation\/peer-1\/connect\/gone$/);
+  assert.ok(env.endedVisible, 'a proxied peer 404 must end the terminal');
+});
+
+test('federated /connect: an unreachable peer (503) keeps retrying — not "session ended"', async () => {
+  // A sick peer is transient; only the attempt cap should stop us, and the
+  // message must not falsely claim the session ended.
+  const env = createReconnectEnv(() => ({
+    ok: false, status: 503, json: () => Promise.resolve({ detail: 'Remote unreachable' }),
+  }));
+  env.open('alive', 'peer-1');
+
+  await env.cycle();
+  await env.cycle();
+
+  assert.ok(!env.endedVisible, 'a 503 from an unreachable peer must not be read as "session ended"');
+});
+
+test('opening a new session clears a previous "session ended" overlay', async () => {
+  const env = createReconnectEnv(() => ({
+    ok: false, status: 404, json: () => Promise.resolve({ detail: 'not found' }),
+  }));
+  env.open('dead');
+  await env.cycle();
+  await env.cycle();
+  assert.ok(env.endedVisible, 'precondition: overlay is showing');
+
+  env.open('fresh');
+  assert.ok(!env.endedVisible, 'openTerminal must hide the session-ended overlay');
+});

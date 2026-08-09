@@ -12,6 +12,108 @@ let _reconnectAttempts = 0; // tracks consecutive failed reconnect attempts for 
 let _searchAddon = null;
 let _resizeObserver = null;
 
+// Maximum consecutive reconnect attempts before the terminal gives up and
+// presents a terminal-state message instead of an endless "Reconnecting…".
+//
+// The backoff is 1s, 2s, 4s, 8s then a 15s cap, so 8 attempts ≈ 75s of retrying
+// — long enough to ride out a server restart, short enough that a genuinely
+// unrecoverable connection stops spinning. This is a BACKSTOP: the common case
+// (the session's process exited, so tmux destroyed the session) is caught much
+// sooner and more precisely by the 404 from /connect — see endTerminalSession.
+const MAX_RECONNECT_ATTEMPTS = 8;
+
+/**
+ * Put the terminal into a terminal (non-retrying) state with an explanation.
+ *
+ * A session whose process exits can NEVER be reconnected to — tmux destroys the
+ * session (`exit-empty on`), so `tmux attach -t <name>` fails and every ttyd we
+ * respawn dies immediately. Before this existed the close handler simply
+ * rescheduled forever and the user saw "Reconnecting…" indefinitely.
+ *
+ * Nulls _currentSession, which is the single latch every reconnect path checks
+ * (`if (!_currentSession) return;`) — so this stops both the close handler and
+ * any in-flight /connect continuation from scheduling further work.
+ *
+ * @param {string} message - user-facing explanation, e.g. "Session ended."
+ */
+function endTerminalSession(message) {
+  if (_reconnectTimer) {
+    clearTimeout(_reconnectTimer);
+    _reconnectTimer = null;
+  }
+  _currentSession = null;
+  _reconnectAttempts = 0;
+  if (_ws) {
+    try { _ws.close(); } catch (_) {}
+    _ws = null;
+  }
+  var reconnectOverlay = document.getElementById('reconnect-overlay');
+  if (reconnectOverlay) reconnectOverlay.classList.add('hidden');
+  var endedMsg = document.getElementById('session-ended-msg');
+  if (endedMsg) endedMsg.textContent = message;
+  var ended = document.getElementById('session-ended-overlay');
+  if (ended) ended.classList.remove('hidden');
+}
+
+/**
+ * Decide whether a POST /connect response proves the session is gone for good.
+ *
+ * Local sessions: `connect_session` (main.py) raises 404 "Session 'x' not found"
+ * when the name is absent from the cached session list — the poll cycle refreshes
+ * that cache every ~2s, so a session destroyed by its process exiting 404s almost
+ * immediately. That 404 is definitive.
+ *
+ * Federated sessions: the local `/api/federation/{id}/connect/{name}` proxy
+ * translates ANY non-2xx from the peer into a 502 "Remote returned <code>"
+ * (main.py federation_connect), so the peer's 404 arrives here as a 502 whose
+ * detail names the original status. A bare 502 is NOT enough — it also covers a
+ * peer that is merely unhealthy, which we want to keep retrying.
+ *
+ * Everything else (503 unreachable, 500, network error) is treated as possibly
+ * transient and left to the retry cap.
+ *
+ * @param {Response|null} res
+ * @param {string} [remoteId]
+ * @returns {Promise<boolean>} true when the session is definitively gone
+ */
+function _connectSaysSessionGone(res, remoteId) {
+  if (!res || typeof res.status !== 'number') return Promise.resolve(false);
+  if (res.status === 404) return Promise.resolve(true);
+  if (!remoteId || res.status !== 502) return Promise.resolve(false);
+  // Federated: only a peer-side 404 counts. Read the proxied detail to tell a
+  // dead remote session apart from a sick remote instance.
+  if (typeof res.json !== 'function') return Promise.resolve(false);
+  return Promise.resolve()
+    .then(function() { return res.json(); })
+    .then(function(body) {
+      var detail = body && body.detail;
+      return typeof detail === 'string' && detail.indexOf('404') !== -1;
+    })
+    .catch(function() { return false; });
+}
+
+/** Hide the "session ended" overlay (called when a new session is opened). */
+function hideSessionEndedOverlay() {
+  var ended = document.getElementById('session-ended-overlay');
+  if (ended) ended.classList.add('hidden');
+}
+
+// Attach-once listener for the ended-overlay's "Back to sessions" button
+// (contract #3: container/static-element listeners live in module-level IIFEs,
+// never inside openTerminal). Delegates to the expanded header's back button so
+// there is exactly one implementation of "return to the grid" — app.js owns it.
+(function initSessionEndedBack() {
+  if (typeof document === 'undefined' || !document.addEventListener) return;
+  document.addEventListener('click', function(e) {
+    var t = e && e.target;
+    if (!t || !t.closest) return;
+    if (!t.closest('#session-ended-back')) return;
+    hideSessionEndedOverlay();
+    var back = document.getElementById('back-btn');
+    if (back && back.click) back.click();
+  });
+})();
+
 // ─── Module-level encoding helpers ──────────────────────────────────────────
 // Hoisted here so the clipboard key handler (in openTerminal) can also use them.
 const _encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
@@ -258,6 +360,13 @@ function connectWebSocket(name, remoteId) {
       if (!_currentSession) return; // intentional close — don't reconnect
       if (reconnectOverlay) reconnectOverlay.classList.remove('hidden');
       _reconnectAttempts++;
+      // Bounded retry: never spin forever. Without this cap a session that can
+      // never be reconnected to (its tmux session was destroyed, the server is
+      // gone) left "Reconnecting…" on screen indefinitely.
+      if (_reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        endTerminalSession('Lost connection to this session.');
+        return;
+      }
       // Exponential backoff: 1s, 2s, 4s, 8s, cap at 15s. Add jitter to avoid thundering herd.
       var delay = Math.min(1000 * Math.pow(2, _reconnectAttempts - 1), 15000);
       delay += Math.random() * 500; // jitter
@@ -291,10 +400,32 @@ function connectWebSocket(name, remoteId) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       })
-        .catch(function() { return null; })
-        .then(function() {
-          // Brief delay for ttyd to bind its port after /connect spawns it
-          setTimeout(_connectWebSocket, 800);
+        // NOTE: the .catch() MUST come after the .then() below. It previously
+        // came first, which meant the success path ran unconditionally and the
+        // response was never inspected at all — a 404 ("session not found")
+        // looked exactly like a success and we respawned the WebSocket anyway,
+        // forever. fetch() only rejects on network failure; an HTTP 404 is a
+        // perfectly RESOLVED promise, so swallowing rejections was never the
+        // thing hiding the error — ignoring res.ok was.
+        .then(function(res) {
+          return _connectSaysSessionGone(res, remoteId).then(function(gone) {
+            if (gone) {
+              // The tmux session no longer exists (its process exited, so
+              // tmux's `exit-empty on` destroyed it). Every future attempt
+              // would spawn a `tmux attach` that dies instantly. Stop; explain.
+              endTerminalSession('Session ended.');
+              return null;
+            }
+            // Brief delay for ttyd to bind its port after /connect spawns it
+            _reconnectTimer = setTimeout(_connectWebSocket, 800);
+            return null;
+          });
+        })
+        .catch(function() {
+          // Network-level failure (server down, offline). Not proof the session
+          // died — retry via the normal path; the attempt cap bounds it.
+          _reconnectTimer = setTimeout(_connectWebSocket, 800);
+          return null;
         });
       return; // Don't fall through — .then() handles the WebSocket creation
     }
@@ -440,6 +571,7 @@ function openTerminal(sessionName, remoteId, fontSize) {
   // schedule a reconnect (it checks `if (!_currentSession) return;`).
   _currentSession = null;
   _reconnectAttempts = 0; // reset backoff on new session open
+  hideSessionEndedOverlay(); // clear any "Session ended." state from a prior session
 
   // Cancel any pending reconnect timer from the previous session.
   if (_reconnectTimer) {
@@ -655,6 +787,7 @@ function closeTerminal() {
   }
 
   _closeSearch();
+  hideSessionEndedOverlay();
   _currentSession = null;
   _reconnectAttempts = 0; // reset backoff on intentional close
 }
