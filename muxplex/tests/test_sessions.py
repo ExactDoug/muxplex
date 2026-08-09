@@ -3,6 +3,8 @@ Tests for coordinator/sessions.py — tmux session enumeration and helpers.
 All 6 acceptance-criteria tests are defined here.
 """
 
+import asyncio
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -264,17 +266,53 @@ def test_update_session_cache_empty_names_clears_caches():
 
 
 # ---------------------------------------------------------------------------
-# list_session_paths (universal search metadata)
+# list_session_panes / list_session_paths (search metadata + change keys)
+#
+# The batched `list-panes -a` format gained four fields in plan item 1.2c
+# (window_activity, pane_id, pane_width, pane_height).  They sit BEFORE the
+# path on purpose — see `_PANE_FORMAT`.
 # ---------------------------------------------------------------------------
+
+
+def _pane_row(
+    name,
+    path,
+    *,
+    window_active="1",
+    pane_active="1",
+    activity="1000",
+    pane_id="%1",
+    width="80",
+    height="24",
+):
+    """Build one row in the current `_PANE_FORMAT` field order."""
+    return (
+        f"{name}\t{window_active}\t{pane_active}\t{activity}\t"
+        f"{pane_id}\t{width}\t{height}\t{path}\n"
+    )
+
+
+def test_pane_format_keeps_path_last_and_maxsplit_in_sync():
+    """Structural guard for the parsing constraint.
+
+    The path is the ONLY field that may contain a TAB, so it must be the last
+    field and `maxsplit` must be exactly `field_count - 1`.  A new field added
+    after the path — or added without bumping the count — silently corrupts
+    cwd parsing.
+    """
+    fields = sessions_mod._PANE_FORMAT.split("\t")
+    assert fields[-1] == "#{pane_current_path}"
+    assert len(fields) == sessions_mod._PANE_FIELD_COUNT
+    assert sessions_mod._PANE_FIELD_MAXSPLIT == sessions_mod._PANE_FIELD_COUNT - 1
 
 
 @pytest.mark.asyncio
 async def test_list_session_paths_keeps_only_active_window_and_pane(mock_subprocess):
     out = (
-        "work\t1\t1\t/home/u/projects/work\n"
-        "work\t1\t0\t/home/u/elsewhere\n"      # inactive pane
-        "work\t0\t1\t/home/u/other-window\n"   # inactive window
-        "play\t1\t1\t/srv/play\n"
+        _pane_row("work", "/home/u/projects/work")
+        + _pane_row("work", "/home/u/elsewhere", pane_active="0")
+        + _pane_row("work", "/home/u/other-window", window_active="0")
+        + _pane_row("play", "/srv/play")
     )
     with mock_subprocess(stdout=out):
         paths = await sessions_mod.list_session_paths()
@@ -283,10 +321,18 @@ async def test_list_session_paths_keeps_only_active_window_and_pane(mock_subproc
 
 @pytest.mark.asyncio
 async def test_list_session_paths_survives_tabs_in_path(mock_subprocess):
-    out = "odd\t1\t1\t/home/u/dir\twith\ttabs\n"
+    """REGRESSION GUARD for the maxsplit constraint (item 1.2c).
+
+    Four fields were prepended to the format string; if `_PANE_FIELD_MAXSPLIT`
+    had not been bumped with them, this path would be truncated at its first
+    embedded tab.
+    """
+    out = _pane_row("odd", "/home/u/dir\twith\ttabs")
     with mock_subprocess(stdout=out):
-        paths = await sessions_mod.list_session_paths()
+        paths, keys = await sessions_mod.list_session_panes()
     assert paths == {"odd": "/home/u/dir\twith\ttabs"}
+    # ...and the change key is still parsed off the front, untouched by tabs.
+    assert keys == {"odd": "1000|%1|80|24"}
 
 
 @pytest.mark.asyncio
@@ -297,11 +343,52 @@ async def test_list_session_paths_returns_empty_when_tmux_unavailable(mock_subpr
 
 
 @pytest.mark.asyncio
+async def test_list_session_panes_returns_empty_pair_when_tmux_unavailable(
+    mock_subprocess,
+):
+    """A failed query yields NO keys — which forces a full capture sweep."""
+    with mock_subprocess(stdout="", stderr="no server running", returncode=1):
+        paths, keys = await sessions_mod.list_session_panes()
+    assert paths == {}
+    assert keys == {}
+
+
+@pytest.mark.asyncio
 async def test_list_session_paths_skips_malformed_lines(mock_subprocess):
-    out = "broken-line-without-tabs\nok\t1\t1\t/srv/ok\n"
+    out = "broken-line-without-tabs\n" + _pane_row("ok", "/srv/ok")
     with mock_subprocess(stdout=out):
         paths = await sessions_mod.list_session_paths()
     assert paths == {"ok": "/srv/ok"}
+
+
+@pytest.mark.asyncio
+async def test_list_session_panes_builds_composite_change_key(mock_subprocess):
+    out = _pane_row(
+        "work", "/srv/work", activity="1786230616", pane_id="%42", width="188",
+        height="49",
+    )
+    with mock_subprocess(stdout=out):
+        _, keys = await sessions_mod.list_session_panes()
+    assert keys == {"work": "1786230616|%42|188|49"}
+
+
+@pytest.mark.asyncio
+async def test_list_session_panes_omits_key_when_a_component_is_empty(mock_subprocess):
+    """A partially-empty key would compare equal across a real change.
+
+    Omitting it entirely makes the session UNKNOWN to the snapshot path, which
+    fails toward capturing.
+    """
+    out = (
+        _pane_row("noact", "/srv/a", activity="")
+        + _pane_row("nopane", "/srv/b", pane_id="")
+        + _pane_row("nosize", "/srv/c", width="")
+        + _pane_row("fine", "/srv/d")
+    )
+    with mock_subprocess(stdout=out):
+        paths, keys = await sessions_mod.list_session_panes()
+    assert set(paths) == {"noact", "nopane", "nosize", "fine"}
+    assert set(keys) == {"fine"}
 
 
 # ---------------------------------------------------------------------------
@@ -417,3 +504,362 @@ def test_validate_session_name_rejects_control_chars():
 def test_validate_session_name_rejects_duplicate():
     assert validate_session_name("taken", existing=["taken", "other"]) is not None
     assert validate_session_name("fresh", existing=["taken", "other"]) is None
+
+
+# ---------------------------------------------------------------------------
+# snapshot_all bounded concurrency (plan item 1.2a)
+# ---------------------------------------------------------------------------
+
+
+class _ConcurrencyProbe:
+    """capture_pane stand-in that records concurrent in-flight calls."""
+
+    def __init__(self, hold: bool = True):
+        self.current = 0
+        self.max_seen = 0
+        self.calls: list[str] = []
+        self._hold = hold
+
+    async def __call__(self, name, lines=30):
+        self.calls.append(name)
+        self.current += 1
+        self.max_seen = max(self.max_seen, self.current)
+        try:
+            if self._hold:
+                # Yield enough times that every task that *can* start does so
+                # before any finishes — otherwise a serial-looking schedule
+                # would masquerade as bounded concurrency.
+                for _ in range(5):
+                    await asyncio.sleep(0)
+            return f"output-for-{name}"
+        finally:
+            self.current -= 1
+
+
+async def test_snapshot_all_bounds_concurrency_at_large_n():
+    """N >> limit: exactly N captures, never more than the limit in flight."""
+    limit = sessions_mod._SNAPSHOT_CONCURRENCY
+    names = [f"s{i}" for i in range(limit * 4)]
+    probe = _ConcurrencyProbe()
+
+    with patch("muxplex.sessions.capture_pane", new=probe):
+        result = await snapshot_all(names)
+
+    assert len(result) == len(names)
+    assert result["s0"] == "output-for-s0"
+    # Spawn COUNT is unchanged — one capture per session, no retries, no skips.
+    assert len(probe.calls) == len(names)
+    assert sorted(probe.calls) == sorted(names)
+    assert probe.max_seen <= limit, f"observed {probe.max_seen} in flight"
+    # And it really is concurrent up to the bound, not serialized.
+    assert probe.max_seen == limit
+
+
+async def test_snapshot_all_small_n_is_fully_concurrent():
+    """N below the limit behaves exactly as the old unbounded gather did."""
+    limit = sessions_mod._SNAPSHOT_CONCURRENCY
+    names = [f"s{i}" for i in range(limit - 1)]
+    probe = _ConcurrencyProbe()
+
+    with patch("muxplex.sessions.capture_pane", new=probe):
+        result = await snapshot_all(names)
+
+    assert len(result) == len(names)
+    assert len(probe.calls) == len(names)
+    assert probe.max_seen == len(names), "small N must all be in flight at once"
+
+
+async def test_snapshot_all_failure_isolated_under_bounded_concurrency():
+    """One failing capture still maps to '' and does not abort the batch."""
+    limit = sessions_mod._SNAPSHOT_CONCURRENCY
+    names = [f"s{i}" for i in range(limit * 2)]
+    bad = names[limit + 1]
+    seen: list[str] = []
+
+    async def mock_capture(name, lines=30):
+        seen.append(name)
+        await asyncio.sleep(0)
+        if name == bad:
+            raise RuntimeError("pane not found")
+        return f"output-for-{name}"
+
+    with patch("muxplex.sessions.capture_pane", side_effect=mock_capture):
+        result = await snapshot_all(names)
+
+    assert result[bad] == ""
+    assert all(result[n] == f"output-for-{n}" for n in names if n != bad)
+    assert len(seen) == len(names)
+
+
+def test_snapshot_all_semaphore_is_not_bound_to_one_event_loop():
+    """The limiter must be per-call — module-level would bind to one loop."""
+    probe = _ConcurrencyProbe(hold=False)
+
+    async def run():
+        with patch("muxplex.sessions.capture_pane", new=probe):
+            return await snapshot_all(["a", "b"])
+
+    # Two *separate* event loops, as the wider test suite creates.
+    first = asyncio.run(run())
+    second = asyncio.run(run())
+    assert first == second == {"a": "output-for-a", "b": "output-for-b"}
+
+
+# ---------------------------------------------------------------------------
+# snapshot_all change-detected capture (plan item 1.2c)
+#
+# Composite change key: window_activity | pane_id | pane_width | pane_height.
+# HARD RULE under test: a tile must NEVER show stale content.  Every ambiguous
+# case (new session, unknown key, failed capture, backstop cycle) captures.
+# ---------------------------------------------------------------------------
+
+
+class _CaptureCounter:
+    """capture_pane stand-in recording exactly which sessions were captured."""
+
+    def __init__(self, text="fresh"):
+        self.calls: list[str] = []
+        self.text = text
+
+    async def __call__(self, name, lines=30):
+        self.calls.append(name)
+        return f"{self.text}-{name}"
+
+
+@pytest.fixture(autouse=True)
+def _reset_snapshot_change_tracking():
+    """Change tracking is process-global; isolate every test from every other."""
+    sessions_mod.reset_snapshot_change_tracking()
+    sessions_mod._snapshots = {}
+    yield
+    sessions_mod.reset_snapshot_change_tracking()
+    sessions_mod._snapshots = {}
+
+
+def _keys(names, **overrides):
+    keys = {n: f"1000|%{i}|80|24" for i, n in enumerate(names)}
+    keys.update(overrides)
+    return keys
+
+
+async def _cycle(names, keys, probe):
+    """Run one poll-cycle-shaped snapshot + cache update."""
+    with patch("muxplex.sessions.capture_pane", new=probe):
+        snaps = await snapshot_all(names, change_keys=keys)
+    update_session_cache(names, snaps)
+    return snaps
+
+
+async def test_idle_fleet_second_cycle_issues_zero_captures():
+    """Unchanged keys -> ZERO capture-pane spawns, snapshots PRESERVED."""
+    names = [f"s{i}" for i in range(5)]
+    keys = _keys(names)
+
+    probe = _CaptureCounter()
+    first = await _cycle(names, keys, probe)
+    assert len(probe.calls) == 5  # cold cache: everything captured
+
+    probe2 = _CaptureCounter(text="SHOULD-NOT-APPEAR")
+    second = await _cycle(names, keys, probe2)
+
+    assert probe2.calls == [], "an unchanged fleet must spawn no capture-pane"
+    # The critical half: reuse means the CACHED TEXT, not a blank tile.
+    assert second == first
+    assert all(v == f"fresh-{n}" for n, v in second.items())
+    assert get_snapshots() == first
+
+
+async def test_one_changed_window_activity_captures_only_that_session():
+    names = [f"s{i}" for i in range(5)]
+    keys = _keys(names)
+    await _cycle(names, keys, _CaptureCounter())
+
+    moved = dict(keys)
+    moved["s3"] = "2000|%3|80|24"  # new output in s3's active window
+    probe = _CaptureCounter(text="new")
+    result = await _cycle(names, moved, probe)
+
+    assert probe.calls == ["s3"]
+    assert result["s3"] == "new-s3"
+    assert result["s0"] == "fresh-s0"
+
+
+async def test_pane_id_change_with_identical_timestamp_captures():
+    """Active-window/pane switch changes what `-t <session>` resolves to."""
+    names = ["a", "b"]
+    keys = {"a": "1000|%1|80|24", "b": "1000|%2|80|24"}
+    await _cycle(names, keys, _CaptureCounter())
+
+    switched = dict(keys, a="1000|%9|80|24")  # same activity time, other pane
+    probe = _CaptureCounter(text="new")
+    await _cycle(names, switched, probe)
+    assert probe.calls == ["a"]
+
+
+@pytest.mark.parametrize("changed", ["1000|%1|120|24", "1000|%1|80|60"])
+async def test_resize_with_identical_timestamp_captures(changed):
+    """A resize reflows visible content with no new output."""
+    names = ["a", "b"]
+    keys = {"a": "1000|%1|80|24", "b": "1000|%2|80|24"}
+    await _cycle(names, keys, _CaptureCounter())
+
+    probe = _CaptureCounter(text="new")
+    await _cycle(names, dict(keys, a=changed), probe)
+    assert probe.calls == ["a"]
+
+
+async def test_new_session_always_captures():
+    names = ["a"]
+    keys = {"a": "1000|%1|80|24"}
+    await _cycle(names, keys, _CaptureCounter())
+
+    names2 = ["a", "brand-new"]
+    keys2 = dict(keys, **{"brand-new": "1000|%7|80|24"})
+    probe = _CaptureCounter(text="new")
+    result = await _cycle(names2, keys2, probe)
+
+    assert probe.calls == ["brand-new"], "a session with no cached snapshot must capture"
+    assert result["brand-new"] == "new-brand-new"
+
+
+async def test_unknown_or_missing_change_key_captures():
+    """Fails safe: no key from tmux -> capture, never reuse."""
+    names = ["a", "b"]
+    keys = {"a": "1000|%1|80|24", "b": "1000|%2|80|24"}
+    await _cycle(names, keys, _CaptureCounter())
+
+    probe = _CaptureCounter(text="new")
+    await _cycle(names, {"a": "1000|%1|80|24"}, probe)  # b's key went missing
+    assert probe.calls == ["b"]
+
+
+async def test_change_keys_none_captures_everything():
+    """Back-compat: callers that pass no keys get the old unconditional sweep."""
+    names = ["a", "b"]
+    keys = {"a": "1000|%1|80|24", "b": "1000|%2|80|24"}
+    await _cycle(names, keys, _CaptureCounter())
+
+    probe = _CaptureCounter(text="new")
+    with patch("muxplex.sessions.capture_pane", new=probe):
+        await snapshot_all(names)
+    assert sorted(probe.calls) == ["a", "b"]
+
+
+async def test_failed_capture_is_retried_next_cycle():
+    """A '' capture records no key, so the next cycle tries again."""
+    names = ["a"]
+    keys = {"a": "1000|%1|80|24"}
+
+    async def failing(name, lines=30):
+        return ""  # capture_pane swallows RuntimeError and returns ''
+
+    with patch("muxplex.sessions.capture_pane", side_effect=failing):
+        snaps = await snapshot_all(names, change_keys=keys)
+    update_session_cache(names, snaps)
+    assert snaps == {"a": ""}
+
+    probe = _CaptureCounter(text="new")
+    await _cycle(names, keys, probe)
+    assert probe.calls == ["a"], "a failed capture must not be cached as fresh"
+
+
+async def test_backstop_forces_a_full_sweep_every_kth_cycle():
+    """CORRECTNESS BACKSTOP: caps any undiscovered staleness hole at K cycles.
+
+    K = ``_SNAPSHOT_FULL_EVERY`` (15 x 2 s = 30 s).  Do not delete this test or
+    the backstop it guards — it is what makes change detection safe rather than
+    a bet that the composite key catches every possible mutation.
+    """
+    k = sessions_mod._SNAPSHOT_FULL_EVERY
+    names = ["a", "b"]
+    keys = {"a": "1000|%1|80|24", "b": "1000|%2|80|24"}
+
+    captures_per_cycle = []
+    for _ in range(k):
+        probe = _CaptureCounter()
+        await _cycle(names, keys, probe)
+        captures_per_cycle.append(len(probe.calls))
+
+    assert captures_per_cycle[0] == 2, "cycle 1 is a cold cache"
+    assert captures_per_cycle[1:-1] == [0] * (k - 2), "idle cycles capture nothing"
+    assert captures_per_cycle[-1] == 2, f"cycle {k} must be a forced full sweep"
+
+    # RFR loop 2 finding: the original test stopped at cycle K, so a backstop
+    # that never released (e.g. a counter that latched instead of wrapping)
+    # would have passed while silently capturing everything forever after —
+    # reverting the whole optimization with no test failing.
+    probe = _CaptureCounter()
+    await _cycle(names, keys, probe)
+    assert len(probe.calls) == 0, (
+        f"cycle {k + 1} must resume skipping after the forced sweep — a backstop "
+        "that does not release turns every cycle into a full capture"
+    )
+
+
+async def test_change_key_bookkeeping_is_pruned_to_live_sessions():
+    """Dead sessions must not accumulate keys forever."""
+    names = ["a", "b"]
+    keys = {"a": "1000|%1|80|24", "b": "1000|%2|80|24"}
+    await _cycle(names, keys, _CaptureCounter())
+    assert set(sessions_mod._snapshot_keys) == {"a", "b"}
+
+    await _cycle(["a"], {"a": "1000|%1|80|24"}, _CaptureCounter())
+    assert set(sessions_mod._snapshot_keys) == {"a"}
+
+    await _cycle([], {}, _CaptureCounter())
+    assert sessions_mod._snapshot_keys == {}
+
+
+# ---------------------------------------------------------------------------
+# Cache accessor copy semantics (plan item 2.5a)
+# ---------------------------------------------------------------------------
+
+
+def test_get_snapshots_returns_a_copy_not_the_module_global():
+    """Mutating the returned dict must not corrupt the module cache."""
+    sessions_mod._snapshots = {"a": "text-a"}
+
+    got = get_snapshots()
+    assert got is not sessions_mod._snapshots
+    got["b"] = "injected"
+    del got["a"]
+
+    assert sessions_mod._snapshots == {"a": "text-a"}
+
+
+def test_get_snapshots_copy_is_shallow():
+    """The copy shares its (immutable str) values — no deep copy of pane text."""
+    text = "a" * 64
+    sessions_mod._snapshots = {"a": text}
+
+    got = get_snapshots()
+
+    assert got["a"] is text, "pane text must not be duplicated"
+
+
+def test_update_session_cache_rebinds_rather_than_mutating():
+    """A held reference stays a consistent view of its own poll cycle."""
+    sessions_mod._snapshots = {}
+    update_session_cache(["a"], {"a": "cycle-1"})
+    held = get_snapshots()
+    before = sessions_mod._snapshots
+
+    update_session_cache(["a"], {"a": "cycle-2"})
+
+    assert held == {"a": "cycle-1"}, "old reference must not see the new cycle"
+    assert before == {"a": "cycle-1"}, "update must rebind, not mutate in place"
+    assert get_snapshots() == {"a": "cycle-2"}
+
+
+def test_get_session_list_and_paths_return_copies():
+    """The other two accessors copy for the same reason (documented, unchanged)."""
+    sessions_mod._session_list = ["a"]
+    sessions_mod._session_paths = {"a": "/x"}
+
+    names = get_session_list()
+    paths = sessions_mod.get_session_paths()
+    names.append("injected")
+    paths["b"] = "/y"
+
+    assert sessions_mod._session_list == ["a"]
+    assert sessions_mod._session_paths == {"a": "/x"}

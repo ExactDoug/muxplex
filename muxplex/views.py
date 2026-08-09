@@ -123,7 +123,9 @@ def visible_count(
 # ---------------------------------------------------------------------------
 
 
-def normalize_session_keys(settings: dict, sessions: list[dict]) -> dict:
+def normalize_session_keys_tracked(
+    settings: dict, sessions: list[dict]
+) -> tuple[dict, bool]:
     """Upgrade bare-name entries in stored keys to `device_id:name` form.
 
     Pre-v2 stored entries used bare `name` strings. v2 stores
@@ -138,7 +140,13 @@ def normalize_session_keys(settings: dict, sessions: list[dict]) -> dict:
     `prune_stale_keys` (Phase 4). Duplicate entries (including duplicates
     created by the upgrade itself) are collapsed to the first occurrence.
 
-    Mutates and returns *settings*.
+    Mutates *settings* and returns `(settings, mutated)`.
+
+    `mutated` is True iff any stored list actually came out different from the
+    list that went in.  It is deliberately computed as a **list inequality**
+    (`upgraded != original`), not as "did any name→key lookup hit": `upgrade()`
+    also collapses pre-existing duplicates, which is a real mutation with zero
+    key upgrades.  A lookup-based flag would silently drop that write.
     """
     # Build a name → sessionKey map from live sessions. Only sessions that
     # actually have a sessionKey contribute; bare-name live sessions are
@@ -168,14 +176,38 @@ def normalize_session_keys(settings: dict, sessions: list[dict]) -> dict:
             result.append(upgraded)
         return result
 
+    mutated = False
+
     if isinstance(settings.get("hidden_sessions"), list):
-        settings["hidden_sessions"] = upgrade(settings["hidden_sessions"])
+        original = settings["hidden_sessions"]
+        upgraded = upgrade(original)
+        # Evaluate the comparison FIRST, then OR it in — `mutated = mutated or
+        # (...)` would short-circuit and skip later lists once one is dirty,
+        # which is harmless for the flag but hides the assignment below.
+        changed = upgraded != original
+        settings["hidden_sessions"] = upgraded
+        mutated = mutated or changed
 
     for view in settings.get("views") or []:
         if isinstance(view.get("sessions"), list):
-            view["sessions"] = upgrade(view["sessions"])
+            original = view["sessions"]
+            upgraded = upgrade(original)
+            changed = upgraded != original
+            view["sessions"] = upgraded
+            mutated = mutated or changed
 
-    return settings
+    return settings, mutated
+
+
+def normalize_session_keys(settings: dict, sessions: list[dict]) -> dict:
+    """Back-compat wrapper: normalize in place and return *settings* only.
+
+    See `normalize_session_keys_tracked` for the full contract.  Callers that
+    need to know whether anything changed (e.g. to decide whether to write the
+    file) must use the tracked variant rather than serializing the dict twice
+    and diffing strings.
+    """
+    return normalize_session_keys_tracked(settings, sessions)[0]
 
 
 def enforce_mutual_exclusion(settings: dict) -> dict:

@@ -364,21 +364,58 @@ function setConnectionStatus(level) {
  * would kill+respawn the shared ttyd and disrupt the client that made the switch.
  * Skipped within RECONCILE_GRACE_MS of a local open so our own in-flight PATCH
  * isn't read back stale. Only called while a session is open (fullscreen view).
+ *
+ * The server's active session now rides ALONG WITH the poll response (the
+ * X-Muxplex-Active-* headers set by /api/sessions and /api/federation/sessions),
+ * so the common path costs ZERO extra requests — this used to issue a second
+ * GET /api/state every 2s per fullscreen tab, doubling the request rate and
+ * adding a blocking state read server-side. *viewing* is that folded hint.
+ * When no hint is available (header stripped by a proxy, or an older server)
+ * we fall back to the original GET /api/state read so convergence still
+ * happens — never silently stop reconciling.
+ * @param {{name: string|null, remoteId: string}|null} [viewing] folded server state
  * @returns {Promise<void>}
  */
-async function reconcileViewingSession() {
+async function reconcileViewingSession(viewing) {
   if (Date.now() - _lastLocalOpenAt < RECONCILE_GRACE_MS) return;
   try {
-    const res = await api('GET', '/api/state');
-    const state = await res.json();
-    const serverName = state.active_session || null;
+    let serverName, serverRid;
+    if (viewing) {
+      serverName = viewing.name || null;
+      serverRid = viewing.remoteId || '';
+    } else {
+      const res = await api('GET', '/api/state');
+      const state = await res.json();
+      serverName = state.active_session || null;
+      serverRid = state.active_remote_id || '';
+    }
     if (!serverName) return;
-    const serverRid = state.active_remote_id || '';
     if (serverName === _viewingSession && serverRid === (_viewingRemoteId || '')) return;
     await openSession(serverName, { remoteId: serverRid, skipAnimation: true, reconcileOnly: true });
   } catch (err) {
     // Non-fatal: pollSessions owns connection-status; a failed reconcile just
     // leaves local state as-is until the next poll retries.
+  }
+}
+
+/**
+ * Read the server's shared active session out of a poll response's headers.
+ * Values are percent-encoded (session names may be non-ASCII; HTTP header
+ * values are latin-1). Returns null when the headers are absent — the caller
+ * then falls back to GET /api/state.
+ * @param {Response} res
+ * @returns {{name: string|null, remoteId: string}|null}
+ */
+function readViewingHeaders(res) {
+  try {
+    const h = res && res.headers;
+    if (!h || typeof h.get !== 'function') return null;
+    const rawName = h.get('X-Muxplex-Active-Session');
+    if (rawName === null || rawName === undefined) return null;
+    const rawRid = h.get('X-Muxplex-Active-Remote-Id') || '';
+    return { name: decodeURIComponent(rawName) || null, remoteId: decodeURIComponent(rawRid) };
+  } catch (_) {
+    return null;
   }
 }
 
@@ -395,6 +432,9 @@ async function pollSessions() {
       ? '/api/federation/sessions'
       : '/api/sessions';
     const res = await api('GET', endpoint);
+    // Shared active-session state rides on the poll response headers (item 2.6)
+    // so reconcile below needs no second request.
+    const viewing = readViewingHeaders(res);
     const sessions = await res.json();
     const prev = _currentSessions;
     _currentSessions = sessions;
@@ -418,7 +458,7 @@ async function pollSessions() {
     updatePageTitle();
     // Follow cross-browser session switches: while viewing a session, adopt the
     // server's shared active_session if another client repointed the shared ttyd.
-    if (_viewMode === 'fullscreen' && _viewingSession != null) await reconcileViewingSession();
+    if (_viewMode === 'fullscreen' && _viewingSession != null) await reconcileViewingSession(viewing);
   } catch (err) {
     _pollFailCount++;
     setConnectionStatus(_pollFailCount <= 2 ? 'warn' : 'err');
@@ -1015,7 +1055,7 @@ function _resolveActiveView(activeView, views, autoViews) {
 /**
  * Render the session sidebar list. Only renders in fullscreen view.
  * Shows empty state when no sessions exist.
- * Binds click handlers on each sidebar-item to switch sessions.
+ * Click activation is delegated on #sidebar-list (bindStaticEventListeners).
  * @param {object[]} sessions
  * @param {string|null} currentSession - name of the currently active session
  * @param {string} [currentRemoteId] - remoteId of the currently active session
@@ -1029,7 +1069,32 @@ function renderSidebar(sessions, currentSession, currentRemoteId) {
   const visible = getVisibleSessions(sessions);
 
   if (visible.length === 0) {
-    list.innerHTML = '<div class="sidebar-empty">No sessions</div>';
+    // Guarded: an unconditional write here would thrash the DOM every poll cycle
+    // whenever the fullscreen sidebar is empty.
+    if (list._mxEmpty !== true) {
+      list.innerHTML = '<div class="sidebar-empty">No sessions</div>';
+      list._mxEmpty = true;
+      list._mxTrailing = undefined;
+    }
+    return;
+  }
+  list._mxEmpty = false;
+
+  var sbEpoch = _renderSettingsEpoch(isMobile());
+
+  // Per-card keyed reconciliation, FLAT path only (same scope limit as the grid): the
+  // multi-device path interleaves <h4> device headers with cards, which would need the
+  // headers keyed too.  Signature includes currentSession/currentRemoteId because
+  // `sidebar-item--active` is baked into the card's class string.
+  if (!(_serverSettings && _serverSettings.multi_device_enabled) && _canReconcile(list)) {
+    _reconcileKeyedList(
+      list,
+      visible,
+      _renderNodeKey,
+      function(session) { return _sidebarSignature(session, sbEpoch, currentSession, currentRemoteId); },
+      function(session) { return buildSidebarHTML(session, currentSession, currentRemoteId); },
+      ''
+    );
     return;
   }
 
@@ -1054,19 +1119,11 @@ function renderSidebar(sessions, currentSession, currentRemoteId) {
   }
 
   list.innerHTML = html;
+  list._mxTrailing = undefined;
 
-  // Bind click handlers on each sidebar item, passing remoteId
-  if (typeof list.querySelectorAll === 'function') {
-    list.querySelectorAll('.sidebar-item').forEach((item) => {
-      const name = item.dataset.session;
-      const remoteId = item.dataset.remoteId || '';
-      on(item, 'click', (e) => {
-        if (e.target.closest && e.target.closest('.tile-options-btn')) return;
-        if (name !== currentSession || remoteId !== (currentRemoteId ?? '')) openSession(name, { remoteId });
-      });
-    });
-  }
-
+  // Click activation is delegated once on #sidebar-list in
+  // bindStaticEventListeners (contract #3) — items are re-rendered every poll,
+  // so per-item binds here would stack without bound behind a render guard.
 }
 
 const SIDEBAR_NARROW_THRESHOLD = 960;
@@ -1999,12 +2056,201 @@ function switchView(viewName) {
   api('PATCH', '/api/state', { active_view: viewName }).catch(function() {});
 }
 
+/**
+ * Fold every NON-session input that affects tile/sidebar markup into one string.
+ * When any of these change, every tile's signature changes and every tile rebuilds.
+ * See resource-efficiency plan item 1.3 step 3.
+ * @param {boolean} mobile
+ * @returns {string}
+ */
+function _renderSettingsEpoch(mobile) {
+  var ds = getDisplaySettings();
+  return [
+    mobile ? 'm' : 'd',
+    ds.viewMode || 'auto',
+    ds.activityIndicator !== undefined ? ds.activityIndicator : 'both',
+    ds.showDeviceBadges !== false ? '1' : '0',
+    (_serverSettings && _serverSettings.multi_device_enabled) ? '1' : '0'
+  ].join('\u0001');
+}
+
+/** Stable identity for a rendered session node (sessionKey + remoteId). */
+function _renderNodeKey(session) {
+  var rid = session.remoteId != null ? String(session.remoteId) : '';
+  return (session.sessionKey || session.name || '') + '\u0000' + rid;
+}
+
+/**
+ * Signature over the RAW inputs buildTileHTML() reads.  If this is unchanged, the
+ * tile's HTML is byte-identical, so buildTileHTML — and the char-by-char ansiToHtml
+ * parse inside it — can be skipped entirely.
+ *
+ * Inputs covered: name, sessionKey, remoteId, deviceName, sessionPriority() (i.e.
+ * bell.unseen_count / seen_at / last_fired_at), snapshot (raw), and via `epoch`:
+ * isMobile(), ds.viewMode, ds.activityIndicator, ds.showDeviceBadges,
+ * _serverSettings.multi_device_enabled.  buildTileHTML's `index` argument is unused.
+ *
+ * DELIBERATELY EXCLUDED: last_activity_at.  formatTimestamp() renders it as "Ns ago",
+ * which changes every single second — including it would make the signature miss on
+ * every poll forever, silently killing this guard.  The server does not emit the field
+ * today (so the span renders empty).  If it is ever wired up, refresh .tile-meta with a
+ * separate cheap textContent pass; do NOT add it here.
+ * @param {object} session
+ * @param {string} epoch
+ * @returns {string}
+ */
+function _tileSignature(session, epoch) {
+  return [
+    session.name || '',
+    session.sessionKey || '',
+    session.remoteId != null ? String(session.remoteId) : '',
+    session.deviceName || '',
+    sessionPriority(session),
+    session.snapshot || '',
+    epoch
+  ].join('\u0001');
+}
+
+/**
+ * Signature for a sidebar card.  buildSidebarHTML differs from buildTileHTML in two
+ * ways that must be reflected here: its bell test is `bell.unseen_count > 0` (NOT
+ * sessionPriority — seen_at is irrelevant there), and `sidebar-item--active` is baked
+ * into the class string, so the active session's name+remoteId are inputs too.
+ * last_activity_at is not read by buildSidebarHTML at all.
+ * @param {object} session
+ * @param {string} epoch
+ * @param {string|null} currentSession
+ * @param {string} [currentRemoteId]
+ * @returns {string}
+ */
+function _sidebarSignature(session, epoch, currentSession, currentRemoteId) {
+  var unseen = session.bell && session.bell.unseen_count;
+  var isActive = (session.name || '') === currentSession &&
+    (session.remoteId ?? '') === (currentRemoteId ?? '');
+  return [
+    session.name || '',
+    session.sessionKey || '',
+    session.remoteId != null ? String(session.remoteId) : '',
+    session.deviceName || '',
+    (unseen && unseen > 0) ? 'bell' : 'idle',
+    isActive ? 'active' : '',
+    session.snapshot || '',
+    epoch
+  ].join('\u0001');
+}
+
+/**
+ * True when `el` is a real DOM element we can reconcile against.  Unit-test mocks
+ * expose only an `innerHTML` accessor; those fall back to the whole-list rebuild.
+ */
+function _canReconcile(el) {
+  return !!(el && typeof el.appendChild === 'function' &&
+    typeof el.insertBefore === 'function' && typeof el.removeChild === 'function' &&
+    el.children && typeof document.createElement === 'function');
+}
+
+/** Parse an HTML string into an array of top-level element nodes. */
+function _parseNodes(html) {
+  var holder = document.createElement('div');
+  holder.innerHTML = html;
+  var out = [];
+  var kids = holder.children || [];
+  for (var i = 0; i < kids.length; i++) out.push(kids[i]);
+  return out;
+}
+
+/**
+ * Keyed per-tile reconciliation (resource-efficiency plan 1.3 step 3).
+ *
+ * Rebuilds ONLY the entries whose signature changed; unchanged entries keep their
+ * existing DOM node (same object identity), so no HTML is built and ansiToHtml is
+ * never entered for them.  Handles insert / remove / reorder against the keyed set.
+ * A whole-container HTML compare was explicitly rejected: it is an AND across all N
+ * entries, so one animating session invalidates the whole grid every poll.
+ *
+ * Safe only because activation is delegated on the container (contract #3) — with
+ * per-element binds, surviving nodes would accumulate listeners without bound.
+ *
+ * @param {Element} container
+ * @param {object[]} items - ordered session objects
+ * @param {function(object):string} keyOf
+ * @param {function(object):string} sigOf
+ * @param {function(object, number):string} buildHtml
+ * @param {string} trailingHtml - static HTML appended after the keyed nodes ('' if none)
+ * @returns {number} count of entries rebuilt
+ */
+function _reconcileKeyedList(container, items, keyOf, sigOf, buildHtml, trailingHtml) {
+  var existing = Object.create(null);
+  var kids = container.children;
+  for (var i = 0; i < kids.length; i++) {
+    var node = kids[i];
+    if (node._mxKey != null) existing[node._mxKey] = node;
+  }
+
+  var desired = [];
+  var reused = Object.create(null);
+  var rebuilt = 0;
+  for (var j = 0; j < items.length; j++) {
+    var key = keyOf(items[j]);
+    var sig = sigOf(items[j]);
+    var reuse = existing[key];
+    if (reuse && reuse._mxSig === sig) {
+      // Mark the NODE as reused, not merely its key as present.  See the
+      // removal loop below for why that distinction is load-bearing.
+      reused[reuse._mxKey] = true;
+      desired.push(reuse);
+      continue;
+    }
+    var fresh = _parseNodes(buildHtml(items[j], j))[0];
+    if (!fresh) continue;
+    fresh._mxKey = key;
+    fresh._mxSig = sig;
+    desired.push(fresh);
+    rebuilt++;
+  }
+
+  // Remove any keyed node that was NOT reused.  This must key off actual reuse,
+  // NOT off "the key appears in desired" — when a tile's signature changes we
+  // build a REPLACEMENT node under the SAME key, so a key-presence test leaves
+  // the superseded node in the DOM while insertBefore adds its replacement.
+  // That produced a duplicate tile per signature change, unbounded: an active
+  // session whose snapshot changes every poll accumulated one stale node every
+  // 2 seconds (verified 1 -> 2 -> 3 nodes over three cycles). The trailing-HTML
+  // cleanup below only masks it when trailingHtml happens to change.
+  for (var k = kids.length - 1; k >= 0; k--) {
+    var old = kids[k];
+    if (old._mxKey != null && !reused[old._mxKey]) container.removeChild(old);
+  }
+
+  for (var p = 0; p < desired.length; p++) {
+    if (kids[p] !== desired[p]) container.insertBefore(desired[p], kids[p] || null);
+  }
+
+  var tail = trailingHtml || '';
+  if (container._mxTrailing !== tail) {
+    for (var t = kids.length - 1; t >= desired.length; t--) container.removeChild(kids[t]);
+    if (tail) {
+      var nodes = _parseNodes(tail);
+      for (var n = 0; n < nodes.length; n++) container.appendChild(nodes[n]);
+    }
+    container._mxTrailing = tail;
+  }
+
+  return rebuilt;
+}
+
 function renderGrid(sessions) {
   var grid = $('session-grid');
   var emptyState = $('empty-state');
   var filterBar = $('filter-bar');
 
-  // Close flyout if the targeted session no longer exists
+  // ---- GUARD-INVARIANT PROLOGUE (resource-efficiency plan 1.3 step 2) -------
+  // Everything in this block must run on EVERY call, including on future calls
+  // where a render guard short-circuits the HTML rebuild below.  Do NOT move any
+  // of it back down into the HTML-building path.
+  //
+  //   (a) Close the flyout if the session it targets no longer exists.  Depends
+  //       on the session list, not on whether any tile HTML changed.
   if (_flyoutSessionKey) {
     var flyoutStillExists = (sessions || []).some(function(s) {
       return (s.sessionKey || s.name) === _flyoutSessionKey;
@@ -2013,6 +2259,14 @@ function renderGrid(sessions) {
       closeFlyoutMenu();
     }
   }
+  //   (b) Fullscreen pill bell.  updatePillBell() reads _currentSessions[].bell
+  //       including HIDDEN sessions, which never appear in the grid HTML at all —
+  //       so a bell change on a hidden session must still repaint the badge even
+  //       when nothing in the grid changed (or when the grid is empty).
+  if (_viewMode === 'fullscreen') {
+    updatePillBell();
+  }
+  // ---- end guard-invariant prologue ----------------------------------------
 
   var visible = getVisibleSessions(sessions);
 
@@ -2025,7 +2279,12 @@ function renderGrid(sessions) {
       if (session.status === 'auth_failed') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Auth required', 'auth');
       else if (session.status === 'unreachable') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Offline', 'offline');
     });
-    if (grid) grid.innerHTML = statusTilesHtml;
+    if (grid) {
+      grid.innerHTML = statusTilesHtml;
+      // innerHTML wiped every reconciler-tracked node; keep the trailing bookkeeping
+      // consistent with what is now actually in the DOM.
+      grid._mxTrailing = statusTilesHtml;
+    }
     // Only show empty-state when there are truly no tiles at all
     if (emptyState) {
       if (statusTilesHtml) emptyState.classList.add('hidden');
@@ -2048,15 +2307,6 @@ function renderGrid(sessions) {
     ordered = mobile ? sortByPriority(visible) : visible;
   }
 
-  var html;
-  if (_gridViewMode === 'grouped') {
-    html = renderGroupedGrid(ordered, mobile);
-  } else if (_gridViewMode === 'cwd') {
-    html = renderCwdGroupedGrid(ordered, mobile);
-  } else {
-    html = ordered.map(function(session, index) { return buildTileHTML(session, index, mobile); }).join('');
-  }
-
   // Append status tiles for auth_failed and unreachable sessions.  status:empty sentinels are
   // intentionally ignored in all view modes — a remote with zero tmux sessions produces no
   // visible tile.  auth_failed and unreachable are actionable error states and are always shown.
@@ -2065,38 +2315,51 @@ function renderGrid(sessions) {
     if (session.status === 'auth_failed') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Auth required', 'auth');
     else if (session.status === 'unreachable') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Offline', 'offline');
   });
-  if (grid) grid.innerHTML = html + statusTilesHtml;
+
+  // SCOPE LIMIT: per-tile keyed reconciliation applies to FLAT mode only.  The grouped
+  // and cwd modes interleave <h3> group headers with tiles in one flat string; keyed
+  // reconciliation there would need the headers keyed too, plus their own insert /
+  // remove / reorder handling.  They keep the whole-grid rebuild.  (Plan item 1.3.)
+  var isFlatMode = (_gridViewMode !== 'grouped' && _gridViewMode !== 'cwd');
+  if (grid && isFlatMode && _canReconcile(grid)) {
+    var epoch = _renderSettingsEpoch(mobile);
+    _reconcileKeyedList(
+      grid,
+      ordered,
+      _renderNodeKey,
+      function(session) { return _tileSignature(session, epoch); },
+      function(session, index) { return buildTileHTML(session, index, mobile); },
+      statusTilesHtml
+    );
+  } else if (grid) {
+    var html;
+    if (_gridViewMode === 'grouped') {
+      html = renderGroupedGrid(ordered, mobile);
+    } else if (_gridViewMode === 'cwd') {
+      html = renderCwdGroupedGrid(ordered, mobile);
+    } else {
+      html = ordered.map(function(session, index) { return buildTileHTML(session, index, mobile); }).join('');
+    }
+    grid.innerHTML = html + statusTilesHtml;
+    // Whole-grid rebuild dropped every reconciler-tracked node; force the flat path to
+    // rebuild from scratch the next time it runs.
+    grid._mxTrailing = undefined;
+  }
 
   // Clear filter bar (filtered mode removed; bar is a no-op for flat/grouped)
   if (filterBar) filterBar.innerHTML = '';
 
-  // Bind interaction handlers on each tile
-  document.querySelectorAll('.session-tile').forEach(function(tile) {
-    // Select mode: reapply the selection highlight across poll re-renders
-    if (_selectMode && tile.dataset && _selectedKeys[tile.dataset.sessionKey || tile.dataset.session]) {
-      tile.classList.add('session-tile--selected');
-    }
-    on(tile, 'click', (e) => {
-      // Don't navigate when clicking the options button inside the tile
-      if (e.target.closest && e.target.closest('.tile-options-btn')) return;
-      // Don't open error/status tiles (unreachable, auth_failed)
-      if (tile.classList.contains('source-tile--error') || !tile.dataset.session) return;
-      // Select mode: click toggles selection instead of opening
-      if (_selectMode) { _toggleTileSelection(tile); return; }
-      openSession(tile.dataset.session, { remoteId: tile.dataset.remoteId || '' });
-    });
-    on(tile, 'keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        // Don't open error/status tiles (unreachable, auth_failed)
-        if (tile.classList.contains('source-tile--error') || !tile.dataset.session) return;
-        if (_selectMode) { _toggleTileSelection(tile); return; }
-        openSession(tile.dataset.session, { remoteId: tile.dataset.remoteId || '' });
+  // Select mode: reapply the selection highlight.  Reused (skipped) tiles keep the
+  // class naturally now that their DOM node survives, but freshly rebuilt tiles and
+  // the whole-grid grouped/cwd paths still need it, so the loop stays.
+  // (Click/keydown activation is delegated once on #session-grid in
+  //  bindStaticEventListeners — see contract #3; never bind per-tile here.)
+  if (_selectMode) {
+    document.querySelectorAll('.session-tile').forEach(function(tile) {
+      if (tile.dataset && _selectedKeys[tile.dataset.sessionKey || tile.dataset.session]) {
+        tile.classList.add('session-tile--selected');
       }
     });
-  });
-
-  if (_viewMode === 'fullscreen') {
-    updatePillBell();
   }
 
   // Reapply view mode layout after grid HTML is rebuilt
@@ -3627,6 +3890,16 @@ function _setViewingSession(name) {
   _viewingSession = name;
 }
 
+/** Test-only helper: set _lastLocalOpenAt (the reconcile grace window). */
+function _setLastLocalOpenAt(ts) {
+  _lastLocalOpenAt = ts;
+}
+
+/** Test-only helper: read _viewingSession directly. */
+function _getViewingSession() {
+  return _viewingSession;
+}
+
 /** Test-only helper: set _viewingRemoteId directly. */
 function _setViewingRemoteId(rid) {
   _viewingRemoteId = rid;
@@ -3646,7 +3919,23 @@ var _expandedPillsModel = null;   // last built model (slim sessions)
 var _expandedPillsAlloc = null;   // last per-group inline counts
 var _expandedPillMenuFor = null;  // open dropdown key ('view:i'|'overflow:i'|'other') or null
 var _pillMeasureEl = null;        // offscreen measurement container
-var _pillWidthCache = {};         // pill HTML -> measured width
+var _pillWidthCache = {};         // normalized pill signature -> measured width
+var _pillWidthCacheSize = 0;      // tracked separately (Object.keys() is O(n))
+var PILL_WIDTH_CACHE_MAX = 500;   // hard ceiling; cleared wholesale when exceeded
+
+/**
+ * Normalize a pill's HTML into a cache key (resource-efficiency plan item 4.2).
+ *
+ * Keying on the raw HTML made the key space (views × names × bell states × session
+ * COUNTS) — every time a view gained or lost a session, every one of its pills minted
+ * a permanent new entry, so the cache only ever grew.  The measurement depends on the
+ * rendered TEXT LENGTH, not on a count's exact value, and digits are equal-width in
+ * the UI font, so every digit maps to '0': a view's pill is measured once per
+ * count-digit-width (1-9, 10-99, …) instead of once per count.
+ */
+function _epWidthCacheKey(html) {
+  return String(html).replace(/[0-9]/g, '0');
+}
 
 var EP_GAP = 6; // must match .expanded-pills CSS gap
 
@@ -3909,7 +4198,8 @@ function _epMenuItemHTML(s) {
  * expands everything, which is harmless there.
  */
 function _epMeasureWidth(html) {
-  if (_pillWidthCache[html] != null) return _pillWidthCache[html];
+  var cacheKey = _epWidthCacheKey(html);
+  if (_pillWidthCache[cacheKey] != null) return _pillWidthCache[cacheKey];
   if (!_pillMeasureEl) {
     if (!document.body || typeof document.createElement !== 'function') return 0;
     _pillMeasureEl = document.createElement('div');
@@ -3925,7 +4215,12 @@ function _epMeasureWidth(html) {
   _pillMeasureEl.innerHTML = html;
   var el = _pillMeasureEl.firstElementChild;
   var w = (el && el.offsetWidth) || 0;
-  _pillWidthCache[html] = w;
+  if (_pillWidthCacheSize >= PILL_WIDTH_CACHE_MAX) {
+    _pillWidthCache = {};
+    _pillWidthCacheSize = 0;
+  }
+  if (_pillWidthCache[cacheKey] == null) _pillWidthCacheSize++;
+  _pillWidthCache[cacheKey] = w;
   return w;
 }
 
@@ -4446,6 +4741,20 @@ function toggleSelectMode() {
 /** Exit select mode (Done button / Escape). */
 function exitSelectMode() {
   if (_selectMode) toggleSelectMode();
+}
+
+/**
+ * Activate a session tile (click or Enter/Space).  Shared by the delegated
+ * click and keydown handlers registered on #session-grid in
+ * bindStaticEventListeners.  Reads _selectMode at call time.
+ */
+function _activateTile(tile) {
+  // Don't open error/status tiles (unreachable, auth_failed)
+  if (tile.classList && tile.classList.contains('source-tile--error')) return;
+  if (!tile.dataset || !tile.dataset.session) return;
+  // Select mode: activation toggles selection instead of opening
+  if (_selectMode) { _toggleTileSelection(tile); return; }
+  openSession(tile.dataset.session, { remoteId: tile.dataset.remoteId || '' });
 }
 
 /** Toggle one tile's membership in the grid selection. */
@@ -5874,6 +6183,44 @@ function bindStaticEventListeners() {
     openFlyoutMenu(optionsBtn);
   });
 
+  // Session tile activation — delegated (tiles are re-rendered each poll).
+  // Binding per-tile inside renderGrid would stack a fresh closure per render
+  // the moment anything skips the innerHTML rebuild (contract #3).
+  var sessionGridEl = $('session-grid');
+  if (sessionGridEl && typeof sessionGridEl.addEventListener === 'function') {
+    sessionGridEl.addEventListener('click', function(e) {
+      var tile = e.target.closest && e.target.closest('.session-tile');
+      if (!tile) return;
+      // Don't navigate when clicking the options button inside the tile
+      if (e.target.closest('.tile-options-btn')) return;
+      _activateTile(tile);
+    });
+    sessionGridEl.addEventListener('keydown', function(e) {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      var tile = e.target.closest && e.target.closest('.session-tile');
+      if (!tile) return;
+      _activateTile(tile);
+    });
+  }
+
+  // Sidebar item activation — delegated (items are re-rendered each poll).
+  // The active session is read at EVENT time from _viewingSession /
+  // _viewingRemoteId; the old per-item binds closed over renderSidebar's
+  // currentSession/currentRemoteId arguments, which a delegated handler cannot.
+  var sidebarListDelegate = $('sidebar-list');
+  if (sidebarListDelegate && typeof sidebarListDelegate.addEventListener === 'function') {
+    sidebarListDelegate.addEventListener('click', function(e) {
+      if (e.target.closest && e.target.closest('.tile-options-btn')) return;
+      var item = e.target.closest && e.target.closest('.sidebar-item');
+      if (!item || !item.dataset) return;
+      var name = item.dataset.session;
+      var remoteId = item.dataset.remoteId || '';
+      if (name !== _viewingSession || remoteId !== (_viewingRemoteId ?? '')) {
+        openSession(name, { remoteId: remoteId });
+      }
+    });
+  }
+
   on($('back-btn'), 'click', closeSession);
 
   // View pills — single click activates that view (delegated; pills re-render)
@@ -6522,9 +6869,13 @@ if (typeof module !== 'undefined' && module.exports) {
     updatePillBell,
     openSession,
     closeSession,
+    reconcileViewingSession,
+    readViewingHeaders,
     _findZoomTile,
     _clearZoomTileStyles,
     _setViewingSession,
+    _getViewingSession,
+    _setLastLocalOpenAt,
     handleGlobalKeydown,
     bindStaticEventListeners,
     openBottomSheet,
@@ -6594,6 +6945,7 @@ if (typeof module !== 'undefined' && module.exports) {
     allocateExpandedPills,
     renderExpandedHeaderPills,
     _epMenuItemHTML,
+    _epWidthCacheKey,
     _epMenuSessions,
     _epToggleMenu,
     _epCloseMenu,
@@ -6607,6 +6959,7 @@ if (typeof module !== 'undefined' && module.exports) {
     bulkAddToViewsOp,
     bulkHideOp,
     toggleSelectMode,
+    _activateTile,
     exitSelectMode,
     // Manage Views settings tab
     renderViewsSettingsTab,

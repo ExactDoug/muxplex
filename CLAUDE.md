@@ -76,6 +76,18 @@ uv run muxplex serve         # http://127.0.0.1:8088 — settings from ~/.config
 - `uv run` installs the project editable: frontend files in `muxplex/frontend/` are
   served live — a browser refresh picks up edits, no restart needed (backend `.py`
   changes DO need a restart).
+- **For a long-lived server, invoke `.venv/bin/muxplex serve` directly** (or use the
+  systemd unit). `uv run` leaves a **~30 MB supervisor process** resident for the whole
+  lifetime of the server — more than half the server's own ~58 MB RSS, for no runtime
+  benefit once the environment is resolved. `uv run` remains the right call for one-shot
+  commands and tests. Measured 2026-08-08; see
+  `docs/plans/2026-08-08-resource-efficiency-plan.md` item 5.1.
+- **Stopping a foreground `serve` leaves no orphan** as of the Phase 0/1 efficiency work:
+  ttyd is spawned with `start_new_session=True` (so it survives the spawning HTTP
+  request) and therefore does NOT receive the Ctrl-C SIGINT; the lifespan shutdown now
+  SIGTERMs it explicitly. That kill is deliberately **single-PID** — it detaches the tmux
+  client, sessions and panes keep running. Never widen it to a process-group or
+  cgroup-wide kill (that is upstream issue #7, which destroys hosted sessions).
 - **Browser caching gotcha:** assets are served with `?v=<package version>` and no
   `Cache-Control` header. Same version ⇒ browsers replay cached JS without
   revalidating. When testing frontend changes, hard-refresh (`Ctrl+Shift+R`) or bump
@@ -86,14 +98,31 @@ uv run muxplex serve         # http://127.0.0.1:8088 — settings from ~/.config
 ## Tests
 
 ```bash
-uv run pytest -q -m "not integration"          # Python suite (~1320 tests)
-node muxplex/frontend/tests/test_app.mjs       # frontend app logic (~470 tests)
-node muxplex/frontend/tests/test_terminal.mjs  # terminal/xterm contracts
+uv run pytest -q -m "not integration"              # Python suite (~1382 tests)
+node muxplex/frontend/tests/test_app.mjs           # frontend app logic (497 tests)
+node muxplex/frontend/tests/test_terminal.mjs      # terminal/xterm contracts
+node muxplex/frontend/tests/test_mobile_keyboard.mjs # mobile keybar (8 tests)
 ```
 
-⚠️ `test_terminal.mjs` has **27 pre-existing harness failures** (WebSocket/DOM mock
-environment issues — "onData is registered exactly once" etc.). They are NOT
-regressions; diff failing test names against a clean checkout before blaming a change.
+⚠️ **Two pre-existing failures — NOT regressions.** Diff failing test names against a
+clean checkout before blaming a change.
+- `test_terminal.mjs`: **27 harness failures**, all from one root cause —
+  `container.addEventListener is not a function` at `terminal.js:733` during module
+  require (DOM-stub gap in the mock, not product code).
+- `test_frontend_html.py::test_html_settings_panels_use_data_tab`: expects 5
+  `.settings-panel` elements, finds 6 — the Mouse Lab harness (v0.9.6.dev2) added a
+  sixth panel and the assertion was never updated.
+
+**Test isolation:** `muxplex/tests/conftest.py` redirects every state/config path
+(`STATE_PATH`, `SETTINGS_PATH`, `PRUNING_STATE_PATH`, `IDENTITY_PATH`, `TTYD_PID_PATH`)
+to `tmp_path`. Before it existed, a new test file wrote to the **real**
+`~/.config/muxplex` — which has destroyed saved views. The 22 older modules still carry
+their own equivalent autouse fixtures; those layer on top and win. Do not remove either.
+
+**`bells.py` mocking gotcha:** `bells.py` does `from muxplex.sessions import run_tmux` at
+import time, so it holds its own reference — patching `muxplex.sessions.run_tmux` does
+NOT intercept the bell path and your test will spawn **real tmux processes**. Patch
+`muxplex.bells.run_tmux`.
 
 ## Architecture quick map
 

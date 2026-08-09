@@ -2,6 +2,7 @@
 Comprehensive tests for the WebSocket proxy in muxplex/main.py.
 """
 
+import asyncio
 import inspect
 import threading
 import time
@@ -118,6 +119,30 @@ class FakeTtydWs:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
         return False
+
+
+
+class HoldOpenTtydWs(FakeTtydWs):
+    """FakeTtydWs whose upstream stream stays open until explicitly released.
+
+    Needed for any test that drives the browser→upstream direction: the proxy
+    now tears down as soon as EITHER direction ends (plan item 3.4), so a fake
+    whose message stream exhausts immediately would close the relay before the
+    browser ever sends.  A real ttyd keeps its stream open.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._release = threading.Event()
+
+    async def _async_gen(self):
+        while not self._release.is_set():
+            await asyncio.sleep(0.01)
+        return
+        yield  # pragma: no cover — makes this an async generator
+
+    def release(self):
+        self._release.set()
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +307,7 @@ def test_ws_bearer_auth_accepted(monkeypatch):
 
 def test_browser_text_relayed_to_ttyd(monkeypatch):
     """Text message from browser is forwarded to ttyd via FakeTtydWs.send()."""
-    fake_ws = FakeTtydWs()
+    fake_ws = HoldOpenTtydWs()
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
@@ -295,7 +320,7 @@ def test_browser_text_relayed_to_ttyd(monkeypatch):
 
 def test_browser_bytes_relayed_to_ttyd(monkeypatch):
     """Binary message from browser is forwarded to ttyd via FakeTtydWs.send()."""
-    fake_ws = FakeTtydWs()
+    fake_ws = HoldOpenTtydWs()
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
@@ -388,7 +413,7 @@ def test_ttyd_unreachable_closes_browser_ws(monkeypatch):
 def test_concurrent_ws_sessions(monkeypatch):
     """Two simultaneous proxy sessions relay to separate FakeTtydWs instances."""
     # Create two separate FakeTtydWs instances, one per connection
-    ws_pool = [FakeTtydWs(), FakeTtydWs()]
+    ws_pool = [HoldOpenTtydWs(), HoldOpenTtydWs()]
     call_count = 0
     lock = threading.Lock()
 
@@ -458,4 +483,111 @@ def test_federation_ws_proxy_uses_ssl_context_for_wss():
     assert "ssl" in source and ("CERT_NONE" in source or "ssl_context" in source), (
         "Federation WS proxy must configure an SSL context (CERT_NONE / ssl_context) "
         "for self-signed cert support on wss:// connections"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plan item 3.4 — FIRST_COMPLETED teardown
+#
+# The proxy used to `asyncio.gather(client_to_ttyd(), ttyd_to_client())`, which
+# waits for BOTH.  `client_to_ttyd` blocks in `await websocket.receive()` until
+# the browser acts, so if ttyd died while an idle tab was open the handler task,
+# both coroutines, the accepted browser WS and the upstream connection all
+# stayed resident — one stranded connection per idle tab per ttyd restart.
+# ---------------------------------------------------------------------------
+
+
+def _run_with_deadline(fn, timeout: float = 5.0):
+    """Run *fn* in a daemon thread; return (finished, box) where box holds results."""
+    box: dict = {}
+
+    def _target():
+        try:
+            fn(box)
+        except Exception as exc:  # noqa: BLE001 — recorded, asserted on by caller
+            box["exc"] = exc
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+    return (not thread.is_alive()), box
+
+
+def test_upstream_end_tears_down_proxy_while_browser_is_idle(monkeypatch):
+    """When ttyd ends first, the proxy must tear down without waiting on the browser.
+
+    The browser never sends a frame, so `client_to_ttyd` is parked in
+    `websocket.receive()`.  With `gather` the handler would hang forever and the
+    browser would never see a close frame; with FIRST_COMPLETED it is cancelled
+    and the handler returns.
+    """
+    fake_ws = FakeTtydWs(responses=[])  # upstream exhausts immediately
+    monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
+
+    def body(box):
+        with _make_authed_client() as c:
+            with c.websocket_connect("/terminal/ws") as ws:
+                # Deliberately send NOTHING — this is the idle-tab case.
+                box["frame"] = ws.receive()
+
+    finished, box = _run_with_deadline(body)
+
+    assert finished, (
+        "proxy did not tear down after the upstream ended — the browser-side "
+        "receive() is still parked (regression: gather instead of FIRST_COMPLETED)"
+    )
+    frame = box.get("frame")
+    assert frame is not None and frame.get("type") == "websocket.close", (
+        f"expected a close frame from the proxy, got {frame!r} / {box.get('exc')!r}"
+    )
+    assert fake_ws._closed, "upstream connection must be closed on teardown"
+
+
+def test_client_disconnect_still_closes_both_sides(monkeypatch):
+    """Normal case unchanged: browser closes the tab → both sides are closed.
+
+    Here the *upstream* is the survivor that must be cancelled.
+    """
+    fake_ws = HoldOpenTtydWs()
+    monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
+
+    def body(box):
+        with _make_authed_client() as c:
+            with c.websocket_connect("/terminal/ws") as ws:
+                ws.send_text("ping")
+                _wait_for(lambda: "ping" in fake_ws.sent)
+            # Context exit disconnects the browser.
+            box["sent"] = list(fake_ws.sent)
+            box["closed"] = _wait_for(lambda: fake_ws._closed)
+
+    finished, box = _run_with_deadline(body)
+
+    assert finished, "client-disconnect teardown hung"
+    assert box.get("exc") is None, f"unexpected error: {box.get('exc')!r}"
+    assert "ping" in box.get("sent", []), "relay must still work in the normal case"
+    assert box.get("closed"), (
+        "upstream must be closed after the browser disconnects (the still-running "
+        "upstream reader must be cancelled, not awaited forever)"
+    )
+
+
+def test_ws_proxies_use_first_completed_not_gather():
+    """Both proxies must not fall back to gather()-ing the two relay directions."""
+    from muxplex.main import _relay_until_either_ends, federation_terminal_ws_proxy
+
+    for fn in (terminal_ws_proxy, federation_terminal_ws_proxy):
+        source = inspect.getsource(fn)
+        assert "asyncio.gather(" not in source, (
+            f"{fn.__name__} must not gather() both relay directions — gather waits "
+            "for BOTH and strands idle connections when the upstream dies"
+        )
+        assert "_relay_until_either_ends(" in source, (
+            f"{fn.__name__} must use the FIRST_COMPLETED relay helper"
+        )
+
+    helper_src = inspect.getsource(_relay_until_either_ends)
+    assert "FIRST_COMPLETED" in helper_src
+    assert ".cancel()" in helper_src, "the survivor must be cancelled"
+    assert "return_exceptions=True" in helper_src, (
+        "the cancelled task must be awaited so no pending task is left behind"
     )

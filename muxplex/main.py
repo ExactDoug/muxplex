@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from typing import Literal
 
 import httpx
@@ -34,7 +35,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
-from starlette.responses import RedirectResponse
+from starlette.responses import RedirectResponse, Response
 
 from muxplex.auth import (
     AuthMiddleware,
@@ -79,7 +80,11 @@ from muxplex.settings import (
     save_settings,
 )
 from muxplex.pruning import load_pruning_state, save_pruning_state
-from muxplex.views import normalize_session_keys, prune_stale_keys, rename_session_key
+from muxplex.views import (
+    normalize_session_keys_tracked,
+    prune_stale_keys,
+    rename_session_key,
+)
 from muxplex.identity import load_device_id
 from muxplex.ttyd import kill_orphan_ttyd, kill_ttyd, spawn_ttyd, TTYD_PORT
 
@@ -100,6 +105,18 @@ _log = logging.getLogger(__name__)
 _poll_task: asyncio.Task | None = None
 _federation_client: httpx.AsyncClient | None = None
 _settings_sync_counter: int = 0
+
+# Monotonic counter bumped once per completed poll cycle.  It is part of the
+# /api/sessions payload cache key so a cached body can never outlive the cycle
+# that produced it, even for inputs the key does not enumerate (e.g. a git repo
+# rename behind an unchanged cwd).  Staleness is therefore bounded by one poll
+# cycle -- exactly today's semantics.
+_poll_generation: int = 0
+
+# (key, body_bytes) for the last /api/sessions payload.  Serialized ONCE per
+# distinct key, so B browser tabs polling within one cycle share one build +
+# one serialization instead of doing B of each.
+_sessions_payload_cache: tuple | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -181,21 +198,38 @@ async def _sync_settings_with_remotes(
 
 async def _run_poll_cycle() -> None:
     """Perform one full poll cycle, all operations executed under state_lock."""
-    global _settings_sync_counter
+    global _settings_sync_counter, _poll_generation
     async with state_lock:
+        # Bump INSIDE the lock.  Bumping before acquiring it opens a window in
+        # which a request reads pre-cycle content but stamps it with the new
+        # generation.  The content-derived key members below make that harmless
+        # for anything they cover, but the generation exists precisely to bound
+        # staleness for inputs they do NOT enumerate (gitRepo resolved behind an
+        # unchanged cwd), and a pre-lock bump widens exactly that window.
+        _poll_generation += 1
         # 1. Enumerate live tmux sessions
         names = await enumerate_sessions()
         name_set = set(names)
 
-        # 2. Capture pane snapshots and update in-memory snapshot cache
-        new_snapshots = await snapshot_all(names)
-        update_session_cache(names, new_snapshots)
-
-        # 2b. Refresh active-pane cwd per session (universal search metadata)
+        # 2. Refresh active-pane cwd per session (universal search metadata).
+        #    ORDERING IS LOAD-BEARING: this must run BEFORE the snapshot step.
+        #    The same single `tmux list-panes -a` that yields the cwd map also
+        #    yields each session's snapshot CHANGE KEY (item 1.2c), which
+        #    `snapshot_all` picks up through the freshness handshake in
+        #    sessions.py.  Keys must describe the panes as they are NOW —
+        #    reusing the previous cycle's keys would make every skip decision
+        #    one cycle (2 s) stale, i.e. a visibly stale tile.  If this call
+        #    fails, no fresh keys are published and the snapshot step captures
+        #    everything.
         try:
             update_session_paths(await list_session_paths())
         except Exception:
             _log.exception("session-path refresh error")
+
+        # 2b. Capture pane snapshots (only those whose change key moved since
+        #     their cached snapshot) and update the in-memory snapshot cache.
+        new_snapshots = await snapshot_all(names)
+        update_session_cache(names, new_snapshots)
 
         # 3. Load current persisted state
         state = load_state()
@@ -297,10 +331,25 @@ async def _run_poll_cycle() -> None:
         _sessions_for_normalize = [
             {"name": _n, "sessionKey": f"{_norm_device_id}:{_n}"} for _n in names
         ]
-        _norm_before = json.dumps(_norm_settings, sort_keys=True)
-        normalize_session_keys(_norm_settings, _sessions_for_normalize)
-        _norm_after = json.dumps(_norm_settings, sort_keys=True)
-        if _norm_before != _norm_after:
+        # normalize_session_keys_tracked() reports mutation directly (list
+        # inequality per stored list, which also catches pure dedups).  It
+        # replaces a pair of throwaway json.dumps() of the WHOLE settings dict
+        # that ran every 2s purely to diff before/after — normalization touches
+        # only hidden_sessions and view["sessions"], so the full serialization
+        # was never load-bearing.
+        _norm_settings, _norm_mutated = normalize_session_keys_tracked(
+            _norm_settings, _sessions_for_normalize
+        )
+        if _norm_mutated:
+            # DELIBERATELY does NOT bump settings_updated_at (so this write does
+            # NOT win LWW and is NOT pushed to peers).  Normalization is a purely
+            # LOCAL schema migration: it rewrites legacy bare names into
+            # "<this device's id>:<name>" form.  Every peer runs the same
+            # migration against its OWN device id, so pushing our stamped keys
+            # would relabel sessions the peer owns and the two devices would
+            # ping-pong conflicting prefixes forever.  The write is idempotent
+            # (the next cycle's before/after compare is equal), so it happens
+            # once per legacy key, not every cycle.
             save_settings(_norm_settings)
     except Exception:
         _log.exception("session-key normalize cycle error")
@@ -334,15 +383,49 @@ async def _run_poll_cycle() -> None:
             _live_keys.add(_name)
             _live_keys.add(f"{_local_device_id}:{_name}")
 
+        # Snapshot the bookkeeping BEFORE the call: prune_stale_keys() mutates
+        # first_missed_at in place (and injects it if absent), so a snapshot
+        # taken afterwards would always compare equal.  A shallow dict() copy is
+        # sufficient — first_missed_at is a flat dict[str, float], and all four
+        # of prune_stale_keys()'s mutation sites (pop-on-revive, set-on-first-
+        # miss, del-on-prune, GC-of-unreferenced) add/remove/replace entries in
+        # exactly this dict, never a nested structure.
+        _prune_first_missed_before = dict(_prune_state.get("first_missed_at", {}))
+
         _prune_settings, _prune_state, _prune_changed = prune_stale_keys(
             _prune_settings,
             _live_keys,
             pruning_state=_prune_state,
             grace_seconds=_grace_seconds,
         )
-        save_pruning_state(_prune_state)
+
+        # Write pruning.json only when the BOOKKEEPING changed — NOT when
+        # _prune_changed.  _prune_changed is True only when a key was actually
+        # removed from settings, which is 1 of the 4 bookkeeping mutations.  In
+        # particular, "start the grace clock" (first_missed_at[key] = now)
+        # leaves it False; since _prune_state is re-read from disk every cycle,
+        # skipping that write would reset the clock to ~now forever and stale-key
+        # pruning would never fire again.  See plan item 2.1.
+        if dict(_prune_state.get("first_missed_at", {})) != _prune_first_missed_before:
+            save_pruning_state(_prune_state)
         if _prune_changed:
-            # Stale keys were removed — persist (triggers LWW sync on next cycle).
+            # Stale keys were removed — persist AND bump settings_updated_at so
+            # the deletion actually wins last-write-wins on the next sync cycle.
+            #
+            # save_settings() does NOT touch settings_updated_at (only
+            # patch_settings() does), so without this explicit bump the prune
+            # write lands on disk with an unchanged timestamp: it never wins
+            # LWW, is never pushed to peers, and any peer with a higher
+            # timestamp pushes the dead key straight back via
+            # apply_synced_settings() — the pruned key resurrects and
+            # ping-pongs indefinitely.
+            #
+            # No sync storm: prune_stale_keys() reports changed=True ONLY when a
+            # key was actually removed from hidden_sessions/view.sessions, and it
+            # deletes that key's first_missed_at bookkeeping at the same time, so
+            # the same key cannot be pruned twice.  Steady state (nothing stale)
+            # leaves the timestamp untouched.
+            _prune_settings["settings_updated_at"] = time.time()
             save_settings(_prune_settings)
     except Exception:
         _log.exception("stale-key prune cycle error")
@@ -417,6 +500,21 @@ async def lifespan(app: FastAPI):
                 await _poll_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+        # Kill our ttyd child.  It is spawned with start_new_session=True, so it
+        # is NOT in our process group and would otherwise outlive the server,
+        # holding TTYD_PORT, a PTY and a `tmux attach` client until the next
+        # startup sweep (kill_orphan_ttyd) reaps it.
+        #
+        # This is a single-PID SIGTERM (see plan item 3.1): the tmux SERVER is
+        # never touched, the attached session merely detaches and every pane
+        # keeps running.  Do NOT escalate this to a process-group / cgroup-wide
+        # kill — that is the mechanism behind upstream issue #7, which destroys
+        # hosted tmux sessions and everything inside them.
+        try:
+            await kill_ttyd()
+        except Exception:
+            _log.exception("ttyd shutdown kill error")
 
 
 # ---------------------------------------------------------------------------
@@ -614,24 +712,18 @@ def _session_path_fields(name: str, paths: dict[str, str]) -> dict:
     return {"cwd": cwd, "cwdLeaf": leaf, "gitRepo": resolve_git_repo(cwd)}
 
 
-@app.get("/api/sessions")
-async def get_sessions() -> list[dict]:
-    """Return list of sessions with name, sessionKey, snapshot, and bell data.
+def _build_session_items(
+    names: list[str],
+    snapshots: dict[str, str],
+    paths: dict[str, str],
+    device_id: str,
+    state: dict,
+) -> list[dict]:
+    """Build the /api/sessions payload list (name/sessionKey/snapshot/bell/paths).
 
-    sessionKey is the canonical ``device_id:name`` form — the SAME form the
-    background normalize cycle (13b) rewrites stored view/hidden entries into,
-    and the same form /api/federation/sessions tags local sessions with.
-    Without it, single-device clients stored bare names in view.sessions,
-    normalization upgraded them to canonical form server-side, and after a
-    page reload the frontend could no longer match members against live
-    sessions — views appeared empty after a hard refresh.
+    Factored out of get_sessions() so the per-cycle payload cache has exactly
+    one build path to short-circuit (and so tests can count builds).
     """
-    names = get_session_list()
-    snapshots = get_snapshots()
-    state = await read_state()
-    device_id = load_device_id()
-    paths = get_session_paths()
-
     result = []
     for name in names:
         session_state = state.get("sessions", {}).get(name, {})
@@ -645,6 +737,121 @@ async def get_sessions() -> list[dict]:
         item.update(_session_path_fields(name, paths))
         result.append(item)
     return result
+
+
+def _sessions_payload_key(
+    names: list[str],
+    snapshots: dict[str, str],
+    paths: dict[str, str],
+    device_id: str,
+    state: dict,
+) -> tuple:
+    """Content-derived cache key covering every input of the payload body.
+
+    Deliberately content-based rather than "invalidate here and there": a
+    mutation anywhere (poll cycle, bell hook, bell/clear, rename, delete)
+    necessarily changes one of these values, so the body can never go stale
+    without anyone having to remember to invalidate.
+
+    Compared with ``==``, never hashed.  CPython's ``str.__eq__`` happens to
+    check identity first, so within a single cycle the snapshot strings usually
+    compare in O(N); that is an implementation detail, not a guarantee, and
+    ACROSS cycles ``load_state``/``capture_pane`` yield fresh objects so the
+    comparison is a genuine O(N x len) value compare.  Snapshots are capped at
+    30 lines, so this is cheap either way — do not rely on the identity fast
+    path.
+
+    The bell member MUST be normalized through ``empty_bell()`` exactly as
+    ``_build_session_items`` does.  The body renders a missing bell entry as
+    ``empty_bell()`` while a raw ``.get("bell")`` would yield ``None``; keeping
+    the two representations in step by coincidence is how a future refactor of
+    one side silently desynchronizes the key from the body it claims to
+    describe.
+    """
+    sessions_state = state.get("sessions") or {}
+    return (
+        _poll_generation,
+        device_id,
+        tuple(names),
+        tuple(snapshots.get(n, "") for n in names),
+        tuple(paths.get(n) for n in names),
+        tuple(
+            (sessions_state.get(n) or {}).get("bell") or empty_bell() for n in names
+        ),
+    )
+
+
+def _json_body(payload) -> bytes:
+    """Serialize *payload* exactly as FastAPI's default JSONResponse would."""
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        indent=None,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _viewing_headers(state: dict) -> dict[str, str]:
+    """Headers carrying the shared active session (see app.js reconcile).
+
+    Folded onto the poll response so a fullscreen client no longer needs a
+    SECOND request (GET /api/state) every 2 s just to read these two fields.
+    Carried as headers rather than body fields because /api/federation/sessions
+    merges REMOTE session bodies verbatim — a body field would be overwritten
+    with the remote's notion of "active" and the client would follow the wrong
+    machine.  Values are percent-encoded (session names may be non-ASCII;
+    HTTP header values are latin-1).  These are recomputed on EVERY request
+    from freshly-read state and are intentionally NOT part of the body cache
+    key, so a session switch is reflected immediately.
+    """
+    name = state.get("active_session") or ""
+    remote_id = state.get("active_remote_id") or ""
+    return {
+        "X-Muxplex-Active-Session": urllib.parse.quote(str(name), safe=""),
+        "X-Muxplex-Active-Remote-Id": urllib.parse.quote(str(remote_id), safe=""),
+    }
+
+
+@app.get("/api/sessions")
+async def get_sessions() -> Response:
+    """Return list of sessions with name, sessionKey, snapshot, and bell data.
+
+    sessionKey is the canonical ``device_id:name`` form — the SAME form the
+    background normalize cycle (13b) rewrites stored view/hidden entries into,
+    and the same form /api/federation/sessions tags local sessions with.
+    Without it, single-device clients stored bare names in view.sessions,
+    normalization upgraded them to canonical form server-side, and after a
+    page reload the frontend could no longer match members against live
+    sessions — views appeared empty after a hard refresh.
+
+    The body is built and serialized at most ONCE per distinct input state and
+    replayed to every other client polling within the same poll cycle.
+    """
+    global _sessions_payload_cache
+    names = get_session_list()
+    snapshots = get_snapshots()
+    state = await read_state()
+    device_id = load_device_id()
+    paths = get_session_paths()
+
+    key = _sessions_payload_key(names, snapshots, paths, device_id, state)
+    cached = _sessions_payload_cache
+    if cached is not None and cached[0] == key:
+        body = cached[1]
+    else:
+        body = _json_body(
+            _build_session_items(names, snapshots, paths, device_id, state)
+        )
+        # Single atomic rebind of a fully-built tuple — a concurrent request
+        # either sees the old complete entry or the new one, never a partial.
+        _sessions_payload_cache = (key, body)
+
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers=_viewing_headers(state),
+    )
 
 
 @app.post("/api/sessions")
@@ -1110,6 +1317,33 @@ def _ttyd_is_listening() -> bool:
         return False
 
 
+async def _relay_until_either_ends(*coros) -> None:
+    """Run the two relay directions and return as soon as EITHER one finishes.
+
+    ``asyncio.gather`` waits for BOTH, but the client→upstream direction blocks
+    in ``await websocket.receive()`` until the browser sends a frame or
+    disconnects.  If the upstream (ttyd / remote peer) dies while an idle tab is
+    open, gather would keep the handler task, both coroutines, the accepted
+    browser WebSocket and the upstream connection resident indefinitely — one
+    stranded connection per idle tab per ttyd restart.
+
+    So: wait for FIRST_COMPLETED, then cancel the survivor and await it, so no
+    pending task is left behind (which would trade one leak for another).
+    Cancellation raises CancelledError *inside* the relay coroutine; that is a
+    BaseException, so the relays' ``except Exception`` handlers do not catch it
+    and no spurious "relay closed" log is emitted.  ``gather(...,
+    return_exceptions=True)`` absorbs it here, so this helper never raises and
+    the caller's ``finally:`` close logic always runs.
+    """
+    tasks = [asyncio.create_task(c) for c in coros]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _ws_auth_check(websocket: WebSocket) -> bool:
     """Return True if the WebSocket caller is authorized.
 
@@ -1203,7 +1437,7 @@ async def terminal_ws_proxy(websocket: WebSocket) -> None:
                 except Exception as exc:
                     _log.debug("ws relay closed (ttyd_to_client): %s", exc)
 
-            await asyncio.gather(client_to_ttyd(), ttyd_to_client())
+            await _relay_until_either_ends(client_to_ttyd(), ttyd_to_client())
     except Exception as exc:
         _log.debug("ws proxy closed: %s", exc)
     finally:
@@ -1329,7 +1563,7 @@ async def federation_terminal_ws_proxy(websocket: WebSocket, device_id: str) -> 
                 except Exception as exc:
                     _log.debug("federation ws relay closed (remote_to_client): %s", exc)
 
-            await asyncio.gather(client_to_remote(), remote_to_client())
+            await _relay_until_either_ends(client_to_remote(), remote_to_client())
     except Exception as exc:
         _log.debug("federation ws proxy closed: %s", exc)
     finally:
@@ -1443,13 +1677,20 @@ _FEDERATION_GRACE_FAILURES = 3  # consecutive failures before marking unreachabl
 
 
 @app.get("/api/federation/sessions")
-async def federation_sessions(request: Request) -> list[dict]:
+async def federation_sessions(request: Request) -> Response:
     """Fetch sessions from all instances (local + remotes) and merge.
 
     Local sessions are tagged with deviceName (from settings) and remoteId=None.
     Remote sessions are fetched concurrently via asyncio.gather with Bearer auth
     headers. Failed remotes produce a status entry with status='unreachable' or
     status='auth_failed'.
+
+    Carries the same X-Muxplex-Active-* headers as /api/sessions so a
+    multi-device client gets the shared active session from its poll response
+    too (this is the endpoint it polls when multi_device_enabled).  The body is
+    NOT cached here: it is a merge of live per-peer HTTP results with their own
+    grace/failure bookkeeping, so a shared body would need a key covering every
+    remote's payload — materially riskier for a smaller win.  See the report.
     """
     settings = load_settings()
     local_device_name: str = settings.get("device_name", "")
@@ -1478,7 +1719,11 @@ async def federation_sessions(request: Request) -> list[dict]:
         local_sessions.append(local_item)
 
     if not remote_instances:
-        return local_sessions
+        return Response(
+            content=_json_body(local_sessions),
+            media_type="application/json",
+            headers=_viewing_headers(state),
+        )
 
     # Fetch remote sessions concurrently
     http_client: httpx.AsyncClient = request.app.state.federation_client
@@ -1573,7 +1818,11 @@ async def federation_sessions(request: Request) -> list[dict]:
     for result in remote_results:
         all_sessions.extend(result)
 
-    return all_sessions
+    return Response(
+        content=_json_body(all_sessions),
+        media_type="application/json",
+        headers=_viewing_headers(state),
+    )
 
 
 @app.post("/api/federation/generate-key")

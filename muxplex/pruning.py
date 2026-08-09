@@ -14,6 +14,7 @@ section "Stale key pruning (separate concern, local-only state)".
 """
 
 import json
+import os
 from pathlib import Path
 
 PRUNING_STATE_PATH = Path.home() / ".config" / "muxplex" / "pruning.json"
@@ -49,8 +50,15 @@ def load_pruning_state() -> dict:
 def save_pruning_state(state: dict) -> None:
     """Write pruning bookkeeping to the sidecar file.
 
-    Creates parent directories as needed.  Matches the direct-write style of
+    Creates parent directories as needed.  Matches the write style of
     save_settings (indent=2, trailing newline).
+
+    The write is ATOMIC: it goes to a sibling ``.tmp`` file which is then
+    ``os.replace``d over PRUNING_STATE_PATH (same pattern as state.save_state
+    and settings.save_settings), so a concurrent reader never observes a
+    partially-written file.  Do NOT revert to a bare write_text.
     """
     PRUNING_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PRUNING_STATE_PATH.write_text(json.dumps(state, indent=2) + "\n")
+    tmp = Path(str(PRUNING_STATE_PATH) + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n")
+    os.replace(tmp, PRUNING_STATE_PATH)

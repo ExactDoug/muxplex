@@ -178,6 +178,48 @@ def save_state(state: dict) -> None:
 # ---------------------------------------------------------------------------
 # Async wrappers — acquire state_lock before touching the file
 # ---------------------------------------------------------------------------
+#
+# These deliberately call the SYNCHRONOUS primitives on the event-loop thread.
+# Plan item 2.4 (docs/plans/2026-08-08-resource-efficiency-plan.md) proposed
+# wrapping them in ``asyncio.to_thread``; that item was MEASURED after phases
+# 0-3 landed and DELIBERATELY NOT IMPLEMENTED.  Do not "fix" this.
+#
+# Measured 2026-08-08 on this machine (native ext4, WSL2, CPython 3.11):
+#
+#   operation                          mean      p95      p99
+#   load_state()  N=20 sessions        25 us     30 us     65 us
+#   save_state()  N=20 sessions       870 us   1535 us   2282 us
+#   load_settings()                   147 us
+#   load_pruning_state()               22 us
+#
+#   blocking per event-loop second, 20 sessions / 4 browser tabs:
+#     poll cycle       0.5/s x 1217 us  =  609 us/s
+#     /api/sessions    2.0/s x   57 us  =  113 us/s
+#     heartbeat        0.8/s x  809 us  =  647 us/s
+#     TOTAL            ~1.37 ms/s  =  0.14% of wall clock
+#
+# Two facts make the change actively counterproductive rather than merely
+# unnecessary:
+#
+#  1. ``save_state`` cost is FIXED, not O(N): 898 us at N=1, 870 us at N=20,
+#     1306 us at N=100.  It is the atomic tmp-write + ``os.replace`` metadata
+#     path, not serialization.  By this plan's own scale-invariance criterion
+#     that makes it the lowest-priority kind of cost.
+#  2. An ``asyncio.to_thread`` round trip on this machine costs ~860 us mean /
+#     2093 us p95 (warm pool; 447 us/hop under 4-way concurrency) -- i.e. AS
+#     MUCH AS the entire ``save_state`` it would offload, and ~30x the cost of
+#     a ``load_state``.  Offloading would not shorten the operation; it would
+#     roughly double the wall-clock time ``state_lock`` is held (the lock must
+#     stay held across the hop to preserve write ordering), making writers
+#     serialize worse than they do today.
+#
+# What would change the answer: state.json growing by an order of magnitude
+# (so save cost is dominated by serialization and scales with N), STATE_DIR
+# living on a network/fuse mount where a write is tens of ms, or a profile
+# showing these calls as a measurable share of request latency.  Re-measure
+# before acting; do not port this from a machine with different storage.
+
+
 
 
 async def read_state() -> dict:

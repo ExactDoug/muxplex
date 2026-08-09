@@ -10,6 +10,7 @@ In-memory state:
 
 Public API:
     poll_bell_flag(session_name)             → bool
+    poll_all_bell_flags()                    → dict[str, bool]
     process_bell_flags(session_names, state) → bool
     should_clear_bell(session_name, state)   → bool
     apply_bell_clear_rule(state)             → list[str]
@@ -50,6 +51,65 @@ async def poll_bell_flag(session_name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# poll_all_bell_flags
+# ---------------------------------------------------------------------------
+
+
+async def poll_all_bell_flags() -> dict[str, bool] | None:
+    """Poll the tmux bell flag for every live session in ONE subprocess.
+
+    ONE subprocess per call:
+        tmux list-windows -a -F '#{session_name}\\t#{window_bell_flag}'
+
+    replacing one `display-message -t <name>` spawn per session.
+
+    Aggregation is **OR across all windows** of a session: a bell in ANY window
+    counts as a bell for that session.  This is deliberate.  The primary bell
+    detection path — the global `alert-bell` hook registered in main.py — reports
+    only `#{session_name}` and therefore fires for a bell in any window; OR makes
+    this fallback path consistent with it.  The old per-session
+    `display-message -t <session>` silently resolved to the session's CURRENT
+    window only, which is an accident of tmux target resolution (an incomplete
+    target is completed to the current window) rather than a design choice —
+    note `window_bell_flag` is a *window* variable and tmux has no session-level
+    bell format variable at all.
+
+    Rows are tab-delimited because session names may contain spaces
+    (`validate_session_name` rejects only '.', ':', control chars and 'dir:'),
+    following the `list_session_paths` convention.  The flag is always the last
+    field and always 0/1, so `rsplit("\\t", 1)` is the safe parse.
+
+    Returns a mapping of session_name → bool.  Sessions absent from the mapping
+    should be treated as False by callers — tmux answered, and simply did not
+    report a bell for them.
+
+    Returns **None** when the query itself failed (tmux unavailable).  That is
+    deliberately distinct from an empty mapping: a failure is "unknown", not
+    "no bells", and callers must not use it to drive 1→0 transitions.  The
+    old per-session helper could only say False here, which conflated the two;
+    with a single batched call the distinction is both cheap and necessary,
+    since one failure now covers every session at once.
+    """
+    try:
+        output = await run_tmux(
+            "list-windows", "-a", "-F", "#{session_name}\t#{window_bell_flag}"
+        )
+    except (RuntimeError, FileNotFoundError):
+        return None
+
+    flags: dict[str, bool] = {}
+    for line in output.splitlines():
+        if "\t" not in line:
+            continue
+        name, flag = line.rsplit("\t", 1)
+        if not name:
+            continue
+        # OR across the session's windows.
+        flags[name] = flags.get(name, False) or flag.strip() == "1"
+    return flags
+
+
+# ---------------------------------------------------------------------------
 # process_bell_flags
 # ---------------------------------------------------------------------------
 
@@ -79,6 +139,13 @@ async def process_bell_flags(session_names: list[str], state: dict) -> bool:
     """
     changed = False
 
+    # ONE batched tmux call for every session, instead of one spawn per session
+    # awaited sequentially.  Sessions missing from the map default to False,
+    # preserving the old per-session `except RuntimeError: return False`.
+    # (No sessions ⇒ nothing to ask tmux about; the old per-session loop spawned
+    # nothing at N=0 either, so keep that constant at zero.)
+    all_flags = await poll_all_bell_flags() if session_names else {}
+
     for name in session_names:
         # Ensure session entry and bell sub-dict exist
         if name not in state["sessions"]:
@@ -86,8 +153,17 @@ async def process_bell_flags(session_names: list[str], state: dict) -> bool:
         if "bell" not in state["sessions"][name]:
             state["sessions"][name]["bell"] = empty_bell()
 
+        # None means the query FAILED — as opposed to {} / a missing key, which
+        # mean "tmux answered: no bell".  Treating a failure as "no bell" would
+        # reset the 1→0 latch below, so a flag that is still set gets counted as
+        # a fresh 0→1 transition on the next successful poll and unseen_count
+        # over-counts.  (Nothing is ever LOST: unseen_count is never decremented
+        # here.)  Skip transition processing entirely and re-read next cycle.
+        if all_flags is None:
+            continue
+
         bell = state["sessions"][name]["bell"]
-        flag_set = await poll_bell_flag(name)
+        flag_set = all_flags.get(name, False)
         previously_seen = _bell_seen.get(name, False)
 
         if flag_set and not previously_seen:
@@ -100,6 +176,14 @@ async def process_bell_flags(session_names: list[str], state: dict) -> bool:
             # 1→0: flag cleared — reset tracking so next '1' is a new bell
             # Do NOT decrement unseen_count
             _bell_seen[name] = False
+
+    # Evict tracking for sessions that no longer exist.  _bell_seen otherwise
+    # grows for the process lifetime — every name ever seen, including keys
+    # orphaned by session rename.  session_names is the live set (it mirrors
+    # the name_set the poll cycle uses to prune persisted state).
+    live = set(session_names)
+    for stale in [name for name in _bell_seen if name not in live]:
+        del _bell_seen[stale]
 
     return changed
 
