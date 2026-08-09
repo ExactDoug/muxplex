@@ -28,3 +28,6 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# git worktrees live under ./.worktrees/ (see the worktree skill); never commit them
+.worktrees/
