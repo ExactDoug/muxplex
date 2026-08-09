@@ -5,7 +5,7 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.6.dev5**, on **`main`** — a **dev/experimental**
+improvements. Current version: **0.9.6.dev6**, on **`main`** — a **dev/experimental**
 build carrying the Mouse Lab selection-fix harness *and* the mobile terminal keybar (both
 below); last released version is **0.9.5**. All feature branches through PR #12 are
 merged and their branches/worktrees deleted — **start new work from `main`**.
@@ -21,11 +21,15 @@ panes that actually changed; measured on a live 45-session fleet as 45 captures 
 **`docs/plans/2026-08-08-resource-efficiency-plan.md`**. Contracts that came out of it are
 in "Hard-won backend contracts" below — read those before touching the poll cycle.
 
-**Next up — an OPEN BUG, not yet investigated.** Killing/exiting the process a tmux
-session was invoked to run leaves the terminal in a **"Reconnecting…" loop that never
-ends**. Pre-existing (not from #11/#12). Briefing with a concrete hypothesis, a decisive
-test, and fix directions: **`docs/plans/2026-08-09-terminal-reconnect-loop-investigation.md`**.
-Branch: `investigate/terminal-reconnect-loop`.
+**Just fixed — the "Reconnecting…" infinite loop (v0.9.6.dev6, branch
+`investigate/terminal-reconnect-loop`).** Killing/exiting the process a tmux session was
+invoked to run destroyed the tmux session, so ttyd's `tmux attach` failed forever and the
+terminal retried every ~15 s with no explanation. The hypothesis in the briefing was
+verified and correct. Fix is frontend-only — the backend was already reporting the truth
+(a 404 from `/connect`) and it was being discarded. Full write-up, including the one thing
+the briefing got wrong:
+**`docs/plans/2026-08-09-terminal-reconnect-loop-investigation.md`** (§"Verification and
+outcome"). See frontend contract #8 below.
 
 **Server:** normally run detached — `setsid nohup .venv/bin/muxplex serve >> ~/.local/state/muxplex/serve.log 2>&1 &`.
 
@@ -272,6 +276,25 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    Any future bottom-docked affordance should reuse `--keybar-lift` rather than
    re-deriving it. Details: `docs/plans/2026-07-27-mobile-terminal-keybar.md`.
 
+8. **Reconnect must be able to STOP** (v0.9.6.dev6, `terminal.js`) — a tmux session whose
+   process exits is destroyed by tmux (`exit-empty on`), so `tmux attach -t <name>` fails
+   forever and no reconnect can ever succeed. Three parts, all load-bearing:
+   (a) **`POST /connect`'s status is inspected.** A **404** (local: `connect_session`
+   raises it once the ~2 s poll cache drops the name) is definitive → end the terminal.
+   Federated sessions arrive as a **502 whose detail reads `Remote returned 404`**, because
+   `federation_connect` flattens every non-2xx from the peer into 502 — so a *bare* 502 is
+   deliberately NOT enough, or a merely-sick peer would be declared dead. 503/500/network
+   errors stay retryable. Note `fetch()` resolves on a 404: a `.catch()` was never what hid
+   this, ignoring `res.status` was. Do not "simplify" back to an unconditional `.then()`.
+   (b) **`MAX_RECONNECT_ATTEMPTS = 8`** — a cause-independent backstop. Never remove it in
+   favour of (a) alone.
+   (c) **`endTerminalSession()` nulls `_currentSession`**, the single latch every reconnect
+   path checks, and shows `#session-ended-overlay` whose Back button delegates to
+   `#back-btn` (app.js keeps sole ownership of returning to the grid). A session ending must
+   present as an explained outcome, never an indefinite spinner.
+   The 800 ms post-`/connect` settle timer is tracked in `_reconnectTimer` — keep it so, or
+   a late callback reattaches to a stale session.
+
 ## Hard-won backend contracts (2026-08-08 efficiency work; tests enforce them)
 
 Full rationale and measurements: `docs/plans/2026-08-08-resource-efficiency-plan.md`.
@@ -379,10 +402,12 @@ fails loudly rather than silently costing O(N) again.
   visible-set snapshot scoping (unsound — federation hands every local snapshot to peers
   who filter by their *own* view). The doc carries a revision log of what its own first
   draft got wrong, after adversarial review corrected four risk ratings.
-- **Terminal "Reconnecting…" loop (OPEN — next up):**
+- **Terminal "Reconnecting…" loop (FIXED — v0.9.6.dev6):**
   `docs/plans/2026-08-09-terminal-reconnect-loop-investigation.md` — killing the process
-  a session was invoked to run leaves the terminal retrying forever. Pre-existing.
-  Contains a concrete hypothesis (the reconnect path has no notion of session liveness
-  and re-POSTs `/connect` for a destroyed session every ~15 s), a decisive test to
-  confirm or kill that hypothesis, and three ranked fix directions. **Verify before
-  fixing.**
+  a session was invoked to run left the terminal retrying forever. Pre-existing; the
+  briefing's hypothesis (the reconnect path has no notion of session liveness and
+  re-POSTs `/connect` for a destroyed session every ~15 s) was **verified and correct**.
+  §"Verification and outcome" records what was confirmed, the fix (directions 1 + 2,
+  both), and the brief's one wrong claim — it blamed `.catch(() => null)`, but `fetch()`
+  resolves on a 404, so the real defect was never reading `res.status`. Distilled into
+  frontend contract #8.
