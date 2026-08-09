@@ -544,8 +544,24 @@ def test_html_settings_panels_use_data_tab() -> None:
     dialog = soup.find(id="settings-dialog")
     assert dialog is not None, "Missing #settings-dialog"
     panels = dialog.find_all(class_="settings-panel")
-    assert len(panels) == 5, (
-        f"Expected 5 .settings-panel elements, found: {len(panels)}"
+    assert panels, "Missing .settings-panel elements"
+
+    # Pin the panel<->tab CORRESPONDENCE, not a hardcoded count.  A bare count
+    # says nothing useful (5 panels and 5 buttons for different tabs would pass)
+    # and goes stale every time a tab is added or removed — it was asserting 5
+    # while the Mouse Lab harness had already made it 6, so this test failed for
+    # months without indicating any real defect.  What actually matters is that
+    # every panel is reachable by a button and every button has a panel to show:
+    # a button with no panel blanks the dialog on click, and a panel with no
+    # button is dead markup.
+    panel_tabs = [p.get("data-tab") for p in panels]
+    button_tabs = [b.get("data-tab") for b in dialog.find_all(class_="settings-tab")]
+    assert sorted(panel_tabs) == sorted(button_tabs), (
+        f"every settings panel needs a matching tab button and vice versa — "
+        f"panels: {sorted(panel_tabs)}, buttons: {sorted(button_tabs)}"
+    )
+    assert len(set(panel_tabs)) == len(panel_tabs), (
+        f"duplicate data-tab among settings panels: {panel_tabs}"
     )
     for panel in panels:
         assert panel.get("data-tab") is not None, (

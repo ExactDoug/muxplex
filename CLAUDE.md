@@ -98,20 +98,25 @@ uv run muxplex serve         # http://127.0.0.1:8088 — settings from ~/.config
 ## Tests
 
 ```bash
-uv run pytest -q -m "not integration"              # Python suite (~1382 tests)
-node muxplex/frontend/tests/test_app.mjs           # frontend app logic (497 tests)
-node muxplex/frontend/tests/test_terminal.mjs      # terminal/xterm contracts
+uv run pytest -q -m "not integration"              # Python suite (~1427 tests, all green)
+node muxplex/frontend/tests/test_app.mjs           # frontend app logic (523 tests)
+node muxplex/frontend/tests/test_terminal.mjs      # terminal/xterm contracts (26 pass / 27 fail)
 node muxplex/frontend/tests/test_mobile_keyboard.mjs # mobile keybar (8 tests)
 ```
 
-⚠️ **Two pre-existing failures — NOT regressions.** Diff failing test names against a
-clean checkout before blaming a change.
-- `test_terminal.mjs`: **27 harness failures**, all from one root cause —
-  `container.addEventListener is not a function` at `terminal.js:733` during module
-  require (DOM-stub gap in the mock, not product code).
-- `test_frontend_html.py::test_html_settings_panels_use_data_tab`: expects 5
-  `.settings-panel` elements, finds 6 — the Mouse Lab harness (v0.9.6.dev2) added a
-  sixth panel and the assertion was never updated.
+⚠️ **One pre-existing failure — NOT a regression.** `test_terminal.mjs` has **27 harness
+failures**, all from one root cause: `container.addEventListener is not a function` at
+`terminal.js:733` during module require (a DOM-stub gap in the mock, not product code).
+Diff failing test names against a clean checkout before blaming a change. Everything else
+should be green — the Python suite and the other two JS suites pass completely.
+
+**`uv run pytest` broken with `ModuleNotFoundError` / `PackageNotFoundError`?** Check
+`head -1 .venv/bin/pytest`. Venvs created before the 2026-06-17 ext4 migration have
+console-script shebangs pointing at the dead `/mnt/c/dev/...` overlay path, so the script
+runs under the wrong interpreter and cannot see the venv's packages. `uv sync` will NOT
+fix it — it audits *packages* (which are fine) and never rewrites shims. Recreate the
+venv: `rm -rf .venv && uv sync --extra dev`. Note `uv run python -m pytest` works around
+it, which makes the failure look like a test problem rather than an environment one.
 
 **Test isolation:** `muxplex/tests/conftest.py` redirects every state/config path
 (`STATE_PATH`, `SETTINGS_PATH`, `PRUNING_STATE_PATH`, `IDENTITY_PATH`, `TTYD_PID_PATH`)
