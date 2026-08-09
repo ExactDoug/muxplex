@@ -7,9 +7,29 @@ user-defined session Views.
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
 improvements. Current version: **0.9.6.dev5**, on **`main`** — a **dev/experimental**
 build carrying the Mouse Lab selection-fix harness *and* the mobile terminal keybar (both
-below); last released version is **0.9.5**. The v0.9 session-UX and mobile-keybar branches
-are merged (PRs #8, #9); `feat/v0.9-session-ux` and `agent/mobile-terminal-keyboard` are
-spent — start new work from `main`.
+below); last released version is **0.9.5**. All feature branches through PR #12 are
+merged and their branches/worktrees deleted — **start new work from `main`**.
+
+---
+
+## ⇢ CURRENT STATE (2026-08-09)
+
+**Just landed — resource efficiency (PRs #11, #12, both merged).** The poll cycle is now
+**O(1) in session count**. Per-cycle tmux spawns went `2N+2` → `N+3` → **`C+3`** where C =
+panes that actually changed; measured on a live 45-session fleet as 45 captures cold then
+**1** on the next cycle. Full design, measurements, rejected options and a revision log:
+**`docs/plans/2026-08-08-resource-efficiency-plan.md`**. Contracts that came out of it are
+in "Hard-won backend contracts" below — read those before touching the poll cycle.
+
+**Next up — an OPEN BUG, not yet investigated.** Killing/exiting the process a tmux
+session was invoked to run leaves the terminal in a **"Reconnecting…" loop that never
+ends**. Pre-existing (not from #11/#12). Briefing with a concrete hypothesis, a decisive
+test, and fix directions: **`docs/plans/2026-08-09-terminal-reconnect-loop-investigation.md`**.
+Branch: `investigate/terminal-reconnect-loop`.
+
+**Server:** normally run detached — `setsid nohup .venv/bin/muxplex serve >> ~/.local/state/muxplex/serve.log 2>&1 &`.
+
+---
 
 **v0.9 session UX (DONE on `feat/v0.9-session-ux`)** — see `CHANGELOG.md` v0.9.0–v0.9.2:
 (1) new sessions reliably auto-open (createNewSession poll now keys off the canonical
@@ -252,6 +272,50 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    Any future bottom-docked affordance should reuse `--keybar-lift` rather than
    re-deriving it. Details: `docs/plans/2026-07-27-mobile-terminal-keybar.md`.
 
+## Hard-won backend contracts (2026-08-08 efficiency work; tests enforce them)
+
+Full rationale and measurements: `docs/plans/2026-08-08-resource-efficiency-plan.md`.
+`muxplex/tests/test_poll_cycle_perf.py` pins the per-cycle spawn counts, so a regression
+fails loudly rather than silently costing O(N) again.
+
+1. **The poll cycle must stay O(1) in N.** Per cycle: 1 `list-sessions`, 1 `list-panes -a`,
+   1 `list-windows -a`, plus one `capture-pane` **only for panes that changed**. Never
+   reintroduce a per-session tmux query — that is what `2N+2` was.
+2. **Bells are ONE batched `list-windows -a`**, OR-aggregated across a session's windows,
+   TAB-delimited (session names may contain spaces). `window_bell_flag` is a *window*
+   variable; there is no session-level equivalent. Rejected and re-rejected:
+   `window_activity_flag` (alert flag, gated on `monitor-activity`),
+   `pane_unseen_changes` (copy-mode only), `session_activity` (bumps on client attach),
+   `pane_last_activity` (does not exist).
+3. **Snapshot change key is composite**: `window_activity|pane_id|pane_width|pane_height`.
+   The timestamp alone is insufficient — `capture_pane` targets `-t <session>`, which
+   resolves to the *current window's active pane*, so switching window/pane or resizing
+   changes content with no new output. **Every ambiguous branch must fail toward
+   capturing**, and the forced full sweep every 15th cycle is a correctness backstop —
+   do not remove it.
+4. **The `list-panes -a` format keeps `pane_current_path` LAST** and parses with a fixed
+   maxsplit derived from the field count, so paths containing tabs survive. New fields go
+   *before* the path.
+5. **Ordering in `_run_poll_cycle` is load-bearing:** `list_session_paths` (publishes the
+   change keys) must precede `snapshot_all` (consumes them). A one-shot freshness
+   handshake enforces it — a mis-ordered call sees no keys and captures everything, so
+   mistakes cost a fork, never a stale tile.
+6. **`kill_ttyd` is SINGLE-PID, SIGTERM → SIGKILL.** Never `killpg`, never a process
+   group, never the tmux server: a group kill destroys live sessions and everything in
+   them (upstream issue #7). Its bool return means "there was something to clean up and
+   it was dealt with" — **not** "the process is confirmed dead".
+7. **`/api/sessions` caches its serialized body under a CONTENT-derived key**, not a list
+   of invalidation sites. Bell state is mutated *outside* the poll cycle by the tmux
+   alert-bell hook, so a generation-counter-only key would delay bells by up to 2 s. Keep
+   the key derived from the payload's actual inputs.
+8. **`settings.json` / `pruning.json` writes are atomic** (tmp + `os.replace`). A torn
+   read makes `load_settings` fall back to `DEFAULT_SETTINGS` and a concurrent PATCH then
+   destroys every saved view. Never revert to a bare `write_text`.
+9. **The pruning-state write is guarded on the BOOKKEEPING changing**, not on
+   `_prune_changed`. That flag is only true when a key was *removed*, while the grace
+   clock is started by a bookkeeping-only mutation — guarding on it silently disables
+   stale-key pruning forever.
+
 ## Documentation map
 
 - `CHANGELOG.md` — user-facing release history (newest first)
@@ -304,3 +368,21 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
   enablement rationale, and the two iPhone-only bugs (rounded-corner key clipping; the
   software keyboard burying the bar) with the visual-viewport dock that fixes the second.
   See contract #7. Shipped in `CHANGELOG.md` v0.9.6.dev5.
+- **Resource efficiency (DONE — PRs #11/#12, merged 2026-08-09):**
+  `docs/plans/2026-08-08-resource-efficiency-plan.md` — the poll cycle made O(1) in N.
+  Read this before touching the poll cycle, snapshots, bells, the `/api/sessions` cache,
+  or ttyd lifecycle; the backend contracts above are its distilled output. Notable for
+  what it *declined*: async disk I/O (measured at 0.137% of wall clock — `to_thread`
+  costs more per hop than the `save_state` it would offload), ttyd `-t scrollback`
+  (verified no-op — muxplex serves its own xterm bundle and ignores ttyd's
+  SET_PREFERENCES), WS backpressure hardening (already bounded end-to-end), and
+  visible-set snapshot scoping (unsound — federation hands every local snapshot to peers
+  who filter by their *own* view). The doc carries a revision log of what its own first
+  draft got wrong, after adversarial review corrected four risk ratings.
+- **Terminal "Reconnecting…" loop (OPEN — next up):**
+  `docs/plans/2026-08-09-terminal-reconnect-loop-investigation.md` — killing the process
+  a session was invoked to run leaves the terminal retrying forever. Pre-existing.
+  Contains a concrete hypothesis (the reconnect path has no notion of session liveness
+  and re-POSTs `/connect` for a destroyed session every ~15 s), a decisive test to
+  confirm or kill that hypothesis, and three ranked fix directions. **Verify before
+  fixing.**
