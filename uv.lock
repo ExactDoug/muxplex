@@ -332,7 +332,7 @@ wheels = [
 
 [[package]]
 name = "muxplex"
-version = "0.9.6.dev6"
+version = "0.9.6.dev7"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },

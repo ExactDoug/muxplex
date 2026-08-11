@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.9.6.dev7 (2026-08-10) — dev build
+
+### Bug fixes
+
+- **The "Reconnecting…" fix from dev6 was insufficient — this is the real one.** In
+  practice a dead session still took about five reconnect attempts and ~15 seconds to give
+  up, printed `can't find session: <name>` into the terminal on every one of them, and left
+  the orphaned ttyd process running afterwards. Root cause: **ttyd is a server, not a
+  wrapper.** Started without `--once` it keeps listening and re-runs `tmux attach` for
+  *every* client that connects, so each reconnect regenerated the doomed process — a loop
+  that sustained itself entirely server-side. muxplex now kills that ttyd in the same poll
+  cycle that notices its session vanished, and refuses to respawn one for a session that no
+  longer exists. On the browser side, the reconnect counter no longer treats inbound data
+  as proof of health: tmux's error message arrives as ordinary terminal output, so the
+  *failure report* was being read as a success signal. Health is now judged by whether the
+  connection actually stayed open. A dead session ends in roughly one attempt instead of
+  five, with one line of error text instead of five.
+- **`GET /` now sends `Cache-Control: no-cache`.** The `?v=<version>` cache-buster is
+  written into `index.html`, so if that document is itself served stale the browser keeps
+  requesting the old asset URLs and a version bump does nothing. Nothing was forcing it to
+  revalidate.
+
 ## v0.9.6.dev6 (2026-08-09) — dev build
 
 ### Bug fixes

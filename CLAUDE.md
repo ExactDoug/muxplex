@@ -5,7 +5,7 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.6.dev6**, on **`main`** — a **dev/experimental**
+improvements. Current version: **0.9.6.dev7**, on **`main`** — a **dev/experimental**
 build carrying the Mouse Lab selection-fix harness *and* the mobile terminal keybar (both
 below); last released version is **0.9.5**. All feature branches through PR #12 are
 merged and their branches/worktrees deleted — **start new work from `main`**.
@@ -21,8 +21,15 @@ panes that actually changed; measured on a live 45-session fleet as 45 captures 
 **`docs/plans/2026-08-08-resource-efficiency-plan.md`**. Contracts that came out of it are
 in "Hard-won backend contracts" below — read those before touching the poll cycle.
 
-**Just fixed — the "Reconnecting…" infinite loop (v0.9.6.dev6, branch
-`investigate/terminal-reconnect-loop`).** Killing/exiting the process a tmux session was
+**Just fixed — the "Reconnecting…" infinite loop (v0.9.6.dev7, branch
+`investigate/terminal-reconnect-loop`).** The dev6 attempt was **insufficient** — it
+terminated only after ~5 cycles/~15 s, spammed the terminal with tmux errors, and left the
+doomed ttyd running. dev7 fixes the real drivers: ttyd is a *server* that re-forks
+`tmux attach` per client, so the poll cycle now reaps it and the WS proxy refuses to
+respawn for a vanished session; the reconnect counter no longer treats inbound error text
+as a health signal. See contracts #8(d), #9, #10.
+
+**(historical) The dev6 attempt.** Killing/exiting the process a tmux session was
 invoked to run destroyed the tmux session, so ttyd's `tmux attach` failed forever and the
 terminal retried every ~15 s with no explanation. The hypothesis in the briefing was
 verified and correct. Fix is frontend-only — the backend was already reporting the truth
@@ -286,14 +293,54 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    deliberately NOT enough, or a merely-sick peer would be declared dead. 503/500/network
    errors stay retryable. Note `fetch()` resolves on a 404: a `.catch()` was never what hid
    this, ignoring `res.status` was. Do not "simplify" back to an unconditional `.then()`.
-   (b) **`MAX_RECONNECT_ATTEMPTS = 8`** — a cause-independent backstop. Never remove it in
-   favour of (a) alone.
-   (c) **`endTerminalSession()` nulls `_currentSession`**, the single latch every reconnect
-   path checks, and shows `#session-ended-overlay` whose Back button delegates to
-   `#back-btn` (app.js keeps sole ownership of returning to the grid). A session ending must
-   present as an explained outcome, never an indefinite spinner.
+   (b) **`MAX_RECONNECT_ATTEMPTS = 8`** — a backstop. Never remove it in favour of (a)
+   alone. (dev6 called this "cause-independent"; it was not — it depended on the counter
+   climbing, see (d).)
+   (c) **`endTerminalSession()` nulls `_currentSession`** and shows
+   `#session-ended-overlay` whose Back button delegates to `#back-btn` (app.js keeps sole
+   ownership of returning to the grid). A session ending must present as an explained
+   outcome, never an indefinite spinner. `_currentSession` is the latch, but **a latch only
+   works if every path READS it** — dev6 asserted this halted the in-flight `/connect`
+   continuation and it did not (the continuation reopened a socket after the terminal had
+   ended). `_scheduleSettle()` and `connect()` now check it. Keep those checks.
+   (d) **NEVER reset `_reconnectAttempts` on inbound data** (v0.9.6.dev7). A dead session's
+   `tmux attach` writes `can't find session: <name>` to the PTY, which arrives as an
+   ordinary **0x30 OUTPUT frame** — the *failure report* read as a health signal. ttyd also
+   sends 0x31/0x32 (title/prefs) frames on every connect, so even a silent connection reset
+   it. Health is judged by **connection SURVIVAL** (`HEALTHY_CONNECTION_MS = 5000`,
+   stamped in `open`, checked in `close`): a doomed attach dies in ~11 ms, a real session
+   lives for minutes. Duration is version- and locale-independent; do **not** substitute
+   string-matching tmux's error text. This is the same 0→1→0→1 bounce as commit `38e2fc4`,
+   which moved the reset from `open` to `message` instead of rejecting its premise —
+   don't relocate it a third time.
    The 800 ms post-`/connect` settle timer is tracked in `_reconnectTimer` — keep it so, or
    a late callback reattaches to a stale session.
+
+9. **A dead session's ttyd must be REAPED, and never respawned** (v0.9.6.dev7, `main.py`) —
+   **ttyd is a server, not a wrapper.** Spawned without `--once` it binds its port once and
+   **re-forks `tmux attach -t <name>` for every client that connects**; it does not exit
+   when a child exits (verified: 3 connections → 3 child PIDs, ttyd alive throughout).
+   Pointed at a destroyed session, every fork prints the error and dies in ~11 ms, and
+   `_ttyd_is_listening()` — a bare **TCP probe** — reports that orphan as perfectly healthy
+   forever. Two consequences, both load-bearing:
+   (a) the poll cycle **kills ttyd in the same cycle that clears `active_session`** (step 7
+   records it, step 13a kills it *outside* `state_lock`, exactly once — not once per cycle).
+   Clearing the name while leaving the process alive is what made the loop self-sustaining
+   with zero frontend involvement.
+   (b) `terminal_ws_proxy`'s auto-spawn **checks `get_session_list()` first**, as
+   `connect_session` always has. An unguarded respawn there regenerates the doomed process
+   on every browser reconnect.
+   Both kills remain **single-PID** (contract: never a process group, never the tmux
+   server). Safe here for a second reason: the session is already gone, so nothing live is
+   disturbed.
+
+10. **`GET /` must send `Cache-Control: no-cache`** (v0.9.6.dev7) — the `?v=<version>`
+   cache-buster is applied to asset URLs *inside index.html*, so the scheme is load-bearing
+   on that document never being stale. Served with no `Cache-Control` **and no validator**,
+   it is heuristically cacheable (RFC 9111 §4.2.2) and WebKit caches it eagerly: the
+   browser replays old HTML, requests the OLD `?v=` URLs (a different, still-fresh cache
+   key), and a version bump becomes a **silent no-op**. Do not remove the header thinking
+   the `?v=` param alone is sufficient — it is not.
 
 ## Hard-won backend contracts (2026-08-08 efficiency work; tests enforce them)
 
