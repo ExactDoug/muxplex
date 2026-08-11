@@ -254,7 +254,18 @@ async def _run_poll_cycle() -> None:
             del state["sessions"][name]
 
         # 7. Clear active_session if the session is gone
+        #
+        # Also remember that we did, so the ttyd attached to it can be reaped
+        # after the lock is released (step 13b).  Clearing the NAME while
+        # leaving the PROCESS running is what made the "Reconnecting…" loop
+        # self-sustaining: ttyd is a server, not a wrapper — spawned without
+        # --once it keeps listening and re-forks `tmux attach -t <dead>` for
+        # every client that connects, printing "can't find session" forever.
+        # _ttyd_is_listening() is a bare TCP probe, so that orphan reads as
+        # perfectly healthy and nothing else would ever clean it up.
+        stale_ttyd_session: str | None = None
         if state["active_session"] not in name_set:
+            stale_ttyd_session = state["active_session"]
             state["active_session"] = None
 
         # 8. Process bell flags (detect 0→1 transitions, update unseen_count)
@@ -304,6 +315,27 @@ async def _run_poll_cycle() -> None:
 
         # 12. Atomically persist the updated state
         save_state(state)
+
+    # 13a. Reap the ttyd left attached to a session that no longer exists.
+    #
+    # Runs OUTSIDE state_lock: kill_ttyd() waits on process termination
+    # (SIGTERM, then SIGKILL after a timeout) and must not hold up the poll
+    # cycle or any HTTP handler queued behind the lock.
+    #
+    # Single-PID by contract — kill_ttyd never touches a process group or the
+    # tmux server (upstream issue #7).  Safe here for a second reason too: the
+    # session it was attached to is already gone, so there is nothing live to
+    # disturb.  Any browser still pointed at it gets a closed socket and, with
+    # no ttyd listening, /connect now answers 404 instead of the frontend
+    # silently reconnecting into a doomed respawn.
+    if stale_ttyd_session is not None:
+        _log.info(
+            "Reaping ttyd for vanished session %r", stale_ttyd_session
+        )
+        try:
+            await kill_ttyd()
+        except Exception:
+            _log.exception("failed to reap ttyd for %r", stale_ttyd_session)
 
     # 13. Periodically sync settings with remote instances (every SETTINGS_SYNC_INTERVAL
     #     poll cycles, ~30 seconds). Runs outside the state_lock to avoid blocking the
@@ -1397,6 +1429,18 @@ async def terminal_ws_proxy(websocket: WebSocket) -> None:
             async with state_lock:
                 state = load_state()
             session_name = state.get("active_session")
+            # Only respawn for a session that still EXISTS.  connect_session
+            # has always checked this (via get_session_list()); this path did
+            # not, so a stale active_session made every browser reconnect
+            # resurrect a `tmux attach` against a destroyed session — a
+            # self-sustaining loop with no frontend involvement at all.
+            known = get_session_list()
+            if session_name and known and session_name not in known:
+                _log.info(
+                    "WS proxy: refusing to spawn ttyd for vanished session '%s'",
+                    session_name,
+                )
+                session_name = None
             if session_name:
                 _log.info(
                     "WS proxy: ttyd not listening, auto-spawning for '%s'",
@@ -1597,7 +1641,14 @@ async def index_page():
         lambda m: f"{m.group(1)}{m.group(2)}?v={_UI_VERSION}",
         html,
     )
-    return HTMLResponse(html)
+    # The ?v= scheme above is load-bearing ONLY if this document is never
+    # stale: the version lives in the asset URLs, which live in this HTML.
+    # Served with no Cache-Control and no validator, this response is
+    # heuristically cacheable (RFC 9111 §4.2.2) and WebKit caches it eagerly —
+    # so a browser could keep replaying an old index.html, keep requesting the
+    # OLD ?v= URLs (a different cache key, still fresh), and never see a new
+    # release at all.  no-cache still allows storage but forces revalidation.
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/login", response_class=HTMLResponse)

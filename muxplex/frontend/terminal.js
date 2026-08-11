@@ -9,6 +9,7 @@ let _reconnectTimer = null;
 let _currentSession = null;
 let _vpHandler = null;
 let _reconnectAttempts = 0; // tracks consecutive failed reconnect attempts for backoff + ttyd respawn
+let _connOpenedAt = 0; // Date.now() when the live WS opened; 0 when none is open
 let _searchAddon = null;
 let _resizeObserver = null;
 
@@ -21,6 +22,12 @@ let _resizeObserver = null;
 // (the session's process exited, so tmux destroyed the session) is caught much
 // sooner and more precisely by the 404 from /connect — see endTerminalSession.
 const MAX_RECONNECT_ATTEMPTS = 8;
+
+// How long a WebSocket must stay open before we call it healthy and forgive the
+// reconnect counter. A doomed `tmux attach` dies in ~11ms (measured); a real
+// session lives for minutes. 5s sits far above the noise and far below anything
+// a user would call "it was working".
+const HEALTHY_CONNECTION_MS = 5000;
 
 /**
  * Put the terminal into a terminal (non-retrying) state with an explanation.
@@ -315,11 +322,12 @@ function connectWebSocket(name, remoteId) {
 
     ws.addEventListener('open', function() {
       if (ws !== _ws) return; // stale connection — superseded by a newer one, ignore
-      // NOTE: do NOT reset _reconnectAttempts here. The server-side proxy accepts
-      // the WS before confirming ttyd is alive (auto-spawning if needed), but the
-      // browser 'open' event fires as soon as the proxy accepts — not when ttyd
-      // is actually ready. Resetting here caused the 0→1→0→1 bounce. Instead,
-      // reset on first data message (proves ttyd is alive and relaying).
+      // Stamp when this connection opened. The close handler uses it to decide
+      // whether the connection LIVED long enough to count as healthy — see the
+      // HEALTHY_CONNECTION_MS discussion there. Do NOT reset _reconnectAttempts
+      // here: the proxy accepts the browser WS before ttyd is confirmed alive,
+      // so 'open' alone proves nothing (that was the original 0→1→0→1 bounce).
+      _connOpenedAt = Date.now();
       if (reconnectOverlay) reconnectOverlay.classList.add('hidden');
       // Step 1: TEXT frame auth handshake — ttyd checks AuthToken before starting PTY
       ws.send(JSON.stringify({ AuthToken: '' }));
@@ -334,12 +342,22 @@ function connectWebSocket(name, remoteId) {
     ws.addEventListener('message', function(e) {
       if (ws !== _ws) return; // stale connection — superseded by a newer one, ignore
       if (!_term) return;
-      // First data message proves ttyd is alive and relaying — safe to reset counter.
-      // We deliberately do NOT reset in the 'open' handler: the server-side proxy
-      // accepts the browser WS before ttyd is fully confirmed alive, so 'open'
-      // firing alone doesn't mean data will flow. Resetting here prevents the
-      // 0→1→0→1 bounce that kept the reconnect loop from escalating to /connect.
-      if (_reconnectAttempts > 0) _reconnectAttempts = 0;
+      // NOTE: _reconnectAttempts is deliberately NOT reset here.
+      //
+      // It used to be, on the theory that "a data frame proves ttyd is alive and
+      // relaying". That theory is false in the exact case this whole reconnect
+      // path exists to handle: when the tmux session is gone, ttyd dutifully
+      // forks `tmux attach`, which writes "can't find session: <name>" to the
+      // PTY and dies in ~11ms. That error text arrives as an ordinary 0x30
+      // OUTPUT frame — the FAILURE REPORT was being read as a health signal.
+      // ttyd also sends 0x31/0x32 (title/preferences) frames on every connect,
+      // and the reset ran before the type dispatch, so even a silent connection
+      // reset it. Result: the counter oscillated ~0↔1, escalation to /connect
+      // took ~5 cycles instead of 2, and the retry cap was nearly unreachable.
+      //
+      // Health is now judged by how long the connection SURVIVED (see the close
+      // handler), which is the version-independent invariant. Do not reintroduce
+      // a data-based reset here in any form.
       if (e.data instanceof ArrayBuffer) {
         var msg = new Uint8Array(e.data);
         if (msg.length < 1) return;
@@ -359,6 +377,20 @@ function connectWebSocket(name, remoteId) {
       if (ws !== _ws) return; // stale connection — don't reconnect for old sockets
       if (!_currentSession) return; // intentional close — don't reconnect
       if (reconnectOverlay) reconnectOverlay.classList.remove('hidden');
+      // Health check: did this connection LIVE, or did it die on arrival?
+      //
+      // A connection that carried a real session for a while and then dropped
+      // (server restart, network blip, laptop sleep) is a fresh problem — reset
+      // the counter so the user gets the full patient backoff. A connection that
+      // died within HEALTHY_CONNECTION_MS never worked, so it counts toward
+      // escalation no matter how many bytes it delivered on its way out.
+      //
+      // Duration is deliberate: it is the one signal that does not depend on
+      // parsing tmux's error text (fragile across versions and locales) and it
+      // covers every instant-death cause, not just a missing session.
+      var lived = _connOpenedAt ? Date.now() - _connOpenedAt : 0;
+      if (lived >= HEALTHY_CONNECTION_MS) _reconnectAttempts = 0;
+      _connOpenedAt = 0;
       _reconnectAttempts++;
       // Bounded retry: never spin forever. Without this cap a session that can
       // never be reconnected to (its tmux session was destroyed, the server is
@@ -379,7 +411,25 @@ function connectWebSocket(name, remoteId) {
     });
   }
 
+  // Schedule the post-/connect settle that gives ttyd time to bind its port.
+  //
+  // Guarded on _currentSession because this runs from a fetch continuation that
+  // may resolve AFTER the terminal was ended (by the retry cap, by the user
+  // navigating away, or by a session switch). Without the guard the
+  // continuation resurrects the loop we just stopped and clobbers the
+  // _reconnectTimer = null that endTerminalSession set. Nulling
+  // _currentSession only halts reconnects if every path actually READS it —
+  // this one did not.
+  function _scheduleSettle() {
+    if (!_currentSession) return;
+    _reconnectTimer = setTimeout(function() {
+      if (!_currentSession) return; // ended while the settle timer was pending
+      _connectWebSocket();
+    }, 800);
+  }
+
   function connect() {
+    if (!_currentSession) return; // terminal was ended — never reconnect
     // After 2 failed WS attempts, ttyd is likely dead (e.g. after service restart).
     // AWAIT the /connect POST before opening the WebSocket — ttyd must be alive first.
     // fetch() includes cookies automatically for same-origin requests so auth is transparent.
@@ -417,14 +467,14 @@ function connectWebSocket(name, remoteId) {
               return null;
             }
             // Brief delay for ttyd to bind its port after /connect spawns it
-            _reconnectTimer = setTimeout(_connectWebSocket, 800);
+            _scheduleSettle();
             return null;
           });
         })
         .catch(function() {
           // Network-level failure (server down, offline). Not proof the session
           // died — retry via the normal path; the attempt cap bounds it.
-          _reconnectTimer = setTimeout(_connectWebSocket, 800);
+          _scheduleSettle();
           return null;
         });
       return; // Don't fall through — .then() handles the WebSocket creation
