@@ -5,11 +5,42 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.6.dev5**, on **`main`** — a **dev/experimental**
+improvements. Current version: **0.9.6.dev7**, on **`main`** — a **dev/experimental**
 build carrying the Mouse Lab selection-fix harness *and* the mobile terminal keybar (both
-below); last released version is **0.9.5**. The v0.9 session-UX and mobile-keybar branches
-are merged (PRs #8, #9); `feat/v0.9-session-ux` and `agent/mobile-terminal-keyboard` are
-spent — start new work from `main`.
+below); last released version is **0.9.5**. All feature branches through PR #12 are
+merged and their branches/worktrees deleted — **start new work from `main`**.
+
+---
+
+## ⇢ CURRENT STATE (2026-08-09)
+
+**Just landed — resource efficiency (PRs #11, #12, both merged).** The poll cycle is now
+**O(1) in session count**. Per-cycle tmux spawns went `2N+2` → `N+3` → **`C+3`** where C =
+panes that actually changed; measured on a live 45-session fleet as 45 captures cold then
+**1** on the next cycle. Full design, measurements, rejected options and a revision log:
+**`docs/plans/2026-08-08-resource-efficiency-plan.md`**. Contracts that came out of it are
+in "Hard-won backend contracts" below — read those before touching the poll cycle.
+
+**Just fixed — the "Reconnecting…" infinite loop (v0.9.6.dev7, branch
+`investigate/terminal-reconnect-loop`).** The dev6 attempt was **insufficient** — it
+terminated only after ~5 cycles/~15 s, spammed the terminal with tmux errors, and left the
+doomed ttyd running. dev7 fixes the real drivers: ttyd is a *server* that re-forks
+`tmux attach` per client, so the poll cycle now reaps it and the WS proxy refuses to
+respawn for a vanished session; the reconnect counter no longer treats inbound error text
+as a health signal. See contracts #8(d), #9, #10.
+
+**(historical) The dev6 attempt.** Killing/exiting the process a tmux session was
+invoked to run destroyed the tmux session, so ttyd's `tmux attach` failed forever and the
+terminal retried every ~15 s with no explanation. The hypothesis in the briefing was
+verified and correct. Fix is frontend-only — the backend was already reporting the truth
+(a 404 from `/connect`) and it was being discarded. Full write-up, including the one thing
+the briefing got wrong:
+**`docs/plans/2026-08-09-terminal-reconnect-loop-investigation.md`** (§"Verification and
+outcome"). See frontend contract #8 below.
+
+**Server:** normally run detached — `setsid nohup .venv/bin/muxplex serve >> ~/.local/state/muxplex/serve.log 2>&1 &`.
+
+---
 
 **v0.9 session UX (DONE on `feat/v0.9-session-ux`)** — see `CHANGELOG.md` v0.9.0–v0.9.2:
 (1) new sessions reliably auto-open (createNewSession poll now keys off the canonical
@@ -252,6 +283,109 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    Any future bottom-docked affordance should reuse `--keybar-lift` rather than
    re-deriving it. Details: `docs/plans/2026-07-27-mobile-terminal-keybar.md`.
 
+8. **Reconnect must be able to STOP** (v0.9.6.dev6, `terminal.js`) — a tmux session whose
+   process exits is destroyed by tmux (`exit-empty on`), so `tmux attach -t <name>` fails
+   forever and no reconnect can ever succeed. Three parts, all load-bearing:
+   (a) **`POST /connect`'s status is inspected.** A **404** (local: `connect_session`
+   raises it once the ~2 s poll cache drops the name) is definitive → end the terminal.
+   Federated sessions arrive as a **502 whose detail reads `Remote returned 404`**, because
+   `federation_connect` flattens every non-2xx from the peer into 502 — so a *bare* 502 is
+   deliberately NOT enough, or a merely-sick peer would be declared dead. 503/500/network
+   errors stay retryable. Note `fetch()` resolves on a 404: a `.catch()` was never what hid
+   this, ignoring `res.status` was. Do not "simplify" back to an unconditional `.then()`.
+   (b) **`MAX_RECONNECT_ATTEMPTS = 8`** — a backstop. Never remove it in favour of (a)
+   alone. (dev6 called this "cause-independent"; it was not — it depended on the counter
+   climbing, see (d).)
+   (c) **`endTerminalSession()` nulls `_currentSession`** and shows
+   `#session-ended-overlay` whose Back button delegates to `#back-btn` (app.js keeps sole
+   ownership of returning to the grid). A session ending must present as an explained
+   outcome, never an indefinite spinner. `_currentSession` is the latch, but **a latch only
+   works if every path READS it** — dev6 asserted this halted the in-flight `/connect`
+   continuation and it did not (the continuation reopened a socket after the terminal had
+   ended). `_scheduleSettle()` and `connect()` now check it. Keep those checks.
+   (d) **NEVER reset `_reconnectAttempts` on inbound data** (v0.9.6.dev7). A dead session's
+   `tmux attach` writes `can't find session: <name>` to the PTY, which arrives as an
+   ordinary **0x30 OUTPUT frame** — the *failure report* read as a health signal. ttyd also
+   sends 0x31/0x32 (title/prefs) frames on every connect, so even a silent connection reset
+   it. Health is judged by **connection SURVIVAL** (`HEALTHY_CONNECTION_MS = 5000`,
+   stamped in `open`, checked in `close`): a doomed attach dies in ~11 ms, a real session
+   lives for minutes. Duration is version- and locale-independent; do **not** substitute
+   string-matching tmux's error text. This is the same 0→1→0→1 bounce as commit `38e2fc4`,
+   which moved the reset from `open` to `message` instead of rejecting its premise —
+   don't relocate it a third time.
+   The 800 ms post-`/connect` settle timer is tracked in `_reconnectTimer` — keep it so, or
+   a late callback reattaches to a stale session.
+
+9. **A dead session's ttyd must be REAPED, and never respawned** (v0.9.6.dev7, `main.py`) —
+   **ttyd is a server, not a wrapper.** Spawned without `--once` it binds its port once and
+   **re-forks `tmux attach -t <name>` for every client that connects**; it does not exit
+   when a child exits (verified: 3 connections → 3 child PIDs, ttyd alive throughout).
+   Pointed at a destroyed session, every fork prints the error and dies in ~11 ms, and
+   `_ttyd_is_listening()` — a bare **TCP probe** — reports that orphan as perfectly healthy
+   forever. Two consequences, both load-bearing:
+   (a) the poll cycle **kills ttyd in the same cycle that clears `active_session`** (step 7
+   records it, step 13a kills it *outside* `state_lock`, exactly once — not once per cycle).
+   Clearing the name while leaving the process alive is what made the loop self-sustaining
+   with zero frontend involvement.
+   (b) `terminal_ws_proxy`'s auto-spawn **checks `get_session_list()` first**, as
+   `connect_session` always has. An unguarded respawn there regenerates the doomed process
+   on every browser reconnect.
+   Both kills remain **single-PID** (contract: never a process group, never the tmux
+   server). Safe here for a second reason: the session is already gone, so nothing live is
+   disturbed.
+
+10. **`GET /` must send `Cache-Control: no-cache`** (v0.9.6.dev7) — the `?v=<version>`
+   cache-buster is applied to asset URLs *inside index.html*, so the scheme is load-bearing
+   on that document never being stale. Served with no `Cache-Control` **and no validator**,
+   it is heuristically cacheable (RFC 9111 §4.2.2) and WebKit caches it eagerly: the
+   browser replays old HTML, requests the OLD `?v=` URLs (a different, still-fresh cache
+   key), and a version bump becomes a **silent no-op**. Do not remove the header thinking
+   the `?v=` param alone is sufficient — it is not.
+
+## Hard-won backend contracts (2026-08-08 efficiency work; tests enforce them)
+
+Full rationale and measurements: `docs/plans/2026-08-08-resource-efficiency-plan.md`.
+`muxplex/tests/test_poll_cycle_perf.py` pins the per-cycle spawn counts, so a regression
+fails loudly rather than silently costing O(N) again.
+
+1. **The poll cycle must stay O(1) in N.** Per cycle: 1 `list-sessions`, 1 `list-panes -a`,
+   1 `list-windows -a`, plus one `capture-pane` **only for panes that changed**. Never
+   reintroduce a per-session tmux query — that is what `2N+2` was.
+2. **Bells are ONE batched `list-windows -a`**, OR-aggregated across a session's windows,
+   TAB-delimited (session names may contain spaces). `window_bell_flag` is a *window*
+   variable; there is no session-level equivalent. Rejected and re-rejected:
+   `window_activity_flag` (alert flag, gated on `monitor-activity`),
+   `pane_unseen_changes` (copy-mode only), `session_activity` (bumps on client attach),
+   `pane_last_activity` (does not exist).
+3. **Snapshot change key is composite**: `window_activity|pane_id|pane_width|pane_height`.
+   The timestamp alone is insufficient — `capture_pane` targets `-t <session>`, which
+   resolves to the *current window's active pane*, so switching window/pane or resizing
+   changes content with no new output. **Every ambiguous branch must fail toward
+   capturing**, and the forced full sweep every 15th cycle is a correctness backstop —
+   do not remove it.
+4. **The `list-panes -a` format keeps `pane_current_path` LAST** and parses with a fixed
+   maxsplit derived from the field count, so paths containing tabs survive. New fields go
+   *before* the path.
+5. **Ordering in `_run_poll_cycle` is load-bearing:** `list_session_paths` (publishes the
+   change keys) must precede `snapshot_all` (consumes them). A one-shot freshness
+   handshake enforces it — a mis-ordered call sees no keys and captures everything, so
+   mistakes cost a fork, never a stale tile.
+6. **`kill_ttyd` is SINGLE-PID, SIGTERM → SIGKILL.** Never `killpg`, never a process
+   group, never the tmux server: a group kill destroys live sessions and everything in
+   them (upstream issue #7). Its bool return means "there was something to clean up and
+   it was dealt with" — **not** "the process is confirmed dead".
+7. **`/api/sessions` caches its serialized body under a CONTENT-derived key**, not a list
+   of invalidation sites. Bell state is mutated *outside* the poll cycle by the tmux
+   alert-bell hook, so a generation-counter-only key would delay bells by up to 2 s. Keep
+   the key derived from the payload's actual inputs.
+8. **`settings.json` / `pruning.json` writes are atomic** (tmp + `os.replace`). A torn
+   read makes `load_settings` fall back to `DEFAULT_SETTINGS` and a concurrent PATCH then
+   destroys every saved view. Never revert to a bare `write_text`.
+9. **The pruning-state write is guarded on the BOOKKEEPING changing**, not on
+   `_prune_changed`. That flag is only true when a key was *removed*, while the grace
+   clock is started by a bookkeeping-only mutation — guarding on it silently disables
+   stale-key pruning forever.
+
 ## Documentation map
 
 - `CHANGELOG.md` — user-facing release history (newest first)
@@ -304,3 +438,23 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
   enablement rationale, and the two iPhone-only bugs (rounded-corner key clipping; the
   software keyboard burying the bar) with the visual-viewport dock that fixes the second.
   See contract #7. Shipped in `CHANGELOG.md` v0.9.6.dev5.
+- **Resource efficiency (DONE — PRs #11/#12, merged 2026-08-09):**
+  `docs/plans/2026-08-08-resource-efficiency-plan.md` — the poll cycle made O(1) in N.
+  Read this before touching the poll cycle, snapshots, bells, the `/api/sessions` cache,
+  or ttyd lifecycle; the backend contracts above are its distilled output. Notable for
+  what it *declined*: async disk I/O (measured at 0.137% of wall clock — `to_thread`
+  costs more per hop than the `save_state` it would offload), ttyd `-t scrollback`
+  (verified no-op — muxplex serves its own xterm bundle and ignores ttyd's
+  SET_PREFERENCES), WS backpressure hardening (already bounded end-to-end), and
+  visible-set snapshot scoping (unsound — federation hands every local snapshot to peers
+  who filter by their *own* view). The doc carries a revision log of what its own first
+  draft got wrong, after adversarial review corrected four risk ratings.
+- **Terminal "Reconnecting…" loop (FIXED — v0.9.6.dev6):**
+  `docs/plans/2026-08-09-terminal-reconnect-loop-investigation.md` — killing the process
+  a session was invoked to run left the terminal retrying forever. Pre-existing; the
+  briefing's hypothesis (the reconnect path has no notion of session liveness and
+  re-POSTs `/connect` for a destroyed session every ~15 s) was **verified and correct**.
+  §"Verification and outcome" records what was confirmed, the fix (directions 1 + 2,
+  both), and the brief's one wrong claim — it blamed `.catch(() => null)`, but `fetch()`
+  resolves on a 404, so the real defect was never reading `res.status`. Distilled into
+  frontend contract #8.

@@ -767,6 +767,42 @@ body {
   z-index: 10;
 }
 
+/* Terminal state overlay — a session that ended and cannot be reconnected to.
+   Shares .reconnect-overlay's geometry; adds a small centered card so the
+   outcome reads as an explained end state, not a stalled spinner. */
+.session-ended__box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 24px 32px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-width: 90%;
+  text-align: center;
+}
+
+.session-ended__msg {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.session-ended__back {
+  padding: 8px 18px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.session-ended__back:hover {
+  background: var(--accent-dim);
+}
+
 /* ============================================================
    Zoom-in-place expand/collapse transition
    ============================================================ */

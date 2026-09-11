@@ -216,6 +216,10 @@ def test_ws_proxy_auto_spawns_ttyd_when_dead(monkeypatch):
         "muxplex.main.load_state",
         lambda: {"active_session": "test-session", "sessions": {}, "session_order": []},
     )
+    # The session must be KNOWN for the proxy to respawn for it.  Pinned
+    # explicitly rather than relying on the module-global session cache, which
+    # other tests mutate -- and which made this test's precondition invisible.
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["test-session"])
 
     with _make_authed_client() as c:
         with c.websocket_connect("/terminal/ws") as _:
@@ -223,6 +227,54 @@ def test_ws_proxy_auto_spawns_ttyd_when_dead(monkeypatch):
 
     assert spawn_calls == ["test-session"], (
         "spawn_ttyd must be called with active_session when ttyd is not listening"
+    )
+
+
+def test_ws_proxy_refuses_to_spawn_ttyd_for_vanished_session(monkeypatch):
+    """The proxy must NOT resurrect ttyd for a session that no longer exists.
+
+    ttyd is a server, not a wrapper: spawned without --once it keeps listening
+    and re-forks `tmux attach` for every client.  Pointed at a destroyed
+    session, each fork prints "can't find session" and dies -- so an unguarded
+    respawn here makes every browser reconnect regenerate the doomed process,
+    a loop that sustains itself with no frontend involvement at all.
+
+    connect_session has always had this check; this path did not.
+    """
+    spawn_calls: list[str] = []
+
+    async def mock_spawn_ttyd(session_name: str):
+        spawn_calls.append(session_name)
+
+    async def mock_kill_ttyd():
+        pass
+
+    async def mock_sleep(_delay: float):
+        pass
+
+    monkeypatch.setattr("muxplex.main._ttyd_is_listening", lambda: False)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn_ttyd)
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill_ttyd)
+    monkeypatch.setattr(asyncio, "sleep", mock_sleep)
+
+    fake_ws = FakeTtydWs(responses=[])
+    monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
+
+    # State still names the dead session; the live session list no longer has it.
+    monkeypatch.setattr(
+        "muxplex.main.load_state",
+        lambda: {"active_session": "ghost", "sessions": {}, "session_order": []},
+    )
+    monkeypatch.setattr(
+        "muxplex.main.get_session_list", lambda: ["alive-1", "alive-2"]
+    )
+
+    with _make_authed_client() as c:
+        with c.websocket_connect("/terminal/ws") as _:
+            pass
+
+    assert spawn_calls == [], (
+        "spawn_ttyd must NOT be called for a session missing from the live list"
     )
 
 

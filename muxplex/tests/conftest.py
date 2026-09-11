@@ -35,6 +35,14 @@ Deliberately NOT redirected: ``muxplex.settings.FEDERATION_KEY_PATH``.
 ``~/.config/muxplex/federation_key`` location; patching it here would turn that
 into a false failure.  Tests that exercise the federation key must redirect it
 themselves (``test_api.py`` already does).
+
+PATHS ARE NOT THE ONLY SHARED RESOURCE — SEE ``never_kill_a_real_server``
+-------------------------------------------------------------------------
+Redirecting file paths does not isolate a test from the *network*.  ``serve()``
+kills whatever process is listening on its port before binding, which is a
+machine-wide side effect no ``tmp_path`` can contain.  That fixture is the port
+analogue of this one; read its docstring before adding tests that call
+``serve()``.
 """
 
 import pytest
@@ -70,3 +78,33 @@ def redirect_muxplex_paths(tmp_path, monkeypatch):
     monkeypatch.setattr("muxplex.ttyd.TTYD_PID_PATH", pid_dir / "ttyd.pid")
 
     return cfg_dir
+
+
+@pytest.fixture(autouse=True)
+def never_kill_a_real_server(request, monkeypatch):
+    """Autouse: stop ``serve()`` from SIGTERMing the developer's running muxplex.
+
+    ``cli.serve()`` calls ``_kill_stale_port_holder(port)`` before binding, which
+    runs ``lsof -ti :<port>`` and SIGTERMs every occupant.  That exists to break
+    a systemd restart crash-loop and is correct in production — but in a test it
+    reaches straight out of the sandbox and kills whatever muxplex is genuinely
+    serving on that port.
+
+    Patching ``uvicorn.run`` is NOT sufficient protection, which is the trap:
+    it stops a server being *started* while leaving the kill fully live.  Eleven
+    ``test_serve_*`` tests did exactly that.
+
+    Found 2026-08-09 the hard way — a bare ``pytest muxplex/tests/test_cli.py``
+    silently terminated the user's running server (137 tests passing, server
+    gone).  Verified by noting the listener's pid, running the file, and finding
+    the port unbound.
+
+    The tests that exercise ``_kill_stale_port_holder`` *itself* are exempted by
+    name; they supply their own ``subprocess``/``os.kill`` fakes and would
+    otherwise be asserting against this stub instead of the real function.
+    """
+    if "kill_stale_port_holder" in request.node.name:
+        return
+    monkeypatch.setattr(
+        "muxplex.cli._kill_stale_port_holder", lambda port: None, raising=False
+    )

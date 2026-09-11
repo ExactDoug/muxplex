@@ -183,3 +183,29 @@ def test_versioned_asset_url_resolves_to_static_file(client):
     assert resp.status_code == 200, (
         f"Versioned vendor URL {vendor_url!r} returned {resp.status_code}, expected 200"
     )
+
+
+# ---------------------------------------------------------------------------
+# index.html must not be cacheable without revalidation
+# ---------------------------------------------------------------------------
+
+
+def test_index_html_sends_no_cache(client):
+    """GET / must send Cache-Control: no-cache.
+
+    The whole ?v=<version> scheme above is load-bearing ONLY if this document is
+    never stale: the version lives in the asset URLs, and the asset URLs live in
+    this HTML.  Served with no Cache-Control and no validator (no ETag, no
+    Last-Modified), the response is heuristically cacheable per RFC 9111 4.2.2
+    and WebKit caches it eagerly -- so a browser can keep replaying an old
+    index.html, keep requesting the OLD ?v= URLs (a different, still-fresh cache
+    key), and never see a new release at all.  A version bump would then be a
+    silent no-op, which is exactly the failure this guards.
+    """
+    response = client.get("/")
+    assert response.status_code == 200
+    cache_control = response.headers.get("cache-control", "")
+    assert "no-cache" in cache_control.lower(), (
+        "GET / must send Cache-Control: no-cache so the ?v= cache-buster can "
+        f"actually take effect; got {cache_control!r}"
+    )
