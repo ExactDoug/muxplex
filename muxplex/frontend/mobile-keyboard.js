@@ -25,8 +25,6 @@
   var settingCheckbox = null;
   var originalOpenTerminal = null;
   var originalCloseTerminal = null;
-  var viewportHandler = null;
-  var windowResizeHandler = null;
   var resizeFrame = null;
 
   var ARROW_CODES = { up: 'A', down: 'B', right: 'C', left: 'D' };
@@ -46,12 +44,21 @@
     { label: 'Del', sequence: '\x1b[3~', aria: 'Delete' },
   ];
 
+  // NOTE: there is deliberately no { control: 'v' } entry here, and there must
+  // never be one. controlSequence('v') is 0x16/SYN, which is exactly the byte
+  // frontend contract #1 exists to keep off the PTY — TUI apps then read the
+  // *server-side* clipboard (the original "paste does nothing" bug). Pasting on
+  // this bar goes through action:'paste' → _pasteFromClipboard(), which reads the
+  // BROWSER clipboard and routes it through xterm's bracketed paste. The key is
+  // labelled "Paste" rather than "Ctrl+V" so the label never invites someone to
+  // "simplify" it back into the control path.
   var CTRL_KEYS = [
     { label: 'Esc', sequence: '\x1b', className: 'mobile-keybar__key--escape', aria: 'Escape' },
     { label: 'Back', action: 'normal', className: 'mobile-keybar__key--modifier', aria: 'Return to normal keys' },
+    { label: 'Paste', action: 'paste', className: 'mobile-keybar__key--paste', aria: 'Paste from clipboard' },
+    { label: 'Ctrl+C', control: 'c', aria: 'Control C' },
     { label: 'Ctrl+B', control: 'b', aria: 'Control B, default tmux prefix' },
     { label: 'Ctrl+A', control: 'a', aria: 'Control A' },
-    { label: 'Ctrl+C', control: 'c', aria: 'Control C' },
     { label: 'Ctrl+D', control: 'd', aria: 'Control D' },
     { label: 'Ctrl+L', control: 'l', aria: 'Control L' },
     { label: 'Ctrl+R', control: 'r', aria: 'Control R' },
@@ -80,6 +87,9 @@
     '.mobile-keybar__key:focus-visible{outline:2px solid var(--accent,#00D9F5);outline-offset:1px;}',
     '.mobile-keybar__key--escape{border-color:rgba(241,166,64,.75);color:var(--bell,#F1A640);}',
     '.mobile-keybar__key--modifier{border-color:rgba(0,217,245,.55);color:var(--accent,#00D9F5);}',
+    // Paste is an action, not a raw key — give it its own tint so it does not
+    // read as another Ctrl+<letter> in the row.
+    '.mobile-keybar__key--paste{border-color:rgba(63,185,80,.6);color:var(--ok,#3fb950);}',
     '.mobile-keybar__setting-label{display:flex;flex-direction:column;align-items:flex-start;gap:2px;}',
     '.mobile-keybar__setting-note{font-size:11px;font-weight:400;color:var(--text-muted,#8E95A3);}',
     '@media (max-width:899px) and (hover:none),(pointer:coarse){.mobile-keybar.mobile-keybar--enabled{display:block;}body.muxplex-mobile-keybar-enabled #session-pill:not(.hidden){bottom:calc(var(--keybar-lift,0px) + var(--keybar-height,54px) + 8px);}}',
@@ -106,9 +116,12 @@
     return root && typeof root._encodePayload === 'function' ? root._encodePayload : null;
   }
 
-  function getFitAddon() {
-    try { if (typeof _fitAddon !== 'undefined' && _fitAddon) return _fitAddon; } catch (_) {}
-    return root && root._fitAddon ? root._fitAddon : null;
+  // terminal.js is a classic script, so its top-level function declarations are
+  // reachable both as bare identifiers and as window properties. Probe both, the
+  // same way getTerminal()/getEncoder() do, so load order can never matter.
+  function getPasteFromClipboard() {
+    try { if (typeof _pasteFromClipboard === 'function') return _pasteFromClipboard; } catch (_) {}
+    return root && typeof root._pasteFromClipboard === 'function' ? root._pasteFromClipboard : null;
   }
 
   function isSocketOpen(socket) {
@@ -154,6 +167,18 @@
     return false;
   }
 
+  // Paste the BROWSER clipboard. Never emits a control byte — see the note on
+  // CTRL_KEYS and frontend contract #1. Runs inside the key's pointerdown, which
+  // is the user gesture iOS requires before it will grant a clipboard read.
+  function pasteFromClipboard() {
+    var paste = getPasteFromClipboard();
+    if (!paste) return false;
+    var started = false;
+    try { started = paste() !== false; } catch (_) { return false; }
+    focusTerminal();
+    return started;
+  }
+
   function controlSequence(key) {
     if (typeof key !== 'string' || key.length !== 1) return null;
     var code = key.toUpperCase().charCodeAt(0);
@@ -187,6 +212,7 @@
     if (!definition) return false;
     if (definition.action === 'ctrl') { setMode('ctrl'); return true; }
     if (definition.action === 'normal') { setMode('normal'); return true; }
+    if (definition.action === 'paste') return pasteFromClipboard();
 
     var sequence = definition.sequence;
     if (definition.control) sequence = controlSequence(definition.control);
@@ -358,32 +384,21 @@
     return overlap;
   }
 
+  // This module does NOT size the terminal. terminal.js is the single owner of
+  // #terminal-container's height (see the geometry note there and issue #15):
+  // two owners racing here meant two fits, hence two tmux resizes per keyboard
+  // event, with an intermediate geometry a keybar too tall. Our job is to keep
+  // --keybar-lift/--keybar-height current and ask terminal.js to refit.
   function resizeForVisualViewport() {
     resizeFrame = null;
-    var doc = getDocument();
-    var visualViewport = root.visualViewport;
-    var container = doc && doc.getElementById('terminal-container');
     syncDock();
-    if (!visualViewport || !container || !getTerminal()) return;
+    requestTerminalFit();
+  }
 
-    var headerHeight = 44;
-    var searchHeight = 0;
+  function requestTerminalFit() {
     try {
-      var header = doc.querySelector('.expanded-header');
-      if (header) headerHeight = Math.ceil(header.getBoundingClientRect().height || header.offsetHeight || headerHeight);
-      var search = doc.getElementById('terminal-search-bar');
-      if (search && !search.classList.contains('hidden')) {
-        searchHeight = Math.ceil(search.getBoundingClientRect().height || search.offsetHeight || 0);
-      }
+      if (typeof root._fitTerminalToViewport === 'function') root._fitTerminalToViewport();
     } catch (_) {}
-
-    var available = Math.max(80, Math.floor(visualViewport.height - headerHeight - searchHeight - toolbarHeight()));
-    try { container.style.height = available + 'px'; } catch (_) {}
-
-    var fitAddon = getFitAddon();
-    if (fitAddon && typeof fitAddon.fit === 'function') {
-      try { fitAddon.fit(); } catch (_) {}
-    }
   }
 
   function scheduleViewportFit() {
@@ -397,43 +412,15 @@
     resizeFrame = schedule(resizeForVisualViewport);
   }
 
-  function bindViewportHandlers() {
-    unbindViewportHandlers();
-    viewportHandler = scheduleViewportFit;
-    windowResizeHandler = scheduleViewportFit;
-    try {
-      if (root.visualViewport) {
-        root.visualViewport.addEventListener('resize', viewportHandler);
-        // iOS reports keyboard show/hide as a visual-viewport *scroll* (offsetTop
-        // change) as often as a resize; without this the bar lags behind the keyboard.
-        root.visualViewport.addEventListener('scroll', viewportHandler);
-      }
-      root.addEventListener('resize', windowResizeHandler);
-      root.addEventListener('orientationchange', windowResizeHandler);
-    } catch (_) {}
-  }
-
-  function unbindViewportHandlers() {
-    try {
-      if (viewportHandler && root.visualViewport) {
-        root.visualViewport.removeEventListener('resize', viewportHandler);
-        root.visualViewport.removeEventListener('scroll', viewportHandler);
-      }
-      if (windowResizeHandler) {
-        root.removeEventListener('resize', windowResizeHandler);
-        root.removeEventListener('orientationchange', windowResizeHandler);
-      }
-    } catch (_) {}
-    viewportHandler = null;
-    windowResizeHandler = null;
-  }
+  // Viewport listeners intentionally live in terminal.js alongside the geometry
+  // owner, so a single handler drives both the dock vars and the fit. Binding a
+  // second set here is what produced the double-resize in issue #15.
 
   function installLifecycleHooks() {
     if (typeof root._openTerminal === 'function' && !originalOpenTerminal) {
       originalOpenTerminal = root._openTerminal;
       root._openTerminal = function () {
         var result = originalOpenTerminal.apply(this, arguments);
-        bindViewportHandlers();
         setMode('normal');
         scheduleViewportFit();
         return result;
@@ -443,7 +430,6 @@
     if (typeof root._closeTerminal === 'function' && !originalCloseTerminal) {
       originalCloseTerminal = root._closeTerminal;
       root._closeTerminal = function () {
-        unbindViewportHandlers();
         var doc = getDocument();
         var container = doc && doc.getElementById('terminal-container');
         if (container) {
@@ -485,8 +471,11 @@
     controlSequence: controlSequence,
     arrowSequence: arrowSequence,
     activateKey: activateKey,
+    normalKeys: function () { return NORMAL_KEYS.slice(); },
+    ctrlKeys: function () { return CTRL_KEYS.slice(); },
     resizeForVisualViewport: resizeForVisualViewport,
     keyboardOverlap: keyboardOverlap,
     syncDock: syncDock,
+    toolbarHeight: toolbarHeight,
   };
 });

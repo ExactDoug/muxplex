@@ -8,6 +8,8 @@ let _ws = null;
 let _reconnectTimer = null;
 let _currentSession = null;
 let _vpHandler = null;
+let _fitFrame = null;   // pending handle for the single terminal-geometry owner
+let _fitCancel = null;  // canceller matching whatever scheduler produced _fitFrame
 let _reconnectAttempts = 0; // tracks consecutive failed reconnect attempts for backoff + ttyd respawn
 let _connOpenedAt = 0; // Date.now() when the live WS opened; 0 when none is open
 let _searchAddon = null;
@@ -485,26 +487,174 @@ function connectWebSocket(name, remoteId) {
 
   connect();
 }
+// ─── Terminal geometry — SINGLE OWNER ────────────────────────────────────────
+//
+// Exactly ONE place computes #terminal-container's height and calls fit(). Two
+// owners used to race here: this handler (resize-only, synchronous, and blind to
+// the mobile keybar — it subtracted a hardcoded 44px header and nothing else)
+// and mobile-keyboard.js's rAF-deferred one (which correctly subtracted the
+// keybar). Both ran per keyboard event, so the container was sized twice at two
+// different heights and fit() fired twice. Each fit sends a resize down the wire
+// to ttyd, so tmux resized twice per keyboard event and every TUI in the session
+// redrew for an intermediate geometry ~54px too tall — which is why the prompt
+// ended up drawn underneath the keybar. See issue #15.
+//
+// mobile-keyboard.js no longer sizes anything: it publishes --keybar-lift /
+// --keybar-height and asks us to refit. If that module is absent, _keybarHeight()
+// returns 0 and this still produces correct geometry.
+
+/** Let the keybar republish its dock vars. Cheap; safe when the module is absent. */
+function _syncKeybarDock() {
+  try {
+    var kb = window.MuxplexMobileKeyboard;
+    if (kb && typeof kb.syncDock === 'function') kb.syncDock();
+  } catch (_) {}
+}
+
+/** Height the mobile keybar currently occupies, or 0 when it is absent/hidden. */
+function _keybarHeight() {
+  try {
+    var kb = window.MuxplexMobileKeyboard;
+    if (kb && typeof kb.toolbarHeight === 'function') return kb.toolbarHeight() || 0;
+  } catch (_) {}
+  return 0;
+}
+
+/** Measured height of a chrome element, or `fallback` when it is missing/hidden. */
+function _chromeHeight(el, fallback) {
+  if (!el) return fallback;
+  try {
+    if (el.classList && el.classList.contains('hidden')) return 0;
+    return Math.ceil(el.getBoundingClientRect().height || el.offsetHeight || fallback);
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function fitTerminalToViewport() {
+  _fitFrame = null;
+  _fitCancel = null;
+  if (!_term || !_fitAddon) return;
+
+  var container = null;
+  var header = null;
+  var search = null;
+  try {
+    container = document.getElementById('terminal-container');
+    header = document.querySelector('.expanded-header');
+    search = document.getElementById('terminal-search-bar');
+  } catch (_) {
+    return;
+  }
+  if (!container) return;
+
+  // visualViewport.height already excludes the software keyboard on iOS (and the
+  // whole keyboard assembly: accessory bar + keys + emoji row). innerHeight does
+  // NOT — iOS overlays the keyboard rather than shrinking the layout viewport.
+  var vv = window.visualViewport;
+  var available = (vv && vv.height) || window.innerHeight || 0;
+  if (!available) return;
+
+  var height = Math.max(
+    80,
+    Math.floor(available - _chromeHeight(header, 44) - _chromeHeight(search, 0) - _keybarHeight())
+  );
+
+  // maxHeight, NOT height. #terminal-container is `flex: 1` inside a column flex
+  // .terminal-wrapper (style.css), and `flex: 1` means `flex-basis: 0%`, which
+  // OVERRIDES the height property for a flex item's main size. Assigning
+  // container.style.height here is therefore inert — it always was, in both of the
+  // handlers that used to race, which is why the prompt stayed buried even after
+  // the geometry arithmetic was correct. The container simply grew to fill the
+  // wrapper, and the wrapper is sized by the LAYOUT viewport, which iOS does not
+  // shrink for the keyboard.
+  //
+  // A max-height constraint IS honoured by the flex algorithm (flex items are
+  // clamped to their min/max), so the container grows as before and is capped at
+  // the visual viewport's usable height. It is also fail-safe: it can only ever
+  // make the terminal smaller than today's behaviour, never larger, so a wrong
+  // measurement degrades toward the status quo instead of breaking desktop.
+  // height is set alongside it for non-flex contexts and harmless where flex wins.
+  try {
+    container.style.maxHeight = height + 'px';
+    container.style.height = height + 'px';
+  } catch (_) {}
+  try { _fitAddon.fit(); } catch (_) {}
+}
+
+/**
+ * Coalesce every geometry request into ONE fit, so a burst of viewport events
+ * (iOS emits resize AND scroll for a single keyboard open) still costs exactly
+ * one container resize and therefore one tmux resize.
+ *
+ * Prefers requestAnimationFrame, falls back to a timer, and finally runs inline:
+ * a host without either must still get correct geometry rather than none. Every
+ * lookup is guarded because this runs in browsers, in tests, and under a DOM stub.
+ */
+function scheduleTerminalFit() {
+  if (_fitFrame !== null) {
+    try { if (_fitCancel) _fitCancel(_fitFrame); } catch (_) {}
+    _fitFrame = null;
+    _fitCancel = null;
+  }
+
+  if (typeof window.requestAnimationFrame === 'function') {
+    _fitCancel = typeof window.cancelAnimationFrame === 'function'
+      ? window.cancelAnimationFrame.bind(window)
+      : null;
+    _fitFrame = window.requestAnimationFrame(fitTerminalToViewport);
+    return;
+  }
+
+  var timer = typeof window.setTimeout === 'function'
+    ? window.setTimeout.bind(window)
+    : (typeof setTimeout === 'function' ? setTimeout : null);
+  if (timer) {
+    _fitCancel = typeof window.clearTimeout === 'function'
+      ? window.clearTimeout.bind(window)
+      : (typeof clearTimeout === 'function' ? clearTimeout : null);
+    _fitFrame = timer(fitTerminalToViewport, 0);
+    return;
+  }
+
+  fitTerminalToViewport();
+}
+
+function _unbindVisualViewport() {
+  if (!_vpHandler) return;
+  try {
+    if (window.visualViewport) {
+      window.visualViewport.removeEventListener('resize', _vpHandler);
+      window.visualViewport.removeEventListener('scroll', _vpHandler);
+    }
+    window.removeEventListener('resize', _vpHandler);
+    window.removeEventListener('orientationchange', _vpHandler);
+  } catch (_) {}
+  _vpHandler = null;
+}
+
 function initVisualViewport() {
-  if (!window.visualViewport) return;
-  if (_vpHandler) window.visualViewport.removeEventListener('resize', _vpHandler);
+  _unbindVisualViewport();
 
-  _vpHandler = function() {
-    if (!_term || !_fitAddon) return;
-    var container = document.getElementById('terminal-container');
-    if (!container) return;
-
-    // Resize container to fill visual viewport above keyboard
-    var headerHeight = 44; // matches --header-height CSS custom property
-    var vvh = window.visualViewport.height;
-    var termHeight = Math.max(100, vvh - headerHeight);
-    container.style.height = termHeight + 'px';
-
-    // Refit xterm.js to new container size
-    try { _fitAddon.fit(); } catch (_) {}
+  _vpHandler = function () {
+    // Dock synchronously so the keybar never lags the keyboard, but defer the
+    // terminal fit so a burst of events still costs exactly one tmux resize.
+    _syncKeybarDock();
+    scheduleTerminalFit();
   };
 
-  window.visualViewport.addEventListener('resize', _vpHandler);
+  try {
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', _vpHandler);
+      // iOS signals keyboard show/hide via an offsetTop change (a *scroll*) as
+      // often as a resize; without this the terminal lags visibly. Contract #7.
+      window.visualViewport.addEventListener('scroll', _vpHandler);
+    }
+    window.addEventListener('resize', _vpHandler);
+    window.addEventListener('orientationchange', _vpHandler);
+  } catch (_) {}
+
+  scheduleTerminalFit();
 }
 
 // ─── Terminal creation ────────────────────────────────────────────────────────
@@ -812,9 +962,15 @@ function openTerminal(sessionName, remoteId, fontSize) {
  * Close the current terminal session and clean up all resources.
  */
 function closeTerminal() {
-  if (_vpHandler) {
-    if (window.visualViewport) window.visualViewport.removeEventListener('resize', _vpHandler);
-    _vpHandler = null;
+  _unbindVisualViewport();
+  try {
+    var _c = document.getElementById('terminal-container');
+    if (_c) { _c.style.maxHeight = ''; _c.style.height = ''; }
+  } catch (_) {}
+  if (_fitFrame !== null) {
+    try { if (_fitCancel) _fitCancel(_fitFrame); } catch (_) {}
+    _fitFrame = null;
+    _fitCancel = null;
   }
 
   if (_reconnectTimer) {
@@ -867,6 +1023,10 @@ function setTerminalFontSize(size) {
 }
 
 window._setTerminalFontSize = setTerminalFontSize;
+
+// Sole entry point for "the terminal's available space may have changed".
+// mobile-keyboard.js calls this instead of sizing the container itself.
+window._fitTerminalToViewport = scheduleTerminalFit;
 
 // ---------------------------------------------------------------------------
 // Right-click copy-or-paste — module-level, attached ONCE to the static
