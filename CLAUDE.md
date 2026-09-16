@@ -5,7 +5,7 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.6.dev7**, on **`main`** — a **dev/experimental**
+improvements. Current version: **0.9.6.dev8**, on **`main`** — a **dev/experimental**
 build carrying the Mouse Lab selection-fix harness *and* the mobile terminal keybar (both
 below); last released version is **0.9.5**. All feature branches through PR #12 are
 merged and their branches/worktrees deleted — **start new work from `main`**.
@@ -129,17 +129,18 @@ uv run muxplex serve         # http://127.0.0.1:8088 — settings from ~/.config
 ## Tests
 
 ```bash
-uv run pytest -q -m "not integration"              # Python suite (~1427 tests, all green)
+uv run pytest -q -m "not integration"              # Python suite (1434 tests)
 node muxplex/frontend/tests/test_app.mjs           # frontend app logic (523 tests)
-node muxplex/frontend/tests/test_terminal.mjs      # terminal/xterm contracts (26 pass / 27 fail)
-node muxplex/frontend/tests/test_mobile_keyboard.mjs # mobile keybar (8 tests)
+node muxplex/frontend/tests/test_terminal.mjs      # terminal/xterm contracts (64 tests)
+node muxplex/frontend/tests/test_mobile_keyboard.mjs # mobile keybar (16 tests)
 ```
 
-⚠️ **One pre-existing failure — NOT a regression.** `test_terminal.mjs` has **27 harness
-failures**, all from one root cause: `container.addEventListener is not a function` at
-`terminal.js:733` during module require (a DOM-stub gap in the mock, not product code).
-Diff failing test names against a clean checkout before blaming a change. Everything else
-should be green — the Python suite and the other two JS suites pass completely.
+**All four suites are fully green** as of v0.9.6.dev8. `test_terminal.mjs` previously
+carried 27 harness failures (`container.addEventListener is not a function` during module
+require); the `#terminal-container` mock was a bare `{ appendChild }` and terminal.js's
+attach-once IIFEs (contract #3) need a real element. It now uses `makeContainerStub()`.
+**A failure in this suite is therefore a real signal again** — do not assume it is
+environmental.
 
 **`uv run pytest` broken with `ModuleNotFoundError` / `PackageNotFoundError`?** Check
 `head -1 .venv/bin/pytest`. Venvs created before the 2026-06-17 ext4 migration have
@@ -184,6 +185,12 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    clipboard — the original "paste does nothing" bug). Returning false lets the
    browser's native paste event reach xterm's hidden textarea (bracketed paste).
    Reading the clipboard in this path = **double-paste** (COE).
+   **v0.9.6.dev8:** the mobile keybar's Ctrl group carries a **`Paste`** key implemented as
+   `action:'paste'` → `_pasteFromClipboard()` (browser clipboard → xterm bracketed paste).
+   It must NEVER become `{ control: 'v' }` — `controlSequence('v')` is `0x16`/SYN, i.e. the
+   very byte this contract keeps off the PTY. The label is "Paste", not "Ctrl+V", precisely
+   so it does not invite that "simplification". `test_mobile_keyboard.mjs` asserts no key on
+   the bar can emit `0x16`.
 2. **Right-click copy-or-paste** — gesture semantics: right-click WITH a selection
    completes a copy (never pastes); right-click with NO selection pastes via
    `navigator.clipboard.readText()`. Selection is sampled in a capture-phase
@@ -341,6 +348,32 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    browser replays old HTML, requests the OLD `?v=` URLs (a different, still-fresh cache
    key), and a version bump becomes a **silent no-op**. Do not remove the header thinking
    the `?v=` param alone is sufficient — it is not.
+
+11. **`terminal.js` is the SINGLE OWNER of terminal geometry** (v0.9.6.dev8, issue #15) —
+   exactly one place computes `#terminal-container`'s height and calls `fit()`. Two owners
+   used to race: `initVisualViewport`'s handler (resize-only, synchronous, subtracting a
+   hardcoded 44px header and **nothing** for the keybar) and `mobile-keyboard.js`'s
+   rAF-deferred one (which subtracted it correctly). Both ran per keyboard event, so the
+   container was sized twice at two heights and `fit()` fired twice — and since each
+   `fit()` sends a resize to ttyd, **tmux resized twice per keyboard event**, with every
+   TUI redrawing for an intermediate geometry ~one keybar too tall. That is what drew the
+   prompt underneath the keybar. Load-bearing parts:
+   (a) **`mobile-keyboard.js` sizes nothing.** It publishes `--keybar-lift` /
+   `--keybar-height` and calls `window._fitTerminalToViewport()`. It must never set
+   `container.style.height` or call `fitAddon.fit()` again — tests in
+   `test_mobile_keyboard.mjs` pin this.
+   (b) **Dock sync is synchronous, the fit is deferred.** `_vpHandler` calls `syncDock()`
+   inline so the keybar never lags the keyboard, then `scheduleTerminalFit()`, which
+   coalesces a burst of events into ONE fit. iOS emits both `resize` and `scroll` for a
+   single keyboard open; without coalescing that is two tmux resizes again.
+   (c) **Listen to `scroll` as well as `resize`** on `visualViewport` — contract #7's rule,
+   now enforced in `terminal.js` since it owns the binding. A scroll-only signal previously
+   reached only the keybar's handler, which is why the bug looked intermittent.
+   (d) **Degrade, never assume a browser.** `scheduleTerminalFit` prefers rAF, falls back to
+   a timer, then runs inline; the fit guards every DOM lookup. A host without a scheduler
+   must still get correct geometry, not none.
+   (e) `_keybarHeight()` returns 0 when the keybar module is absent or hidden, so the
+   geometry stays correct with the keybar disabled or the module not loaded at all.
 
 ## Hard-won backend contracts (2026-08-08 efficiency work; tests enforce them)
 

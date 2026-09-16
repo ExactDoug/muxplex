@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.9.6.dev8 (2026-09-16) — dev build
+
+Two mobile-keybar fixes found on-device on iPhone. Both are iOS-only in effect; neither
+reproduces in desktop device-emulation.
+
+### Bug fixes
+
+- **The terminal is now sized correctly when the software keyboard is up — the prompt is
+  no longer drawn underneath the keybar** (#15). `#terminal-container` had **two** owners
+  racing to set its height: `terminal.js`'s `initVisualViewport` handler, written before
+  the keybar existed, which subtracted a hardcoded 44px header and *nothing* for the
+  keybar; and `mobile-keyboard.js`'s, which subtracted it correctly. The first ran
+  synchronously, the second one animation frame later, so a single keyboard-open sized the
+  container twice at two different heights and called `fit()` twice. Each `fit()` sends a
+  resize down the wire to ttyd, so **tmux resized twice per keyboard event** and every TUI
+  in the session redrew for an intermediate geometry about a keybar too tall — which is
+  what left the prompt hidden. The two handlers also listened to different events
+  (`terminal.js` to `resize` only; the keybar to `resize` *and* `scroll`), and since iOS
+  signals keyboard show/hide via an `offsetTop` change as often as a resize, which handler
+  "won" varied by event — making the bug look intermittent.
+
+  `terminal.js` is now the **single owner** of terminal geometry. `mobile-keyboard.js`
+  sizes nothing: it publishes `--keybar-lift` / `--keybar-height` and asks for a refit. The
+  dock is synced synchronously so the keybar never lags the keyboard, while the fit is
+  coalesced into one frame, so a burst of viewport events costs exactly **one** tmux
+  resize. If the keybar module is absent the geometry is still correct — it just subtracts
+  zero.
+
+- **The keybar's Ctrl group now has a `Paste` key** (#14), at the left of the row beside
+  `Ctrl+C`, where a thumb lands without scrolling. It is deliberately **not** labelled
+  "Ctrl+V" and deliberately does **not** send one: `Ctrl+V`'s control byte is `0x16`/SYN,
+  which is exactly what frontend contract #1 exists to keep off the PTY — TUI apps then
+  read the *server-side* clipboard, the original "paste does nothing" bug. The key reads
+  the **browser** clipboard via `_pasteFromClipboard()` and routes it through xterm's
+  bracketed paste, the same path right-click already used. A test now enforces that no key
+  anywhere on the bar can emit `0x16`.
+
+### Testing
+
+- **`test_terminal.mjs` is fully green for the first time — 64/64.** It had **27**
+  long-standing failures, all from one harness gap rather than product code: the
+  `#terminal-container` stub was `{ appendChild }` only, so terminal.js's module-level
+  attach-once IIFEs (contract #3) threw `container.addEventListener is not a function` at
+  require time. The stub now models the element properly. This was pre-existing and
+  unrelated to the fixes above; it is fixed here because the geometry work needed
+  terminal-side coverage that the broken harness could not host.
+
 ## v0.9.6.dev7 (2026-08-10) — dev build
 
 ### Bug fixes

@@ -17,6 +17,25 @@ const require = createRequire(import.meta.url);
  * Load a fresh copy of terminal.js with isolated module-level state.
  * Returns { window } after the script has executed.
  */
+// A #terminal-container stub complete enough for terminal.js's module-level
+// attach-once IIFEs (contract #3: initRightClickCopyPaste, initDeliberateSelection,
+// initMobileTerminalScroll all addEventListener on it at require time) and for the
+// geometry owner, which sets .style.height. Before this existed the bare
+// { appendChild } stub threw "container.addEventListener is not a function" during
+// module require, failing 27 tests for harness reasons rather than product ones.
+function makeContainerStub() {
+  return {
+    appendChild: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    style: {},
+    classList: { add: () => {}, remove: () => {}, contains: () => false, toggle: () => {} },
+    getBoundingClientRect: () => ({ height: 0, width: 0, top: 0, bottom: 0, left: 0, right: 0 }),
+    offsetHeight: 0,
+    offsetWidth: 0,
+  };
+}
+
 function loadTerminal() {
   // Delete from require cache so each test gets fresh module-level state
   const modulePath = join(__dirname, '..', 'terminal.js');
@@ -84,7 +103,7 @@ function loadTerminal() {
   globalThis.location = { protocol: 'http:', host: 'localhost' };
   globalThis.document = {
     getElementById: (id) => {
-      if (id === 'terminal-container') return { appendChild: () => {} };
+      if (id === 'terminal-container') return makeContainerStub();
       if (id === 'reconnect-overlay') return { classList: { add: () => {}, remove: () => {} } };
       return null;
     },
@@ -353,7 +372,7 @@ function createMultiSessionEnv() {
   globalThis.location = { protocol: 'http:', host: 'localhost' };
   globalThis.document = {
     getElementById: (id) => {
-      if (id === 'terminal-container') return { appendChild: () => {} };
+      if (id === 'terminal-container') return makeContainerStub();
       if (id === 'reconnect-overlay') return { classList: { add: () => {}, remove: () => {} } };
       return null;
     },
@@ -696,9 +715,12 @@ test('initVisualViewport registers resize handler on window.visualViewport when 
   // RED test: stub does nothing; real impl must call addEventListener('resize', fn)
   const t = loadTerminal();
 
-  let addedEvent = null;
+  // Collect every registration: the handler is bound to BOTH resize and scroll
+  // (contract #7), so latching only the last event name would assert the wrong
+  // thing. The scroll binding is pinned separately below.
+  const addedEvents = [];
   globalThis.window.visualViewport = {
-    addEventListener: (event, _fn) => { addedEvent = event; },
+    addEventListener: (event, _fn) => { addedEvents.push(event); },
     removeEventListener: (_event, _fn) => {},
   };
 
@@ -710,7 +732,7 @@ test('initVisualViewport registers resize handler on window.visualViewport when 
   globalThis.setTimeout = orig;
   delete globalThis.window.visualViewport;
 
-  assert.strictEqual(addedEvent, 'resize',
+  assert.ok(addedEvents.includes('resize'),
     '_vpHandler should be registered as a resize listener on window.visualViewport');
 });
 
@@ -1332,7 +1354,7 @@ test('openTerminal uses passed fontSize to configure xterm.js Terminal construct
   globalThis.location = { protocol: 'http:', host: 'localhost' };
   globalThis.document = {
     getElementById: (id) => {
-      if (id === 'terminal-container') return { appendChild: () => {} };
+      if (id === 'terminal-container') return makeContainerStub();
       if (id === 'reconnect-overlay') return { classList: { add: () => {}, remove: () => {} } };
       return null;
     },
@@ -1766,4 +1788,46 @@ test('an ended terminal is not resurrected by an in-flight /connect continuation
 
   assert.strictEqual(env.wsInstances.length, socketsAtEnd,
     'a late /connect response must not reopen a WebSocket after the session ended');
+});
+
+// ---------------------------------------------------------------------------
+// Terminal geometry: SINGLE OWNER (issue #15)
+//
+// terminal.js alone sizes #terminal-container. It must subtract the mobile
+// keybar's height, or the bottom rows — including the prompt — are drawn
+// underneath the keybar. mobile-keyboard.js used to size the container too; the
+// two handlers raced and tmux resized twice per keyboard event.
+// ---------------------------------------------------------------------------
+
+test('terminal.js exposes a single refit entry point for the keybar to call', () => {
+  loadTerminal();
+  assert.strictEqual(typeof globalThis.window._fitTerminalToViewport, 'function',
+    'mobile-keyboard.js delegates to this instead of sizing the container itself');
+});
+
+test('initVisualViewport listens for visual-viewport scroll as well as resize', () => {
+  // Contract #7: iOS signals keyboard show/hide via an offsetTop change (a
+  // scroll) as often as a resize. Listening only for resize makes the terminal
+  // lag the keyboard, and on a scroll-only signal it never refits at all.
+  const t = loadTerminal();
+
+  const added = [];
+  globalThis.window.visualViewport = {
+    height: 508,
+    offsetTop: 0,
+    addEventListener: (event) => { added.push(event); },
+    removeEventListener: () => {},
+  };
+
+  const orig = globalThis.setTimeout;
+  globalThis.setTimeout = () => 0;
+  try {
+    t.openTerminal('test-session');
+  } finally {
+    globalThis.setTimeout = orig;
+    delete globalThis.window.visualViewport;
+  }
+
+  assert.ok(added.includes('resize'), 'must listen for visualViewport resize');
+  assert.ok(added.includes('scroll'), 'must listen for visualViewport scroll (contract #7)');
 });

@@ -21,6 +21,7 @@ function loadFresh(rootOverrides = {}) {
     _term: globalThis._term,
     _ws: globalThis._ws,
     _encodePayload: globalThis._encodePayload,
+    _pasteFromClipboard: globalThis._pasteFromClipboard,
   };
 
   Object.assign(globalThis, rootOverrides);
@@ -175,6 +176,177 @@ test('syncDock publishes lift/height vars and drops the safe-area pad while the 
   } finally {
     globalThis.visualViewport = previousVV;
     globalThis.innerHeight = previousIH;
+    restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Paste key (frontend contract #1)
+//
+// The bar must never put 0x16/SYN on the PTY: that is the raw Ctrl+V byte that
+// makes TUI apps read the SERVER-side clipboard — the original "paste does
+// nothing" bug. Pasting goes through _pasteFromClipboard() instead.
+// ---------------------------------------------------------------------------
+
+test('ctrl group offers a Paste key and never a control-byte Ctrl+V', () => {
+  const { api, restore } = loadFresh();
+  try {
+    const ctrl = api.ctrlKeys();
+
+    const paste = ctrl.find((k) => k.action === 'paste');
+    assert.ok(paste, 'ctrl group must expose a paste action');
+    assert.equal(paste.label, 'Paste',
+      'label must not read "Ctrl+V" — it does not send Ctrl+V');
+
+    // No definition anywhere on the bar may map to the v control byte.
+    for (const group of [api.normalKeys(), api.ctrlKeys()]) {
+      for (const key of group) {
+        assert.notEqual(String(key.control || '').toLowerCase(), 'v',
+          'contract #1: no key may emit 0x16/SYN');
+      }
+    }
+  } finally {
+    restore();
+  }
+});
+
+test('Paste sits at the left of the ctrl group, beside Ctrl+C', () => {
+  const { api, restore } = loadFresh();
+  try {
+    const labels = api.ctrlKeys().map((k) => k.label);
+    assert.deepEqual(labels.slice(0, 4), ['Esc', 'Back', 'Paste', 'Ctrl+C'],
+      'paste and interrupt must be reachable without horizontal scrolling');
+  } finally {
+    restore();
+  }
+});
+
+test('activating Paste reads the browser clipboard and sends nothing to the PTY', () => {
+  const written = [];
+  const term = {
+    input(data) { written.push(data); },
+    focus() {},
+  };
+  let pasteCalls = 0;
+  const { api, restore } = loadFresh({
+    _term: term,
+    _pasteFromClipboard() { pasteCalls += 1; return true; },
+  });
+  try {
+    const paste = api.ctrlKeys().find((k) => k.action === 'paste');
+    assert.equal(api.activateKey(paste), true);
+    assert.equal(pasteCalls, 1, 'must route through _pasteFromClipboard');
+    assert.deepEqual(written, [],
+      'contract #1: the paste path must not write to the terminal/PTY directly');
+  } finally {
+    restore();
+  }
+});
+
+test('Paste degrades safely when the clipboard helper is unavailable', () => {
+  const { api, restore } = loadFresh({ _term: null, _ws: null, _pasteFromClipboard: undefined });
+  try {
+    const paste = api.ctrlKeys().find((k) => k.action === 'paste');
+    assert.equal(api.activateKey(paste), false);
+  } finally {
+    restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Terminal geometry is owned by terminal.js alone (issue #15)
+//
+// This module must NOT size #terminal-container or call fit(). Two owners racing
+// meant two fits per keyboard event, so tmux resized twice and every TUI redrew
+// for an intermediate geometry a keybar too tall — which drew the prompt under
+// the keybar.
+// ---------------------------------------------------------------------------
+
+function geometryHarness() {
+  const container = { style: {} };
+  const fits = [];
+  const props = new Map();
+  return {
+    container,
+    fits,
+    props,
+    overrides: {
+      _term: { input() {}, focus() {} },
+      _fitAddon: { fit() { fits.push('keybar-fit'); } },
+      _fitTerminalToViewport() { fits.push('requested'); },
+      document: {
+        documentElement: { style: { setProperty: (k, v) => props.set(k, v) } },
+        createElement: () => ({
+          style: {}, classList: { toggle() {}, add() {}, remove() {} },
+          setAttribute() {}, appendChild() {},
+        }),
+        querySelector: () => null,
+        getElementById: (id) => (id === 'terminal-container' ? container : null),
+        head: { appendChild() {} },
+      },
+    },
+  };
+}
+
+test('resizeForVisualViewport never sizes the terminal or calls fit itself', () => {
+  const h = geometryHarness();
+  const previousVV = globalThis.visualViewport;
+  const previousIH = globalThis.innerHeight;
+  const { api, restore } = loadFresh(h.overrides);
+  try {
+    globalThis.innerHeight = 844;
+    globalThis.visualViewport = { height: 508, offsetTop: 0 };
+
+    api.resizeForVisualViewport();
+
+    assert.equal(h.container.style.height, undefined,
+      'issue #15: this module must not own #terminal-container height');
+    assert.ok(!h.fits.includes('keybar-fit'),
+      'issue #15: this module must not call fitAddon.fit()');
+  } finally {
+    globalThis.visualViewport = previousVV;
+    globalThis.innerHeight = previousIH;
+    restore();
+  }
+});
+
+test('resizeForVisualViewport syncs the dock and delegates the fit to terminal.js', () => {
+  const h = geometryHarness();
+  const previousVV = globalThis.visualViewport;
+  const previousIH = globalThis.innerHeight;
+  const { api, restore } = loadFresh(h.overrides);
+  try {
+    globalThis.innerHeight = 844;
+    globalThis.visualViewport = { height: 508, offsetTop: 0 };
+
+    api.resizeForVisualViewport();
+
+    assert.equal(h.props.get('--keybar-lift'), '336px', 'dock vars stay this module\'s job');
+    assert.deepEqual(h.fits, ['requested'], 'exactly one refit request, delegated');
+  } finally {
+    globalThis.visualViewport = previousVV;
+    globalThis.innerHeight = previousIH;
+    restore();
+  }
+});
+
+test('resizeForVisualViewport is a safe no-op when terminal.js exposes no fitter', () => {
+  const h = geometryHarness();
+  delete h.overrides._fitTerminalToViewport;
+  const { api, restore } = loadFresh(h.overrides);
+  try {
+    assert.doesNotThrow(() => api.resizeForVisualViewport());
+  } finally {
+    restore();
+  }
+});
+
+test('toolbarHeight is exported so terminal.js can subtract the keybar', () => {
+  const { api, restore } = loadFresh();
+  try {
+    assert.equal(typeof api.toolbarHeight, 'function');
+    assert.equal(api.toolbarHeight(), 0, 'no toolbar built in this harness → contributes nothing');
+  } finally {
     restore();
   }
 });
