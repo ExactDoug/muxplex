@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.9.6.dev8 (2026-09-16) — dev build
+## v0.9.6.dev9 (2026-09-16) — dev build
 
 Two mobile-keybar fixes found on-device on iPhone. Both are iOS-only in effect; neither
 reproduces in desktop device-emulation.
@@ -8,7 +8,17 @@ reproduces in desktop device-emulation.
 ### Bug fixes
 
 - **The terminal is now sized correctly when the software keyboard is up — the prompt is
-  no longer drawn underneath the keybar** (#15). `#terminal-container` had **two** owners
+  no longer drawn underneath the keybar** (#15). Two distinct defects, both needed:
+
+  **The height assignment was inert.** `#terminal-container` is `flex: 1` inside a column
+  flex `.terminal-wrapper`, and `flex: 1` implies `flex-basis: 0%`, which **overrides the
+  `height` property** for a flex item's main size. So `container.style.height = …` — which
+  *both* of the racing handlers did — never applied. The container simply grew to fill the
+  wrapper, and the wrapper is sized by the **layout** viewport, which iOS does not shrink
+  for the keyboard. The fit now sets **`max-height`**, which the flex algorithm does honour
+  (flex items are clamped to their min/max bounds). This is fail-safe: it can only make the
+  terminal smaller than the previous behaviour, never larger, so a bad measurement degrades
+  toward the status quo rather than breaking desktop. `#terminal-container` had **two** owners
   racing to set its height: `terminal.js`'s `initVisualViewport` handler, written before
   the keybar existed, which subtracted a hardcoded 44px header and *nothing* for the
   keybar; and `mobile-keyboard.js`'s, which subtracted it correctly. The first ran

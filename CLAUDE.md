@@ -5,7 +5,7 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.6.dev8**, on **`main`** — a **dev/experimental**
+improvements. Current version: **0.9.6.dev9**, on **`main`** — a **dev/experimental**
 build carrying the Mouse Lab selection-fix harness *and* the mobile terminal keybar (both
 below); last released version is **0.9.5**. All feature branches through PR #12 are
 merged and their branches/worktrees deleted — **start new work from `main`**.
@@ -135,7 +135,7 @@ node muxplex/frontend/tests/test_terminal.mjs      # terminal/xterm contracts (6
 node muxplex/frontend/tests/test_mobile_keyboard.mjs # mobile keybar (16 tests)
 ```
 
-**All four suites are fully green** as of v0.9.6.dev8. `test_terminal.mjs` previously
+**All four suites are fully green** as of v0.9.6.dev9. `test_terminal.mjs` previously
 carried 27 harness failures (`container.addEventListener is not a function` during module
 require); the `#terminal-container` mock was a bare `{ appendChild }` and terminal.js's
 attach-once IIFEs (contract #3) need a real element. It now uses `makeContainerStub()`.
@@ -185,7 +185,7 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    clipboard — the original "paste does nothing" bug). Returning false lets the
    browser's native paste event reach xterm's hidden textarea (bracketed paste).
    Reading the clipboard in this path = **double-paste** (COE).
-   **v0.9.6.dev8:** the mobile keybar's Ctrl group carries a **`Paste`** key implemented as
+   **v0.9.6.dev9:** the mobile keybar's Ctrl group carries a **`Paste`** key implemented as
    `action:'paste'` → `_pasteFromClipboard()` (browser clipboard → xterm bracketed paste).
    It must NEVER become `{ control: 'v' }` — `controlSequence('v')` is `0x16`/SYN, i.e. the
    very byte this contract keeps off the PTY. The label is "Paste", not "Ctrl+V", precisely
@@ -349,8 +349,16 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    key), and a version bump becomes a **silent no-op**. Do not remove the header thinking
    the `?v=` param alone is sufficient — it is not.
 
-11. **`terminal.js` is the SINGLE OWNER of terminal geometry** (v0.9.6.dev8, issue #15) —
-   exactly one place computes `#terminal-container`'s height and calls `fit()`. Two owners
+11. **`terminal.js` is the SINGLE OWNER of terminal geometry** (v0.9.6.dev9, issue #15) —
+   exactly one place computes `#terminal-container`'s height and calls `fit()`.
+   **(0) Size it with `max-height`, never `height`.** `#terminal-container` is `flex: 1` in
+   a column flex `.terminal-wrapper`, so `flex-basis: 0%` **overrides `height`** for its
+   main size — `container.style.height = …` is INERT and the container grows to fill the
+   wrapper, which the **layout** viewport sizes and iOS never shrinks for the keyboard.
+   That, not the handler race below, is what buried the prompt. `max-height` IS honoured
+   (flex items clamp to min/max) and is fail-safe: it can only shrink the terminal, so a
+   wrong measurement degrades toward the old behaviour instead of breaking desktop. Do not
+   "simplify" this back to `height`. Two owners
    used to race: `initVisualViewport`'s handler (resize-only, synchronous, subtracting a
    hardcoded 44px header and **nothing** for the keybar) and `mobile-keyboard.js`'s
    rAF-deferred one (which subtracted it correctly). Both ran per keyboard event, so the

@@ -1831,3 +1831,78 @@ test('initVisualViewport listens for visual-viewport scroll as well as resize', 
   assert.ok(added.includes('resize'), 'must listen for visualViewport resize');
   assert.ok(added.includes('scroll'), 'must listen for visualViewport scroll (contract #7)');
 });
+
+test('the fit caps the container with max-height, not just height', () => {
+  // #terminal-container is `flex: 1` in a column flex wrapper, so `flex-basis: 0%`
+  // overrides the height property for its main size — setting height alone is
+  // INERT and the container grows to fill the layout viewport, which iOS does not
+  // shrink for the keyboard. A max-height constraint is honoured by the flex
+  // algorithm and is what actually bounds the terminal.
+  const t = loadTerminal();
+
+  const container = makeContainerStub();
+  const realGet = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) =>
+    (id === 'terminal-container' ? container : realGet(id));
+
+  globalThis.window.visualViewport = {
+    height: 500,
+    offsetTop: 0,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+
+  const orig = globalThis.setTimeout;
+  globalThis.setTimeout = () => 0;
+  try {
+    t.openTerminal('test-session');
+    // The fit is deferred (one fit per burst of viewport events), so drive the
+    // scheduler synchronously to observe its result.
+    globalThis.setTimeout = (fn) => { fn(); return 0; };
+    globalThis.window._fitTerminalToViewport();
+  } finally {
+    globalThis.setTimeout = orig;
+    delete globalThis.window.visualViewport;
+    globalThis.document.getElementById = realGet;
+  }
+
+  assert.ok(container.style.maxHeight,
+    'max-height must be set — height alone is overridden by flex-basis');
+  assert.match(container.style.maxHeight, /^\d+px$/);
+});
+
+test('the keybar height is subtracted from the terminal', () => {
+  const t = loadTerminal();
+
+  const container = makeContainerStub();
+  const realGet = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) =>
+    (id === 'terminal-container' ? container : realGet(id));
+
+  globalThis.window.visualViewport = {
+    height: 500,
+    offsetTop: 0,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  };
+  // Header falls back to 44 (querySelector returns null in this stub).
+  globalThis.window.MuxplexMobileKeyboard = { syncDock: () => 0, toolbarHeight: () => 54 };
+
+  const orig = globalThis.setTimeout;
+  globalThis.setTimeout = () => 0;
+  try {
+    t.openTerminal('test-session');
+    // The fit is deferred (one fit per burst of viewport events), so drive the
+    // scheduler synchronously to observe its result.
+    globalThis.setTimeout = (fn) => { fn(); return 0; };
+    globalThis.window._fitTerminalToViewport();
+  } finally {
+    globalThis.setTimeout = orig;
+    delete globalThis.window.visualViewport;
+    delete globalThis.window.MuxplexMobileKeyboard;
+    globalThis.document.getElementById = realGet;
+  }
+
+  assert.strictEqual(container.style.maxHeight, `${500 - 44 - 54}px`,
+    'visual viewport minus header minus keybar');
+});

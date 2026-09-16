@@ -559,7 +559,26 @@ function fitTerminalToViewport() {
     80,
     Math.floor(available - _chromeHeight(header, 44) - _chromeHeight(search, 0) - _keybarHeight())
   );
-  try { container.style.height = height + 'px'; } catch (_) {}
+
+  // maxHeight, NOT height. #terminal-container is `flex: 1` inside a column flex
+  // .terminal-wrapper (style.css), and `flex: 1` means `flex-basis: 0%`, which
+  // OVERRIDES the height property for a flex item's main size. Assigning
+  // container.style.height here is therefore inert — it always was, in both of the
+  // handlers that used to race, which is why the prompt stayed buried even after
+  // the geometry arithmetic was correct. The container simply grew to fill the
+  // wrapper, and the wrapper is sized by the LAYOUT viewport, which iOS does not
+  // shrink for the keyboard.
+  //
+  // A max-height constraint IS honoured by the flex algorithm (flex items are
+  // clamped to their min/max), so the container grows as before and is capped at
+  // the visual viewport's usable height. It is also fail-safe: it can only ever
+  // make the terminal smaller than today's behaviour, never larger, so a wrong
+  // measurement degrades toward the status quo instead of breaking desktop.
+  // height is set alongside it for non-flex contexts and harmless where flex wins.
+  try {
+    container.style.maxHeight = height + 'px';
+    container.style.height = height + 'px';
+  } catch (_) {}
   try { _fitAddon.fit(); } catch (_) {}
 }
 
@@ -944,6 +963,10 @@ function openTerminal(sessionName, remoteId, fontSize) {
  */
 function closeTerminal() {
   _unbindVisualViewport();
+  try {
+    var _c = document.getElementById('terminal-container');
+    if (_c) { _c.style.maxHeight = ''; _c.style.height = ''; }
+  } catch (_) {}
   if (_fitFrame !== null) {
     try { if (_fitCancel) _fitCancel(_fitFrame); } catch (_) {}
     _fitFrame = null;
