@@ -81,6 +81,38 @@ def redirect_muxplex_paths(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def never_kill_the_real_ttyd(monkeypatch):
+    """Autouse: stop ``kill_ttyd()``'s port fallback from signalling REAL processes.
+
+    ``ttyd._kill_pids_on_port`` runs ``lsof -ti :7682`` and SIGTERMs every PID it
+    lists.  ``TTYD_PORT`` is hardcoded, and ``lsof -i :PORT`` matches EITHER end of
+    a connection — so it lists the developer's live ttyd *and* their running
+    muxplex server, which holds a client socket to ttyd while a terminal is open.
+    Redirecting ``TTYD_PID_PATH`` (``redirect_muxplex_paths``) does not reach this
+    fallback.
+
+    Found 2026-10-06: a canary listener on 7682 was killed by a plain
+    ``pytest -m "not integration"`` (on ``main`` too), and the user's live server
+    vanished mid-session with no shutdown log.
+
+    Only ``lsof`` is intercepted (reported as "nothing found"); every other
+    ``subprocess.run`` passes through.  Tests that exercise the fallback install
+    their own ``patch("muxplex.ttyd._subprocess.run", ...)``, which overrides this
+    for the duration of the test.
+    """
+    import subprocess as _sp
+
+    real_run = _sp.run
+
+    def guarded_run(cmd, *args, **kwargs):
+        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "lsof":
+            return _sp.CompletedProcess(cmd, 1, stdout="", stderr="")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr("muxplex.ttyd._subprocess.run", guarded_run)
+
+
+@pytest.fixture(autouse=True)
 def reset_session_times(monkeypatch):
     """Isolate the process-global list-sessions times map (issue #24).
 
