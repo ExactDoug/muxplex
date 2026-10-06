@@ -66,7 +66,12 @@
         <input type="text" class="session-search__input hidden" placeholder="Search sessions&#8230;" aria-label="Search sessions" autocomplete="off" spellcheck="false" />
       </div>
       <span id="expanded-session-name" class="expanded-session-name"></span>
-      <nav id="expanded-pills" class="expanded-pills" aria-label="Session navigation"></nav>
+      <!-- Strip + Other Sessions host: Other Sessions sits OUTSIDE the scrolling
+           strip so no layout can push it off-screen (#24) -->
+      <div id="expanded-pills-wrap" class="expanded-pills-wrap">
+        <nav id="expanded-pills" class="expanded-pills" aria-label="Session navigation"></nav>
+        <div id="expanded-pills-other" class="expanded-pills-other"></div>
+      </div>
       <button id="new-session-btn-expanded" class="header-btn" aria-label="New session">+</button>
       <button id="settings-btn-expanded" class="header-btn" aria-label="Settings">&#9881;</button>
     </header>
@@ -112,6 +117,9 @@
 
   <!-- ── Expanded-header pill dropdown (shared, fixed-positioned) ───────── -->
   <div id="expanded-pill-menu" class="view-dropdown__menu expanded-pill-menu hidden" role="menu" aria-label="Sessions"></div>
+  <!-- Other Sessions folder → sessions submenu: a SIBLING of the menu, because
+       the menu scrolls and would clip a nested flyout (#24) -->
+  <div id="expanded-pill-submenu" class="view-dropdown__menu expanded-pill-menu expanded-pill-submenu hidden" role="menu" aria-label="Folder sessions"></div>
 
   <!-- ── Universal search results (shared, fixed-positioned) ────────────── -->
   <div id="session-search-results" class="view-dropdown__menu session-search-results hidden" role="listbox" aria-label="Search results"></div>

@@ -3908,16 +3908,27 @@ function _setViewingRemoteId(rid) {
 // ─── Expanded-header session pills ───────────────────────────────────────────
 // Session-level navigation strip in the expanded (terminal) header.
 // Design: docs/plans/2026-06-04-expanded-header-session-pills-design.md
+// Folder pills / Other Sessions tree: docs/plans/2026-10-06-header-project-folders-plan.md (#24)
 //
 // Layout (left→right): current-session pill (distinct, no-op) → one group of
-// sibling pills per "home view" (views containing the current session),
-// separated by vertical bars → dropdown pill per other view → right-aligned
-// "Other Sessions" dropdown. Hidden sessions excluded everywhere; strip is
-// hidden < 600px via CSS (the plain name label returns).
+// sibling pills per "home view" (views containing the current session, then
+// the current session's folder), separated by vertical bars → one dropdown pill
+// per other view, then one 📁 pill per other project FOLDER, most recently
+// accessed first, placed while they fit → "Other Sessions", which lives OUTSIDE
+// the scrolling strip (#expanded-pills-other) so it can never be pushed off,
+// and holds everything that did not fit as folder → session submenus.
+// Hidden sessions excluded everywhere; strip is hidden < 600px via CSS (the
+// plain name label returns).
 
 var _expandedPillsModel = null;   // last built model (slim sessions)
-var _expandedPillsAlloc = null;   // last per-group inline counts
-var _expandedPillMenuFor = null;  // open dropdown key ('view:i'|'overflow:i'|'other') or null
+var _expandedPillsAlloc = null;   // last per-home-group inline counts
+var _expandedPillsOverflow = [];  // otherViews entries that did not fit (Other Sessions rows)
+var _expandedPillMenuFor = null;  // open dropdown key ('h:<gk>'|'c:<gk>'|'other') or null
+var _expandedPillSubmenuFor = null; // open Other Sessions submenu key ('f:<x>'|'v:<x>'|'ungrouped')
+var _epSubmenuByHover = false;    // the open submenu was opened by mouse hover (next click keeps it)
+var _epSubmenuTimer = null;       // pending hover switch to another row's submenu
+var _epSubmenuPendingKey = null;  // row that pending switch targets
+var EP_SUBMENU_SWITCH_MS = 150;   // diagonal-travel grace before hover switches rows
 var _pillMeasureEl = null;        // offscreen measurement container
 var _pillWidthCache = {};         // normalized pill signature -> measured width
 var _pillWidthCacheSize = 0;      // tracked separately (Object.keys() is O(n))
@@ -3960,19 +3971,87 @@ function _epSessionSort(a, b) {
 }
 
 /**
+ * MRU recency of a session (#24): the newer of its last tmux attach and its
+ * creation — launching a session counts as accessing it. Epoch seconds; 0 when
+ * unknown (older federated peers send neither field).
+ *
+ * tmux stamps session_last_attached on every terminal connection, and muxplex
+ * has ONE shared active session across all browsers, so ordering by switch-in
+ * time equals ordering by last use for every non-current folder.
+ */
+function sessionRecency(s) {
+  if (!s) return 0;
+  var a = Number(s.lastAttached) || 0;
+  var c = Number(s.created) || 0;
+  return a > c ? a : c;
+}
+
+/** Most recently accessed first; ties alphabetical (then by device). */
+function _epRecencySort(a, b) {
+  var d = sessionRecency(b) - sessionRecency(a);
+  return d !== 0 ? d : _epSessionSort(a, b);
+}
+
+/**
+ * Strip-local folder groups (#24). Pure.
+ *
+ * Unlike buildAutoViews() — which keeps its >=2-session minimum (A8, contract
+ * #6) for the dashboard pills, sidebar and search tags — EVERY folder with a
+ * live session forms a group here, so a single-session project gets the same
+ * 📁 pill as a busy one. Still honors the "Directory auto-views" toggle.
+ *
+ * @param {object[]} pool - live, non-hidden sessions
+ * @param {object} settings
+ * @returns {Array<{name:string, sessions:object[], recency:number}>} most
+ *   recent folder first (name tie-break); members most recent first.
+ */
+function buildStripFolderGroups(pool, settings) {
+  if (settings && settings.autoViewsEnabled === false) return [];
+  var byKey = new Map(); // a Map, so folder names like "__proto__" are plain keys
+  for (var i = 0; i < pool.length; i++) {
+    var key = sessionGroupKey(pool[i]);
+    if (!key) continue;
+    var g = byKey.get(key);
+    if (!g) {
+      g = { name: key, sessions: [], recency: 0 };
+      byKey.set(key, g);
+    }
+    g.sessions.push(pool[i]);
+    var r = sessionRecency(pool[i]);
+    if (r > g.recency) g.recency = r;
+  }
+  var out = Array.from(byKey.values());
+  for (var oi = 0; oi < out.length; oi++) out[oi].sessions.sort(_epRecencySort);
+  out.sort(function (a, b) {
+    if (b.recency !== a.recency) return b.recency - a.recency;
+    var an = a.name.toLowerCase(), bn = b.name.toLowerCase();
+    return an < bn ? -1 : an > bn ? 1 : 0;
+  });
+  return out;
+}
+
+/**
  * Build the expanded-header pills model. Pure — no DOM access.
  *
- * Rules (see design doc):
+ * Rules (see design docs):
  * - live, non-hidden sessions only (status sentinels excluded);
- * - homeGroups = views containing the current session, in views-array order;
- *   each holds the view's OTHER members (current excluded), alphabetical,
- *   deduped across groups (a sibling in several home views renders in the
- *   first one only); empty groups are dropped;
- * - otherViews = remaining (non-empty) views with full membership;
- * - otherSessions = sessions in NO view (and not current);
+ * - homeGroups = views containing the current session, in views-array order,
+ *   then the current session's FOLDER; each holds the group's OTHER members
+ *   (current excluded), deduped across groups (a sibling in several home
+ *   groups renders in the first one only); empty groups are dropped. View
+ *   members are alphabetical; folder members most recently accessed first;
+ * - otherViews = remaining (non-empty) views with full membership, then every
+ *   other folder (singletons included, #24), most recently accessed first —
+ *   the candidates for inline pills; whatever does not fit goes to Other
+ *   Sessions;
+ * - otherSessions = sessions in NO view and NO folder (and not current) — the
+ *   keyless "(no folder)" bucket, or today's flat list when the Directory
+ *   auto-views toggle is off;
  * - same 7-view cap as the main-page pills.
+ * Every group carries a stable, name-derived `key` ('v:<view>' / 'f:<folder>')
+ * so open menus survive re-renders that reorder or add/remove folders.
  *
- * @returns {object|null} { current, homeGroups, otherViews, otherSessions }
+ * @returns {object|null} { current, homeGroups, otherViews, otherSessions, foldersEnabled }
  */
 function buildExpandedPillsModel(sessions, settings, currentName, currentRemoteId) {
   if (!currentName) return null;
@@ -3982,7 +4061,8 @@ function buildExpandedPillsModel(sessions, settings, currentName, currentRemoteI
   function isHiddenS(s) {
     return hiddenList.indexOf(keyOf(s)) !== -1 || hiddenList.indexOf(s.name) !== -1;
   }
-  var pool = (sessions || []).filter(function (s) { return !s.status && !isHiddenS(s); });
+  var live = (sessions || []).filter(function (s) { return !s.status; });
+  var pool = live.filter(function (s) { return !isHiddenS(s); });
 
   var rid = currentRemoteId != null ? String(currentRemoteId) : '';
   function isCurrent(s) {
@@ -3992,6 +4072,14 @@ function buildExpandedPillsModel(sessions, settings, currentName, currentRemoteI
   for (var ci = 0; ci < pool.length; ci++) {
     if (isCurrent(pool[ci])) { currentSession = pool[ci]; break; }
   }
+  // The current session's folder comes from the UNFILTERED list: a hidden
+  // current session still owns its folder, which must stay the home group and
+  // never turn into an ordinary candidate pill.
+  var currentLive = currentSession;
+  for (var li = 0; !currentLive && li < live.length; li++) {
+    if (isCurrent(live[li])) currentLive = live[li];
+  }
+  var currentFolder = currentLive ? sessionGroupKey(currentLive) : null;
 
   var views = ((settings && settings.views) || []).slice(0, 7);
   function inView(v, s) {
@@ -4020,39 +4108,34 @@ function buildExpandedPillsModel(sessions, settings, currentName, currentRemoteI
         seen[k] = true;
         sibs.push(_epSlim(s));
       }
-      if (sibs.length > 0) homeGroups.push({ viewName: v.name, sessions: sibs });
+      if (sibs.length > 0) homeGroups.push({ key: 'v:' + v.name, viewName: v.name, sessions: sibs });
     } else if (members.length > 0) {
-      otherViews.push({ viewName: v.name, sessions: members.map(_epSlim) });
+      otherViews.push({ key: 'v:' + v.name, viewName: v.name, sessions: members.map(_epSlim) });
     }
   }
 
-  // Auto-views (directory groups) in the strip:
-  // - the current session's directory group becomes a "same directory" home
-  //   group after the view home groups (A9), siblings deduped like the rest;
-  // - other directory groups join otherViews as dropdown pills (A3),
-  //   visually distinguished via isAuto.
-  var autoViews = buildAutoViews(sessions, settings);
-  for (var ai = 0; ai < autoViews.length; ai++) {
-    var av = autoViews[ai];
-    var avMembers = pool.filter(function (s) {
-      return av.sessions.indexOf(keyOf(s)) !== -1;
-    }).sort(_epSessionSort);
-    var currentInAuto = currentSession
-      ? av.sessions.indexOf(keyOf(currentSession)) !== -1
-      : av.sessions.indexOf(currentName) !== -1;
-    if (currentInAuto) {
+  // Project folders (#24): the current session's folder becomes a "same
+  // directory" home group after the view home groups (A9), siblings deduped
+  // like the rest; every other folder — single-session ones included — is a
+  // 📁 candidate pill, most recently accessed first.
+  var folders = buildStripFolderGroups(pool, settings);
+  var inFolder = {};
+  for (var fi = 0; fi < folders.length; fi++) {
+    var f = folders[fi];
+    for (var mi = 0; mi < f.sessions.length; mi++) inFolder[keyOf(f.sessions[mi])] = true;
+    if (currentFolder != null && f.name === currentFolder) {
       var dirSibs = [];
-      for (var di = 0; di < avMembers.length; di++) {
-        var ds = avMembers[di];
+      for (var di = 0; di < f.sessions.length; di++) {
+        var ds = f.sessions[di];
         if (isCurrent(ds)) continue;
         var dk = keyOf(ds);
         if (seen[dk]) continue;
         seen[dk] = true;
         dirSibs.push(_epSlim(ds));
       }
-      if (dirSibs.length > 0) homeGroups.push({ viewName: av.name, isAuto: true, sessions: dirSibs });
-    } else if (avMembers.length > 0) {
-      otherViews.push({ viewName: av.name, isAuto: true, sessions: avMembers.map(_epSlim) });
+      if (dirSibs.length > 0) homeGroups.push({ key: 'f:' + f.name, viewName: f.name, isAuto: true, sessions: dirSibs });
+    } else {
+      otherViews.push({ key: 'f:' + f.name, viewName: f.name, isAuto: true, sessions: f.sessions.map(_epSlim) });
     }
   }
 
@@ -4061,19 +4144,22 @@ function buildExpandedPillsModel(sessions, settings, currentName, currentRemoteI
     for (var ki = 0; ki < views.length; ki++) {
       if (inView(views[ki], s)) return false;
     }
-    // Sessions reachable via a directory group pill aren't "other" —
-    // without this they'd show in both that dropdown and Other Sessions
-    for (var aki = 0; aki < autoViews.length; aki++) {
-      if (autoViews[aki].sessions.indexOf(keyOf(s)) !== -1) return false;
-    }
-    return true;
+    // Sessions reachable via a folder pill aren't "other" — without this
+    // they'd show in both that folder and the (no folder) bucket
+    return !inFolder[keyOf(s)];
   }).sort(_epSessionSort).map(_epSlim);
 
   var current = currentSession
     ? _epSlim(currentSession)
     : { name: currentName, remoteId: rid, deviceName: '', bell: false };
 
-  return { current: current, homeGroups: homeGroups, otherViews: otherViews, otherSessions: otherSessions };
+  return {
+    current: current,
+    homeGroups: homeGroups,
+    otherViews: otherViews,
+    otherSessions: otherSessions,
+    foldersEnabled: !(settings && settings.autoViewsEnabled === false),
+  };
 }
 
 /**
@@ -4136,6 +4222,71 @@ function allocateExpandedPills(groups, fixedWidth, available, gap) {
     }
   }
   return counts;
+}
+
+/**
+ * Prefix placement of candidate pills (D6). Pure.
+ *
+ * Places candidates IN ORDER and stops at the first that does not fit — it
+ * never skips a wide pill to squeeze in a later narrow one, so Other Sessions
+ * holds exactly "everything older than the last visible pill".
+ *
+ * @returns {number} how many leading candidates fit after `used`
+ */
+function placeStripCandidates(widths, used, available, gap) {
+  gap = gap != null ? gap : EP_GAP;
+  var n = 0;
+  for (var i = 0; i < widths.length; i++) {
+    if (used + widths[i] + gap > available) break;
+    used += widths[i] + gap;
+    n++;
+  }
+  return n;
+}
+
+/** Width the home groups occupy at `counts` — the same accounting
+ *  allocateExpandedPills uses (a collapsed tail costs one dropdown pill). */
+function _epGroupsWidth(groups, counts, gap) {
+  var w = 0;
+  for (var i = 0; i < groups.length; i++) {
+    var g = groups[i];
+    var k = counts[i] || 0;
+    for (var j = 0; j < k; j++) w += g.sessionWidths[j] + gap;
+    if (k < g.sessionWidths.length) w += g.collapsedWidth + gap;
+  }
+  return w;
+}
+
+/**
+ * Lay out the whole strip. Pure — widths are injected, so the complete
+ * calculation is testable under node (where real measurement returns 0).
+ *
+ * Case A (only when nothing is ungrouped): the full width with NO Other
+ * Sessions pill — accepted only if every candidate fits. Case B: reserve the
+ * Other Sessions pill (it sits outside the scrolling strip, so it is always
+ * visible) and fill what remains. Home-group siblings get width before
+ * candidates (D2), exactly as allocateExpandedPills already decides.
+ *
+ * @param {{fixedWidth:number, groups:Array<{sessionWidths:number[], collapsedWidth:number}>,
+ *   candidateWidths:number[], otherWidth:number, needOther:boolean}} spec
+ * @param {number} available - width of the strip + Other Sessions host
+ * @returns {{counts:number[], placed:number, showOther:boolean}}
+ */
+function layoutStrip(spec, available, gap) {
+  gap = gap != null ? gap : EP_GAP;
+  function attempt(avail) {
+    var counts = allocateExpandedPills(spec.groups, spec.fixedWidth, avail, gap);
+    var used = spec.fixedWidth + _epGroupsWidth(spec.groups, counts, gap);
+    return { counts: counts, placed: placeStripCandidates(spec.candidateWidths, used, avail, gap) };
+  }
+  if (!spec.needOther) {
+    var a = attempt(available);
+    if (a.placed === spec.candidateWidths.length) {
+      return { counts: a.counts, placed: a.placed, showOther: false };
+    }
+  }
+  var b = attempt(available - (spec.otherWidth + gap));
+  return { counts: b.counts, placed: b.placed, showOther: true };
 }
 
 /** Amber activity dot for a slim session; respects the activity-indicator
@@ -4224,6 +4375,87 @@ function _epMeasureWidth(html) {
   return w;
 }
 
+/** "Other Sessions" pill HTML; the count is unique sessions behind it. */
+function _epOtherPillHTML(count) {
+  return _epMenuPillHTML('other', 'Other Sessions', String(count), ' nav-pill--other');
+}
+
+/** Count of DISTINCT sessions across slim-session lists (a view and a folder
+ *  can hold the same session — it must not be counted twice). */
+function _epUniqueSessionCount(lists) {
+  var seen = {};
+  var n = 0;
+  for (var i = 0; i < lists.length; i++) {
+    for (var j = 0; j < lists[i].length; j++) {
+      var s = lists[i][j];
+      var id = (s.remoteId || '') + '\u0000' + s.name;
+      if (!seen[id]) { seen[id] = true; n++; }
+    }
+  }
+  return n;
+}
+
+/** The elements that host pills: the scrolling strip and the Other Sessions
+ *  host outside it (absent in older markup / tests → strip only). */
+function _epPillRoots() {
+  var roots = [];
+  var nav = $('expanded-pills');
+  var otherHost = $('expanded-pills-other');
+  if (nav) roots.push(nav);
+  if (otherHost) roots.push(otherHost);
+  return roots;
+}
+
+/** Find an element under `roots` whose `attr` EQUALS `value` — compared, never
+ *  interpolated into a CSS selector, so keys built from folder/view names
+ *  containing quotes or backslashes are safe. */
+function _epFindByAttr(roots, attr, value) {
+  for (var r = 0; r < roots.length; r++) {
+    var root = roots[r];
+    if (!root || typeof root.querySelectorAll !== 'function') continue;
+    var els = root.querySelectorAll('[' + attr + ']');
+    for (var i = 0; i < els.length; i++) {
+      if (els[i].getAttribute && els[i].getAttribute(attr) === value) return els[i];
+    }
+  }
+  return null;
+}
+
+/** Pill element for a dropdown key (strip or Other Sessions host), or null. */
+function _epFindPill(key) {
+  return _epFindByAttr(_epPillRoots(), 'data-pill-menu', key);
+}
+
+/**
+ * Rewrite `root`'s content via `write()` without losing the user's place:
+ * keyboard focus (matched by the focused element's identifying data
+ * attributes) and scroll position are restored afterwards. Poll-driven
+ * re-renders (a bell, a reorder) would otherwise destroy the focused button.
+ */
+function _epPreserveFocus(root, write) {
+  var doc = typeof document !== 'undefined' ? document : null;
+  var active = doc && doc.activeElement;
+  var had = !!(active && root && typeof root.contains === 'function' && root.contains(active) && active !== root);
+  var ATTRS = ['data-session', 'data-remote-id', 'data-pill-menu', 'data-sub-key', 'data-rename'];
+  var ident = null;
+  if (had && typeof active.getAttribute === 'function') {
+    ident = ATTRS.map(function (a) { return active.getAttribute(a); });
+  }
+  var scroll = root && typeof root.scrollTop === 'number' ? root.scrollTop : 0;
+  write();
+  if (scroll) root.scrollTop = scroll;
+  if (!ident || typeof root.querySelectorAll !== 'function') return;
+  var els = root.querySelectorAll('button');
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i];
+    var match = true;
+    for (var a = 0; a < ATTRS.length; a++) {
+      if ((el.getAttribute ? el.getAttribute(ATTRS[a]) : null) !== ident[a]) { match = false; break; }
+    }
+    if (match) { if (typeof el.focus === 'function') el.focus(); return; }
+  }
+}
+
 /**
  * Render the expanded-header pill strip. Called from pollSessions(),
  * openSession(), closeSession(), and the (rAF-debounced) resize handler.
@@ -4233,12 +4465,15 @@ function _epMeasureWidth(html) {
 function renderExpandedHeaderPills() {
   var nav = $('expanded-pills');
   if (!nav) return;
+  var otherHost = $('expanded-pills-other');
+  var wrap = $('expanded-pills-wrap');
   var header = (typeof document.querySelector === 'function') ? document.querySelector('.expanded-header') : null;
 
   if (_viewMode !== 'fullscreen' || !_viewingSession) {
     if ((nav._lastSig || '') !== '') {
       nav.innerHTML = '';
       nav._lastSig = '';
+      if (otherHost) otherHost.innerHTML = '';
     }
     if (header && header.classList) header.classList.remove('expanded-header--pills');
     _epCloseMenu();
@@ -4248,7 +4483,9 @@ function renderExpandedHeaderPills() {
   var model = buildExpandedPillsModel(_currentSessions, _serverSettings, _viewingSession, _viewingRemoteId);
   if (!model) return;
 
-  var width = nav.clientWidth || 0;
+  // The wrapper spans strip + Other Sessions host, so its width does not
+  // depend on whether Other Sessions is currently shown.
+  var width = (wrap && wrap.clientWidth) || nav.clientWidth || 0;
   var ds = getDisplaySettings();
   var sig = JSON.stringify(model) + '|' + width + '|' + (ds.activityIndicator || 'both');
   if (nav._lastSig === sig) return;
@@ -4260,93 +4497,180 @@ function renderExpandedHeaderPills() {
   if (model.homeGroups.length > 1) {
     fixed += (model.homeGroups.length - 1) * (_epMeasureWidth(sepHtml) + EP_GAP);
   }
-  var otherViewPills = model.otherViews.map(function (v, i) {
-    return _epMenuPillHTML('view:' + i, _epGroupLabel(v), String(v.sessions.length), v.isAuto ? ' nav-pill--auto' : '');
-  });
-  for (var oi = 0; oi < otherViewPills.length; oi++) fixed += _epMeasureWidth(otherViewPills[oi]) + EP_GAP;
-  var otherPillHtml = '';
-  if (model.otherSessions.length > 0) {
-    otherPillHtml = _epMenuPillHTML('other', 'Other Sessions', String(model.otherSessions.length), ' nav-pill--other');
-    fixed += _epMeasureWidth(otherPillHtml) + EP_GAP;
-  }
 
-  // — Measure home-group pills and allocate inline slots
-  var groups = model.homeGroups.map(function (g, i) {
+  // — Home groups (siblings, allocated first — D2)
+  var groups = model.homeGroups.map(function (g) {
     var pillHtmls = g.sessions.map(function (s) { return _epSessionPillHTML(s, false); });
     return {
       pillHtmls: pillHtmls,
       sessionWidths: pillHtmls.map(_epMeasureWidth),
       // Measured with the max overflow count — conservative for partial states
-      collapsedWidth: _epMeasureWidth(_epMenuPillHTML('overflow:' + i, _epGroupLabel(g), '+' + g.sessions.length, g.isAuto ? ' nav-pill--auto' : '')),
+      collapsedWidth: _epMeasureWidth(_epMenuPillHTML('h:' + g.key, _epGroupLabel(g), '+' + g.sessions.length, g.isAuto ? ' nav-pill--auto' : '')),
     };
   });
-  var counts = allocateExpandedPills(groups, fixed, width, EP_GAP);
+
+  // — Candidates: other views, then folders most recently accessed first
+  var candidateHtmls = model.otherViews.map(function (v) {
+    return _epMenuPillHTML('c:' + v.key, _epGroupLabel(v), String(v.sessions.length), v.isAuto ? ' nav-pill--auto' : '');
+  });
+  var worstOther = _epUniqueSessionCount(model.otherViews.map(function (v) { return v.sessions; })
+    .concat([model.otherSessions]));
+
+  var lay = layoutStrip({
+    fixedWidth: fixed,
+    groups: groups,
+    candidateWidths: candidateHtmls.map(_epMeasureWidth),
+    otherWidth: _epMeasureWidth(_epOtherPillHTML(worstOther)),
+    needOther: model.otherSessions.length > 0,
+  }, width, EP_GAP);
 
   _expandedPillsModel = model;
-  _expandedPillsAlloc = counts;
+  _expandedPillsAlloc = lay.counts;
+  _expandedPillsOverflow = model.otherViews.slice(lay.placed);
 
   // — Build final strip HTML
   var html = currentHtml;
   for (var gi = 0; gi < model.homeGroups.length; gi++) {
     if (gi > 0) html += sepHtml;
     var g = model.homeGroups[gi];
-    for (var si = 0; si < counts[gi]; si++) html += groups[gi].pillHtmls[si];
-    if (counts[gi] < g.sessions.length) {
-      html += _epMenuPillHTML('overflow:' + gi, _epGroupLabel(g), '+' + (g.sessions.length - counts[gi]), g.isAuto ? ' nav-pill--auto' : '');
+    for (var si = 0; si < lay.counts[gi]; si++) html += groups[gi].pillHtmls[si];
+    if (lay.counts[gi] < g.sessions.length) {
+      html += _epMenuPillHTML('h:' + g.key, _epGroupLabel(g), '+' + (g.sessions.length - lay.counts[gi]), g.isAuto ? ' nav-pill--auto' : '');
     }
   }
-  for (var pi = 0; pi < otherViewPills.length; pi++) html += otherViewPills[pi];
-  html += otherPillHtml;
+  for (var pi = 0; pi < lay.placed; pi++) html += candidateHtmls[pi];
+
+  var otherHtml = '';
+  if (lay.showOther) {
+    otherHtml = _epOtherPillHTML(_epUniqueSessionCount(
+      _expandedPillsOverflow.map(function (v) { return v.sessions; }).concat([model.otherSessions])));
+  }
+  // Other Sessions lives OUTSIDE the scrolling strip so no layout can push it
+  // off-screen; older markup without the host falls back to the strip's end.
+  if (otherHost) {
+    _epPreserveFocus(otherHost, function () { otherHost.innerHTML = otherHtml; });
+  } else {
+    html += otherHtml;
+  }
 
   nav._lastSig = sig;
-  nav.innerHTML = html;
+  _epPreserveFocus(nav, function () { nav.innerHTML = html; });
   if (header && header.classList) header.classList.add('expanded-header--pills');
 
-  // Keep an open dropdown alive across re-renders; close it if its pill is gone
+  // Keep an open dropdown alive across re-renders (by key — order may have
+  // changed); close it if its pill is gone
   if (_expandedPillMenuFor) {
-    var openPill = (typeof nav.querySelector === 'function')
-      ? nav.querySelector('[data-pill-menu="' + _expandedPillMenuFor + '"]')
-      : null;
+    var openPill = _epFindPill(_expandedPillMenuFor);
     if (openPill) {
       if (openPill.setAttribute) openPill.setAttribute('aria-expanded', 'true');
       _epRenderMenu();
       _epPositionMenu(openPill);
+      _epReanchorSubmenu();
     } else {
       _epCloseMenu();
     }
   }
 }
 
-/** Resolve the slim-session list behind a dropdown key. */
+/** First entry of `list` whose key is `key`, or null. */
+function _epEntryByKey(list, key) {
+  for (var i = 0; i < (list || []).length; i++) {
+    if (list[i].key === key) return list[i];
+  }
+  return null;
+}
+
+/** Resolve the slim-session list behind a dropdown key:
+ *  'c:<gk>' an inline candidate pill, 'h:<gk>' a home group's collapsed tail,
+ *  'other' the flat (no folder) bucket. */
 function _epMenuSessions(key) {
-  if (!_expandedPillsModel) return [];
+  if (!_expandedPillsModel || typeof key !== 'string') return [];
   if (key === 'other') return _expandedPillsModel.otherSessions;
-  var m = /^view:(\d+)$/.exec(key || '');
-  if (m) {
-    var v = _expandedPillsModel.otherViews[Number(m[1])];
+  if (key.indexOf('c:') === 0) {
+    var v = _epEntryByKey(_expandedPillsModel.otherViews, key.slice(2));
     return v ? v.sessions : [];
   }
-  m = /^overflow:(\d+)$/.exec(key || '');
-  if (m) {
-    var i = Number(m[1]);
-    var g = _expandedPillsModel.homeGroups[i];
-    if (!g) return [];
-    var shown = (_expandedPillsAlloc && _expandedPillsAlloc[i]) || 0;
-    return g.sessions.slice(shown);
+  if (key.indexOf('h:') === 0) {
+    var hg = _expandedPillsModel.homeGroups;
+    for (var i = 0; i < hg.length; i++) {
+      if (hg[i].key !== key.slice(2)) continue;
+      var shown = (_expandedPillsAlloc && _expandedPillsAlloc[i]) || 0;
+      return hg[i].sessions.slice(shown);
+    }
   }
   return [];
+}
+
+/** Sessions behind an Other Sessions submenu key: an overflow entry's
+ *  members, or the 'ungrouped' (no folder) bucket. */
+function _epSubmenuSessions(subKey) {
+  if (!_expandedPillsModel) return [];
+  if (subKey === 'ungrouped') return _expandedPillsModel.otherSessions;
+  var e = _epEntryByKey(_expandedPillsOverflow, subKey);
+  return e ? e.sessions : [];
+}
+
+/** One Other Sessions row: a folder (or view) that opens a session submenu. */
+function _epSubRowHTML(key, label, sessions, extraClass) {
+  var anyBell = false;
+  for (var i = 0; i < sessions.length; i++) if (sessions[i].bell) { anyBell = true; break; }
+  var open = _expandedPillSubmenuFor === key;
+  return '<button class="view-dropdown__item ep-sub-row' + (extraClass || '') + '" role="menuitem" data-sub-key="' +
+    escapeHtml(key) + '" aria-haspopup="menu" aria-expanded="' + (open ? 'true' : 'false') +
+    '" aria-controls="expanded-pill-submenu" title="' + escapeHtml(label) + '">' +
+    '<span class="ep-sub-row__label">' + escapeHtml(label) + '</span>' +
+    '<span class="nav-pill__count">' + sessions.length + '</span>' +
+    _epBellHTML({ bell: anyBell }) +
+    '<span class="ep-sub-row__chev" aria-hidden="true">›</span></button>';
+}
+
+/** Other Sessions menu body: one row per overflow entry (in strip order), then
+ *  the keyless sessions — as a "(no folder)" row, or flat rows when the
+ *  Directory auto-views toggle is off (pre-#24 behaviour). */
+function _epOtherMenuHTML() {
+  var m = _expandedPillsModel;
+  if (!m) return '';
+  var html = '';
+  for (var i = 0; i < _expandedPillsOverflow.length; i++) {
+    var e = _expandedPillsOverflow[i];
+    html += _epSubRowHTML(e.key, _epGroupLabel(e), e.sessions, e.isAuto ? ' ep-sub-row--auto' : '');
+  }
+  if (m.otherSessions.length > 0) {
+    if (m.foldersEnabled) {
+      html += _epSubRowHTML('ungrouped', '(no folder)', m.otherSessions, '');
+    } else {
+      for (var j = 0; j < m.otherSessions.length; j++) html += _epMenuItemHTML(m.otherSessions[j]);
+    }
+  }
+  return html;
 }
 
 /** Populate and show the shared #expanded-pill-menu for the open key. */
 function _epRenderMenu() {
   var menu = $('expanded-pill-menu');
   if (!menu) return;
-  var list = _epMenuSessions(_expandedPillMenuFor);
   var html = '';
-  for (var i = 0; i < list.length; i++) html += _epMenuItemHTML(list[i]);
+  if (_expandedPillMenuFor === 'other') {
+    html = _epOtherMenuHTML();
+  } else {
+    var list = _epMenuSessions(_expandedPillMenuFor);
+    for (var i = 0; i < list.length; i++) html += _epMenuItemHTML(list[i]);
+  }
   if (!html) html = '<div class="view-dropdown__item" aria-disabled="true">No sessions</div>';
-  menu.innerHTML = html;
+  _epPreserveFocus(menu, function () { menu.innerHTML = html; });
   menu.classList.remove('hidden');
+  // A submenu whose entry left the overflow (it fit back into the strip, or
+  // emptied) closes; otherwise it is refreshed in place.
+  if (_expandedPillSubmenuFor) {
+    if (_expandedPillMenuFor === 'other' &&
+        (_expandedPillSubmenuFor === 'ungrouped'
+          ? _expandedPillsModel && _expandedPillsModel.otherSessions.length > 0
+          : !!_epEntryByKey(_expandedPillsOverflow, _expandedPillSubmenuFor))) {
+      _epRenderSubmenu();
+    } else {
+      _epCloseSubmenu();
+    }
+  }
 }
 
 /** Fixed-position the menu under its pill (the strip is overflow-x:auto,
@@ -4377,17 +4701,180 @@ function _epToggleMenu(pillEl) {
   if (pillEl.setAttribute) pillEl.setAttribute('aria-expanded', 'true');
 }
 
-/** Close the expanded-header pill dropdown, if open. */
+/** Close the expanded-header pill dropdown (and its submenu), if open. */
 function _epCloseMenu() {
+  _epCloseSubmenu();
   if (!_expandedPillMenuFor) return;
   _expandedPillMenuFor = null;
   var menu = $('expanded-pill-menu');
   if (menu) menu.classList.add('hidden');
-  var nav = $('expanded-pills');
-  if (nav && typeof nav.querySelector === 'function') {
-    var open = nav.querySelector('[data-pill-menu][aria-expanded="true"]');
-    if (open && open.setAttribute) open.setAttribute('aria-expanded', 'false');
+  var open = _epFindByAttr(_epPillRoots(), 'aria-expanded', 'true');
+  if (open && open.setAttribute) open.setAttribute('aria-expanded', 'false');
+}
+
+// ─── Other Sessions submenu (folder → sessions) ──────────────────────────────
+// A SIBLING fixed-position element (#expanded-pill-submenu): the parent menu
+// scrolls (overflow-y:auto), which would clip a nested flyout.
+
+function _epClearSubmenuTimer() {
+  if (_epSubmenuTimer) clearTimeout(_epSubmenuTimer);
+  _epSubmenuTimer = null;
+  _epSubmenuPendingKey = null;
+}
+
+/** Row in the Other Sessions menu for a submenu key, or null. */
+function _epFindSubRow(key) {
+  return _epFindByAttr([$('expanded-pill-menu')], 'data-sub-key', key);
+}
+
+/** Reflect the open submenu on its parent rows' aria-expanded. */
+function _epSyncSubRows() {
+  var menu = $('expanded-pill-menu');
+  if (!menu || typeof menu.querySelectorAll !== 'function') return;
+  var rows = menu.querySelectorAll('[data-sub-key]');
+  for (var i = 0; i < rows.length; i++) {
+    var on = rows[i].getAttribute('data-sub-key') === _expandedPillSubmenuFor;
+    rows[i].setAttribute('aria-expanded', on ? 'true' : 'false');
   }
+}
+
+/** Populate and show #expanded-pill-submenu for the open submenu key. */
+function _epRenderSubmenu() {
+  var sub = $('expanded-pill-submenu');
+  if (!sub) return;
+  var list = _epSubmenuSessions(_expandedPillSubmenuFor);
+  var html = '';
+  for (var i = 0; i < list.length; i++) html += _epMenuItemHTML(list[i]);
+  if (!html) html = '<div class="view-dropdown__item" aria-disabled="true">No sessions</div>';
+  _epPreserveFocus(sub, function () { sub.innerHTML = html; });
+  sub.classList.remove('hidden');
+  _epSyncSubRows();
+}
+
+/**
+ * Fixed-position the submenu beside its row: on the side of the parent menu
+ * that actually has room (measured, not assumed), else the roomier side
+ * clamped to the viewport; top aligned with the row, clamped vertically.
+ */
+function _epPositionSubmenu(rowEl) {
+  var sub = $('expanded-pill-submenu');
+  var menu = $('expanded-pill-menu');
+  if (!sub || !sub.style || !menu || !rowEl ||
+      typeof menu.getBoundingClientRect !== 'function' ||
+      typeof rowEl.getBoundingClientRect !== 'function') return;
+  var m = menu.getBoundingClientRect();
+  var r = rowEl.getBoundingClientRect();
+  var vw = window.innerWidth || 0;
+  var vh = window.innerHeight || 0;
+  var w = sub.offsetWidth || 240;
+  var h = sub.offsetHeight || 0;
+  var spaceRight = vw - m.right;
+  var spaceLeft = m.left;
+  var left;
+  if (spaceRight >= w) left = m.right - 1;
+  else if (spaceLeft >= w) left = m.left - w + 1;
+  else left = spaceRight >= spaceLeft ? Math.max(0, vw - w) : 0;
+  var top = r.top;
+  if (vh && h) top = Math.min(top, vh - h - 8);
+  top = Math.max(8, top);
+  sub.style.left = left + 'px';
+  sub.style.top = top + 'px';
+}
+
+/** Re-anchor an open submenu to its row (after a re-render or a parent
+ *  scroll); close it when the row is gone or scrolled out of the menu. */
+function _epReanchorSubmenu() {
+  if (!_expandedPillSubmenuFor) return;
+  var row = _epFindSubRow(_expandedPillSubmenuFor);
+  var menu = $('expanded-pill-menu');
+  if (!row) { _epCloseSubmenu(); return; }
+  if (menu && typeof menu.getBoundingClientRect === 'function' && typeof row.getBoundingClientRect === 'function') {
+    var m = menu.getBoundingClientRect();
+    var r = row.getBoundingClientRect();
+    if (r.bottom <= m.top || r.top >= m.bottom) { _epCloseSubmenu(); return; }
+  }
+  _epPositionSubmenu(row);
+}
+
+/** Open the submenu for `key`. `byHover` marks a mouse-hover open, so the
+ *  click that typically follows confirms it instead of toggling it shut. */
+function _epOpenSubmenu(key, byHover) {
+  _epClearSubmenuTimer();
+  _expandedPillSubmenuFor = key;
+  _epSubmenuByHover = !!byHover;
+  _epRenderSubmenu();
+  var row = _epFindSubRow(key);
+  if (row) _epPositionSubmenu(row);
+}
+
+/** Close the Other Sessions submenu, if open. */
+function _epCloseSubmenu() {
+  _epClearSubmenuTimer();
+  if (!_expandedPillSubmenuFor) return;
+  _expandedPillSubmenuFor = null;
+  _epSubmenuByHover = false;
+  var sub = $('expanded-pill-submenu');
+  if (sub) sub.classList.add('hidden');
+  _epSyncSubRows();
+}
+
+/** Click on an Other Sessions row: tap/click toggles; a click on a row whose
+ *  submenu mouse hover just opened keeps it open. */
+function _epSubRowClick(key) {
+  if (_expandedPillSubmenuFor === key) {
+    if (_epSubmenuByHover) { _epSubmenuByHover = false; return; }
+    _epCloseSubmenu();
+    return;
+  }
+  _epOpenSubmenu(key, false);
+}
+
+/**
+ * Mouse hover over the Other Sessions menu (delegated `pointerover` —
+ * `pointerenter` does not bubble). Touch/pen are ignored: a tap fires
+ * pointerover then click, and hover-open + click-toggle would close it again.
+ * Switching to a DIFFERENT row waits EP_SUBMENU_SWITCH_MS and is cancelled if
+ * the pointer reaches the open submenu first (diagonal travel).
+ */
+function _epSubRowHover(e) {
+  if (!e || e.pointerType !== 'mouse' || _expandedPillMenuFor !== 'other') return;
+  var row = e.target && e.target.closest && e.target.closest('[data-sub-key]');
+  if (!row) return;
+  var key = row.getAttribute('data-sub-key');
+  if (key === _expandedPillSubmenuFor) { _epClearSubmenuTimer(); return; }
+  if (!_expandedPillSubmenuFor) { _epOpenSubmenu(key, true); return; }
+  if (_epSubmenuPendingKey === key) return;
+  _epClearSubmenuTimer();
+  _epSubmenuPendingKey = key;
+  _epSubmenuTimer = setTimeout(function () {
+    _epSubmenuTimer = null;
+    _epSubmenuPendingKey = null;
+    if (_expandedPillMenuFor === 'other') _epOpenSubmenu(key, true);
+  }, EP_SUBMENU_SWITCH_MS);
+}
+
+/**
+ * Session clicks inside either menu root (#expanded-pill-menu and
+ * #expanded-pill-submenu) — open the session, or Rename (✎) a local one.
+ * Returns true when it handled the event.
+ */
+function _epHandleMenuSessionClick(e) {
+  var renameBtn = e.target.closest && e.target.closest('[data-rename]');
+  if (renameBtn) {
+    var rName = renameBtn.dataset.session;
+    var rRid = renameBtn.dataset.remoteId || '';
+    _epCloseMenu();
+    _openRenameSessionInput(rName, rRid);
+    return true;
+  }
+  var item = e.target.closest && e.target.closest('[data-session]');
+  if (!item) return false;
+  var itemRid = item.dataset.remoteId || '';
+  _epCloseMenu();
+  if (item.dataset.session !== _viewingSession || itemRid !== (_viewingRemoteId || '')) {
+    openSession(item.dataset.session, { remoteId: itemRid });
+  }
+  return true;
 }
 
 // ─── Universal session search ────────────────────────────────────────────────
@@ -5439,6 +5926,16 @@ function handleGlobalKeydown(e) {
     if (e.key === 'Escape') { closeSettings(); }
     return;
   }
+  // Expanded-header pill menus own Escape while open — submenu first, then
+  // the menu — and the key STOPS here. It must never also exit the terminal:
+  // a separate listener used to close the menu first, after which the
+  // fullscreen branch below saw no menu and ran closeSession() (#24).
+  if (e.key === 'Escape' && (_expandedPillSubmenuFor || _expandedPillMenuFor)) {
+    e.preventDefault();
+    if (_expandedPillSubmenuFor) _epCloseSubmenu();
+    else _epCloseMenu();
+    return;
+  }
   // Determine if focus is inside a text input
   const tag = document.activeElement && document.activeElement.tagName;
   const inInput = (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT');
@@ -6263,56 +6760,59 @@ function bindStaticEventListeners() {
   }
 
   // Expanded-header session pills — delegated (pills re-render each poll;
-  // #expanded-pills is static, so listeners attach ONCE here — contract #3)
-  var expandedPills = $('expanded-pills');
-  if (expandedPills) {
-    expandedPills.addEventListener('click', function (e) {
-      var menuPill = e.target.closest && e.target.closest('[data-pill-menu]');
-      if (menuPill) {
-        _epToggleMenu(menuPill);
-        return;
-      }
-      var sessPill = e.target.closest && e.target.closest('[data-session]');
-      if (!sessPill) return;
-      if (sessPill.classList && sessPill.classList.contains('nav-pill--current')) return; // current pill is a no-op
-      _epCloseMenu();
-      var pillRid = sessPill.dataset.remoteId || '';
-      if (sessPill.dataset.session !== _viewingSession || pillRid !== (_viewingRemoteId || '')) {
-        openSession(sessPill.dataset.session, { remoteId: pillRid });
-      }
-    });
+  // the hosts are static, so listeners attach ONCE here — contract #3). The
+  // Other Sessions pill lives in its own host outside the scrolling strip.
+  function onPillHostClick(e) {
+    var menuPill = e.target.closest && e.target.closest('[data-pill-menu]');
+    if (menuPill) {
+      _epToggleMenu(menuPill);
+      return;
+    }
+    var sessPill = e.target.closest && e.target.closest('[data-session]');
+    if (!sessPill) return;
+    if (sessPill.classList && sessPill.classList.contains('nav-pill--current')) return; // current pill is a no-op
+    _epCloseMenu();
+    var pillRid = sessPill.dataset.remoteId || '';
+    if (sessPill.dataset.session !== _viewingSession || pillRid !== (_viewingRemoteId || '')) {
+      openSession(sessPill.dataset.session, { remoteId: pillRid });
+    }
   }
+  var expandedPills = $('expanded-pills');
+  if (expandedPills) expandedPills.addEventListener('click', onPillHostClick);
+  var expandedPillsOther = $('expanded-pills-other');
+  if (expandedPillsOther) expandedPillsOther.addEventListener('click', onPillHostClick);
 
-  // Expanded-header pill dropdown — delegated session item clicks switch session
+  // Expanded-header pill dropdown — delegated: Other Sessions folder rows open
+  // their submenu; session items switch session (shared with the submenu)
   var expandedPillMenu = $('expanded-pill-menu');
   if (expandedPillMenu) {
     expandedPillMenu.addEventListener('click', function (e) {
-      var renameBtn = e.target.closest && e.target.closest('[data-rename]');
-      if (renameBtn) {
-        var rName = renameBtn.dataset.session;
-        var rRid = renameBtn.dataset.remoteId || '';
-        _epCloseMenu();
-        _openRenameSessionInput(rName, rRid);
+      var subRow = e.target.closest && e.target.closest('[data-sub-key]');
+      if (subRow) {
+        _epSubRowClick(subRow.getAttribute('data-sub-key'));
         return;
       }
-      var item = e.target.closest && e.target.closest('[data-session]');
-      if (!item) return;
-      var itemRid = item.dataset.remoteId || '';
-      _epCloseMenu();
-      if (item.dataset.session !== _viewingSession || itemRid !== (_viewingRemoteId || '')) {
-        openSession(item.dataset.session, { remoteId: itemRid });
-      }
+      _epHandleMenuSessionClick(e);
     });
+    expandedPillMenu.addEventListener('pointerover', _epSubRowHover);
+    // A fixed submenu must follow its row when the parent menu scrolls
+    expandedPillMenu.addEventListener('scroll', _epReanchorSubmenu);
+  }
+  var expandedPillSubmenu = $('expanded-pill-submenu');
+  if (expandedPillSubmenu) {
+    expandedPillSubmenu.addEventListener('click', _epHandleMenuSessionClick);
+    // Pointer reached the open submenu — cancel any pending hover switch
+    expandedPillSubmenu.addEventListener('pointerover', _epClearSubmenuTimer);
   }
 
-  // Click-outside / Escape close the expanded-header pill dropdown
+  // Click-outside closes the expanded-header pill dropdown (and submenu).
+  // Escape is handled in handleGlobalKeydown, which owns the whole precedence
+  // chain (submenu → menu → terminal) so one Escape never does two things.
   document.addEventListener('click', function (e) {
     if (!_expandedPillMenuFor) return;
-    if (e.target.closest && (e.target.closest('#expanded-pill-menu') || e.target.closest('[data-pill-menu]'))) return;
+    if (e.target.closest && (e.target.closest('#expanded-pill-menu') ||
+        e.target.closest('#expanded-pill-submenu') || e.target.closest('[data-pill-menu]'))) return;
     _epCloseMenu();
-  });
-  document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape' && _expandedPillMenuFor) _epCloseMenu();
   });
 
   // Universal session search — both header containers + shared results menu
@@ -6790,6 +7290,9 @@ window.addEventListener('resize', function () {
     : function (fn) { return setTimeout(fn, 50); };
   raf(function () {
     _epResizePending = false;
+    // Below 600px the strip is display:none — a menu left open would point at
+    // a trigger that is no longer rendered
+    if (window.innerWidth && window.innerWidth < 600) _epCloseMenu();
     renderExpandedHeaderPills();
   });
 });
@@ -6949,6 +7452,20 @@ if (typeof module !== 'undefined' && module.exports) {
     _epMenuSessions,
     _epToggleMenu,
     _epCloseMenu,
+    sessionRecency,
+    buildStripFolderGroups,
+    placeStripCandidates,
+    layoutStrip,
+    _epSubmenuSessions,
+    _epOtherMenuHTML,
+    _epOpenSubmenu,
+    _epCloseSubmenu,
+    _epSubRowClick,
+    _epSubRowHover,
+    _epFindByAttr,
+    _epUniqueSessionCount,
+    _getExpandedPillMenuFor: function () { return _expandedPillMenuFor; },
+    _getExpandedPillSubmenuFor: function () { return _expandedPillSubmenuFor; },
     _setViewingRemoteId,
     // Universal session search
     searchSessions,

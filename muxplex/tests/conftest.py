@@ -81,6 +81,16 @@ def redirect_muxplex_paths(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def reset_session_times(monkeypatch):
+    """Isolate the process-global list-sessions times map (issue #24).
+
+    enumerate_sessions() publishes it as a side effect, so without this a test
+    that enumerates leaks recency times into later tests' payloads.
+    """
+    monkeypatch.setattr("muxplex.sessions._session_times", {})
+
+
+@pytest.fixture(autouse=True)
 def never_kill_a_real_server(request, monkeypatch):
     """Autouse: stop ``serve()`` from SIGTERMing the developer's running muxplex.
 

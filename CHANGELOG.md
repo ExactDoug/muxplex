@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.9.6.dev10 (2026-10-06) — dev build
+
+The terminal-view header strip now shows **every project folder**, most recently used
+first, and the Other Sessions dropdown is organised by folder (#24). Plan:
+`docs/plans/2026-10-06-header-project-folders-plan.md`.
+
+### Features
+
+- **Every folder with a live session gets a 📁 pill** — not only folders with two or more
+  sessions. The header's "only 2–3 folders" was never a count limit: folder pills came from
+  the dashboard's auto-views, which require ≥2 sessions per folder, so single-session
+  projects never got one. The strip now builds its own folder groups with no minimum. The
+  dashboard's auto-view pills, the sidebar and search tags are unchanged (still ≥2), and the
+  Settings → "Directory auto-views" toggle still turns folder pills off.
+- **Folders are ordered most-recently-used first**, left to right, and sessions inside a
+  folder likewise. `/api/sessions` (and the federation endpoint's local items) now carry
+  `lastAttached` / `created` epoch seconds from tmux's `session_last_attached` /
+  `session_created`, read on the **same single** `list-sessions` call — the poll cycle stays
+  O(1). Every terminal connection is a fresh `tmux attach`, so switching to a session stamps
+  it; launching a session counts as accessing it. Session output never reorders the strip.
+- **Pills fill the strip's width**, up to the Other Sessions pill. Whatever does not fit goes
+  into Other Sessions, in the same order. Other Sessions now sits **outside** the scrolling
+  strip, so it can no longer be pushed off-screen (it is omitted when nothing overflows).
+- **Other Sessions is a folder → session menu.** Each folder is a row (session count,
+  aggregated activity dot, `›`); hovering it with a mouse — or tapping it on touch — opens a
+  submenu of its sessions, with Rename (✎) on local ones. Moving diagonally into the submenu
+  doesn't switch rows; a click on a row hover just opened doesn't snap it shut. Sessions with
+  no known folder sit under a final "(no folder)" row.
+
+### Bug fixes
+
+- **Escape on an open header dropdown no longer also exits the terminal.** The dropdown's own
+  Escape listener closed it first, after which the global handler saw no menu and ran
+  `closeSession()` (for a local session that also sent `DELETE /api/sessions/current`).
+  Escape now has one precedence chain: submenu → menu → terminal.
+- Open header dropdowns are keyed by **name**, not array position, so a re-render that adds,
+  removes or reorders folders can no longer silently swap an open menu's contents; pills are
+  re-found by exact attribute comparison rather than a CSS selector built from the name.
+
 ## v0.9.6.dev9 (2026-09-16) — dev build
 
 Two mobile-keybar fixes found on-device on iPhone. Both are iOS-only in effect; neither

@@ -24,11 +24,11 @@
 | Phase | What | Status |
 |---|---|---|
 | 0 | Research, issue, plan, Codex adversarial review (rev 3) | DONE (2026-10-06) |
-| 1 | Backend: per-session recency fields in `/api/sessions` | not started |
-| 2 | Frontend model: strip-local folder groups, recency-ordered | not started |
-| 3 | Layout: fill width, overflow list, Other Sessions always visible | not started |
-| 4 | Other Sessions folder → session menu with submenu; Escape fix | not started |
-| 5 | Docs, version, manual check | not started |
+| 1 | Backend: per-session recency fields in `/api/sessions` | DONE (2026-10-06) |
+| 2 | Frontend model: strip-local folder groups, recency-ordered | DONE (2026-10-06) |
+| 3 | Layout: fill width, overflow list, Other Sessions always visible | DONE (2026-10-06) |
+| 4 | Other Sessions folder → session menu with submenu; Escape fix | DONE (2026-10-06) |
+| 5 | Docs, version (0.9.6.dev10) DONE; manual check on the live instance | IN PROGRESS |
 
 ## Revision log
 

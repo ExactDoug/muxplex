@@ -53,6 +53,7 @@ from muxplex.sessions import (
     enumerate_sessions,
     get_session_list,
     get_session_paths,
+    get_session_times,
     get_snapshots,
     list_session_paths,
     resolve_git_repo,
@@ -744,14 +745,27 @@ def _session_path_fields(name: str, paths: dict[str, str]) -> dict:
     return {"cwd": cwd, "cwdLeaf": leaf, "gitRepo": resolve_git_repo(cwd)}
 
 
+def _session_time_fields(name: str, times: dict) -> dict:
+    """lastAttached / created epoch seconds for a session (header MRU order, #24).
+
+    Both None when unknown — never attached, or the times map predates the
+    session.  The ONE normalization shared by both payload builders and the
+    body-cache key, so the key can never describe a different value than the
+    body it guards.
+    """
+    last_attached, created = times.get(name) or (None, None)
+    return {"lastAttached": last_attached, "created": created}
+
+
 def _build_session_items(
     names: list[str],
     snapshots: dict[str, str],
     paths: dict[str, str],
     device_id: str,
     state: dict,
+    times: dict | None = None,
 ) -> list[dict]:
-    """Build the /api/sessions payload list (name/sessionKey/snapshot/bell/paths).
+    """Build the /api/sessions payload list (name/sessionKey/snapshot/bell/paths/times).
 
     Factored out of get_sessions() so the per-cycle payload cache has exactly
     one build path to short-circuit (and so tests can count builds).
@@ -767,6 +781,7 @@ def _build_session_items(
             "bell": bell,
         }
         item.update(_session_path_fields(name, paths))
+        item.update(_session_time_fields(name, times or {}))
         result.append(item)
     return result
 
@@ -777,6 +792,7 @@ def _sessions_payload_key(
     paths: dict[str, str],
     device_id: str,
     state: dict,
+    times: dict | None = None,
 ) -> tuple:
     """Content-derived cache key covering every input of the payload body.
 
@@ -809,6 +825,9 @@ def _sessions_payload_key(
         tuple(paths.get(n) for n in names),
         tuple(
             (sessions_state.get(n) or {}).get("bell") or empty_bell() for n in names
+        ),
+        tuple(
+            tuple(_session_time_fields(n, times or {}).values()) for n in names
         ),
     )
 
@@ -866,14 +885,15 @@ async def get_sessions() -> Response:
     state = await read_state()
     device_id = load_device_id()
     paths = get_session_paths()
+    times = get_session_times()
 
-    key = _sessions_payload_key(names, snapshots, paths, device_id, state)
+    key = _sessions_payload_key(names, snapshots, paths, device_id, state, times)
     cached = _sessions_payload_cache
     if cached is not None and cached[0] == key:
         body = cached[1]
     else:
         body = _json_body(
-            _build_session_items(names, snapshots, paths, device_id, state)
+            _build_session_items(names, snapshots, paths, device_id, state, times)
         )
         # Single atomic rebind of a fully-built tuple — a concurrent request
         # either sees the old complete entry or the new one, never a partial.
@@ -1753,6 +1773,7 @@ async def federation_sessions(request: Request) -> Response:
     snapshots = get_snapshots()
     state = await read_state()
     local_paths = get_session_paths()
+    local_times = get_session_times()
     local_sessions: list[dict] = []
     for name in names:
         session_state = state.get("sessions", {}).get(name, {})
@@ -1767,6 +1788,7 @@ async def federation_sessions(request: Request) -> Response:
             "sessionKey": f"{local_device_id}:{name}",
         }
         local_item.update(_session_path_fields(name, local_paths))
+        local_item.update(_session_time_fields(name, local_times))
         local_sessions.append(local_item)
 
     if not remote_instances:

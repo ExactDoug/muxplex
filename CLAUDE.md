@@ -5,7 +5,7 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.6.dev9**, on **`main`** — a **dev/experimental**
+improvements. Current version: **0.9.6.dev10**, on **`main`** — a **dev/experimental**
 build carrying the Mouse Lab selection-fix harness *and* the mobile terminal keybar (both
 below); last released version is **0.9.5**. All feature branches through PR #12 are
 merged and their branches/worktrees deleted — **start new work from `main`**.
@@ -129,13 +129,13 @@ uv run muxplex serve         # http://127.0.0.1:8088 — settings from ~/.config
 ## Tests
 
 ```bash
-uv run pytest -q -m "not integration"              # Python suite (1434 tests)
-node muxplex/frontend/tests/test_app.mjs           # frontend app logic (523 tests)
-node muxplex/frontend/tests/test_terminal.mjs      # terminal/xterm contracts (64 tests)
+uv run pytest -q -m "not integration"              # Python suite (1446 tests)
+node muxplex/frontend/tests/test_app.mjs           # frontend app logic (543 tests)
+node muxplex/frontend/tests/test_terminal.mjs      # terminal/xterm contracts (66 tests)
 node muxplex/frontend/tests/test_mobile_keyboard.mjs # mobile keybar (16 tests)
 ```
 
-**All four suites are fully green** as of v0.9.6.dev9. `test_terminal.mjs` previously
+**All four suites are fully green** as of v0.9.6.dev10. `test_terminal.mjs` previously
 carried 27 harness failures (`container.addEventListener is not a function` during module
 require); the `#terminal-container` mock was a bare `{ appendChild }` and terminal.js's
 attach-once IIFEs (contract #3) need a real element. It now uses `makeContainerStub()`.
@@ -383,6 +383,24 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    (e) `_keybarHeight()` returns 0 when the keybar module is absent or hidden, so the
    geometry stays correct with the keybar disabled or the module not loaded at all.
 
+12. **Header-strip folder pills are STRIP-LOCAL and MRU-ordered** (v0.9.6.dev10, #24) —
+   `buildStripFolderGroups` groups by `sessionGroupKey` with **no minimum**, so every folder
+   with a live session gets a 📁 pill; `buildAutoViews` deliberately keeps its **≥2** rule
+   (contract #6 / A8) for the dashboard pills, sidebar and search tags. Do not "unify" them.
+   The strip still honours `autoViewsEnabled`. Order = `sessionRecency` (newer of tmux
+   `lastAttached` / `created`), newest first, name tie-break. Load-bearing parts:
+   (a) **menu keys are names** (`h:`/`c:` + `v:<view>` / `f:<folder>`, `other`,
+   `ungrouped`), never indices — folders reorder on every session switch; (b) pills are
+   re-found by **exact attribute comparison** (`_epFindByAttr`), never a selector built from
+   a name; (c) **Other Sessions lives outside the scrolling strip** (`#expanded-pills-other`)
+   so no layout can push it off — `layoutStrip` tries "no Other Sessions" first, then
+   reserves it; (d) the submenu is a **sibling** fixed element (`#expanded-pill-submenu`),
+   because the menu scrolls and would clip a nested flyout; hover-open is gated on
+   `pointerType === 'mouse'` (`pointerover`, delegated — `pointerenter` doesn't bubble);
+   (e) **Escape precedence lives in ONE place**, `handleGlobalKeydown`: submenu → menu →
+   terminal. A separate menu Escape listener once closed the menu first, after which the
+   fullscreen branch ran `closeSession()`.
+
 ## Hard-won backend contracts (2026-08-08 efficiency work; tests enforce them)
 
 Full rationale and measurements: `docs/plans/2026-08-08-resource-efficiency-plan.md`.
@@ -426,6 +444,17 @@ fails loudly rather than silently costing O(N) again.
    `_prune_changed`. That flag is only true when a key was *removed*, while the grace
    clock is started by a bookkeeping-only mutation — guarding on it silently disables
    stale-key pruning forever.
+
+10. **Session recency rides the ONE `list-sessions` call** (v0.9.6.dev10, #24) —
+   `_LIST_SESSIONS_FORMAT` is `last_attached TAB created TAB name`, name **last** (tabs in
+   names survive the maxsplit), both times behind `#{?var,#{var},0}` conditionals because
+   tmux prints an **empty** `session_last_attached` for never-attached sessions.
+   `_parse_session_line` **splits before trimming** — stripping first eats that empty field,
+   shifts a timestamp into the name, the real name vanishes from enumeration, and the poll
+   cycle reaps its ttyd (frontend contract #9). Its guarantee is "never worse than the
+   pre-#24 parser", not "never drops". `_session_times` is **rebound wholesale**, never
+   mutated, and `_session_time_fields` is the one normalisation used by both payload
+   builders and `_sessions_payload_key`.
 
 ## Documentation map
 
@@ -490,6 +519,12 @@ fails loudly rather than silently costing O(N) again.
   visible-set snapshot scoping (unsound — federation hands every local snapshot to peers
   who filter by their *own* view). The doc carries a revision log of what its own first
   draft got wrong, after adversarial review corrected four risk ratings.
+- **Header project-folder pills (v0.9.6.dev10, #24):**
+  `docs/plans/2026-10-06-header-project-folders-plan.md` — every folder as a 📁 pill, MRU
+  order from tmux attach times, fill-to-width, Other Sessions as a folder → session menu.
+  Carries a revision log of what an adversarial Codex review corrected (list-sessions
+  parse, the pre-existing Escape bug, placement, menu mechanics). Distilled into frontend
+  contract #12 and backend contract #10.
 - **Terminal "Reconnecting…" loop (FIXED — v0.9.6.dev6):**
   `docs/plans/2026-08-09-terminal-reconnect-loop-investigation.md` — killing the process
   a session was invoked to run left the terminal retrying forever. Pre-existing; the
