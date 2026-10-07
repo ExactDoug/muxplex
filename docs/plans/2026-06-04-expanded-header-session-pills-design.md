@@ -1,5 +1,11 @@
 # Expanded-Header Session Pills — Design
 
+> **Partly superseded (2026-10-06, #24):** other-view / directory pills, the Other Sessions
+> pill and its contents now follow `2026-10-06-header-project-folders-plan.md` — every
+> folder gets a 📁 pill (MRU-ordered), pills fill the width up to an Other Sessions pill that
+> sits outside the scrolling strip, and Other Sessions is a folder → session submenu.
+> The home-group / sibling allocator described here is unchanged.
+
 **Date:** 2026-06-04
 **Status:** Approved 2026-06-04 (all open questions resolved — see bottom)
 **Extends:** `2026-04-15-views-design.md` (views model), CHANGELOG v0.6.8 (header view pills)

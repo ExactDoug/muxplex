@@ -6544,7 +6544,7 @@ test('renderExpandedHeaderPills renders current pill once, siblings, separator, 
     'sibling pills for both home views present (measure widths are 0 in tests → fully expanded)');
   assert.strictEqual((html.match(/expanded-pills__sep/g) || []).length, 1,
     'exactly one separator between the two home groups');
-  assert.ok(html.includes('data-pill-menu="view:0"'), 'other view C renders as a dropdown pill');
+  assert.ok(html.includes('data-pill-menu="c:v:C"'), 'other view C renders as a dropdown pill (name-keyed, #24)');
   assert.ok(html.includes('data-pill-menu="other"'), 'Other Sessions pill present');
   assert.ok(html.includes('Other Sessions <span class="nav-pill__count">1</span>'), 'Other Sessions count = 1 (loose)');
   assert.ok(headerClasses.has('expanded-header--pills'), 'header gets the pills class (name label hidden via CSS)');
@@ -6617,7 +6617,7 @@ test('renderExpandedHeaderPills clears the strip outside fullscreen mode', () =>
   app._setCurrentSessions([]);
 });
 
-test('_epMenuSessions resolves view/overflow/other keys against the last model', () => {
+test('_epMenuSessions resolves candidate/home-overflow/other keys (name-keyed) against the last model', () => {
   const { nav, header } = epMockDom();
   const origGetById = globalThis.document.getElementById;
   const origQs = globalThis.document.querySelector;
@@ -6637,10 +6637,12 @@ test('_epMenuSessions resolves view/overflow/other keys against the last model',
   app._setViewingRemoteId('');
   app.renderExpandedHeaderPills();
 
-  assert.deepStrictEqual(app._epMenuSessions('view:0').map(s => s.name), ['o1', 'o2']);
+  assert.deepStrictEqual(app._epMenuSessions('c:v:Other').map(s => s.name), ['o1', 'o2']);
   assert.deepStrictEqual(app._epMenuSessions('other').map(s => s.name), ['free']);
-  // Fully expanded in tests (0 widths) → overflow list is empty
-  assert.deepStrictEqual(app._epMenuSessions('overflow:0').map(s => s.name), []);
+  // Fully expanded in tests (0 widths) → home-group overflow list is empty
+  assert.deepStrictEqual(app._epMenuSessions('h:v:Home').map(s => s.name), []);
+  // Positional keys are gone — a reorder must never retarget an open menu
+  assert.deepStrictEqual(app._epMenuSessions('view:0'), []);
   assert.deepStrictEqual(app._epMenuSessions('bogus'), []);
 
   globalThis.document.getElementById = origGetById;
@@ -7940,4 +7942,389 @@ test('_epWidthCacheKey collapses session counts so the cache key space is bounde
     'a wider count is measured separately');
   assert.notStrictEqual(app._epWidthCacheKey(a), app._epWidthCacheKey(a.replace('work', 'other')),
     'different label text still keys separately');
+});
+
+// ============================================================================
+// #24 — every project folder as a 📁 pill, MRU-ordered; Other Sessions tree
+// docs/plans/2026-10-06-header-project-folders-plan.md
+// (Appended at the END of the file on purpose: the width-measurement stub
+// below installs a module-level measure element that would leak into later
+// render tests.)
+// ============================================================================
+
+test('sessionRecency is the newer of lastAttached and created; 0 when unknown', () => {
+  assert.strictEqual(app.sessionRecency({ lastAttached: 200, created: 100 }), 200);
+  assert.strictEqual(app.sessionRecency({ lastAttached: 100, created: 300 }), 300,
+    'a session launched (created) after its last attach counts from creation');
+  assert.strictEqual(app.sessionRecency({ lastAttached: null, created: 50 }), 50,
+    'never attached → creation time');
+  assert.strictEqual(app.sessionRecency({ name: 'old-peer' }), 0, 'older peers send neither field');
+  assert.strictEqual(app.sessionRecency(null), 0);
+});
+
+test('buildStripFolderGroups: singletons count, MRU order with name tie-break, members MRU', () => {
+  const pool = [
+    { name: 'a1', gitRepo: 'alpha', lastAttached: 100 },
+    { name: 'solo', gitRepo: 'single', lastAttached: 500 },
+    { name: 'a2', gitRepo: 'alpha', lastAttached: 900 },
+    { name: 'z', gitRepo: 'Zed' },
+    { name: 'b', gitRepo: 'bee' },
+    { name: 'keyless' },
+  ];
+  const groups = app.buildStripFolderGroups(pool, {});
+  assert.deepStrictEqual(groups.map(g => g.name), ['alpha', 'single', 'bee', 'Zed'],
+    'most recent folder first; equal (unknown) recency falls back to case-insensitive name');
+  assert.deepStrictEqual(groups[0].sessions.map(s => s.name), ['a2', 'a1'], 'members most recent first');
+  assert.strictEqual(groups.find(g => g.name === 'single').sessions.length, 1,
+    'a single-session folder is a group here (unlike buildAutoViews)');
+});
+
+test('buildStripFolderGroups honors the Directory auto-views toggle and odd folder names', () => {
+  assert.deepStrictEqual(app.buildStripFolderGroups([{ name: 'x', gitRepo: 'p' }], { autoViewsEnabled: false }), []);
+  const groups = app.buildStripFolderGroups([
+    { name: 'p1', gitRepo: '__proto__' }, { name: 'c1', gitRepo: 'constructor' },
+  ], {});
+  assert.deepStrictEqual(groups.map(g => g.name).sort(), ['__proto__', 'constructor'],
+    'prototype-named folders are ordinary keys');
+});
+
+test('contract #6 regression: buildAutoViews still drops single-session folders', () => {
+  // Live-shaped fixture: 18 folders, only 2 with >=2 sessions.
+  const sessions = [];
+  for (let i = 0; i < 16; i++) sessions.push({ name: 's' + i, gitRepo: 'solo' + i, snapshot: '' });
+  sessions.push({ name: 'm1', gitRepo: 'multiA', snapshot: '' }, { name: 'm2', gitRepo: 'multiA', snapshot: '' });
+  sessions.push({ name: 'n1', gitRepo: 'multiB', snapshot: '' }, { name: 'n2', gitRepo: 'multiB', snapshot: '' });
+  const av = app.buildAutoViews(sessions, { views: [], hidden_sessions: [] });
+  assert.deepStrictEqual(av.map(v => v.name), ['multiA', 'multiB'],
+    'dashboard auto-views keep the >=2 minimum (A8)');
+  const model = app.buildExpandedPillsModel(sessions, { views: [], hidden_sessions: [] }, 's0', '');
+  assert.strictEqual(model.otherViews.length, 17,
+    'the header strip, by contrast, gets a pill for every other folder');
+});
+
+test('buildExpandedPillsModel: every other folder is a name-keyed candidate, most recent first', () => {
+  const sessions = [
+    { name: 'cur', gitRepo: 'home', lastAttached: 1000, snapshot: '' },
+    { name: 'old', gitRepo: 'ancient', lastAttached: 10, snapshot: '' },
+    { name: 'fresh', gitRepo: 'busy', created: 800, snapshot: '' },
+    { name: 'mid', gitRepo: 'middle', lastAttached: 400, snapshot: '' },
+    { name: 'nofolder', snapshot: '' },
+  ];
+  const m = app.buildExpandedPillsModel(sessions, { views: [], hidden_sessions: [] }, 'cur', '');
+  assert.deepStrictEqual(m.otherViews.map(v => v.key), ['f:busy', 'f:middle', 'f:ancient']);
+  assert.ok(m.otherViews.every(v => v.isAuto), 'all render as 📁 folder pills');
+  assert.deepStrictEqual(m.homeGroups, [], "current folder has no siblings → no group, and it is NOT a candidate");
+  assert.deepStrictEqual(m.otherSessions.map(s => s.name), ['nofolder'],
+    'only keyless sessions remain for the (no folder) bucket');
+  assert.strictEqual(m.foldersEnabled, true);
+  assert.ok(!JSON.stringify(m).includes('lastAttached'),
+    'the model carries order only, never timestamps (render signature stays stable)');
+});
+
+test('buildExpandedPillsModel: a HIDDEN current session still owns its folder (home, never a candidate)', () => {
+  const sessions = [
+    { name: 'cur', sessionKey: 'd:cur', gitRepo: 'proj', snapshot: '' },
+    { name: 'sib', sessionKey: 'd:sib', gitRepo: 'proj', snapshot: '' },
+  ];
+  const m = app.buildExpandedPillsModel(sessions, { views: [], hidden_sessions: ['d:cur'] }, 'cur', '');
+  assert.deepStrictEqual(m.otherViews, [], 'proj must not become a candidate pill');
+  assert.deepStrictEqual(m.homeGroups.map(g => g.key), ['f:proj']);
+  assert.deepStrictEqual(m.homeGroups[0].sessions.map(s => s.name), ['sib']);
+});
+
+test('placeStripCandidates is prefix placement — a narrow pill after a too-wide one is NOT placed', () => {
+  assert.strictEqual(app.placeStripCandidates([100, 300, 50], 0, 260, 0), 1);
+  assert.strictEqual(app.placeStripCandidates([], 0, 100, 0), 0);
+  assert.strictEqual(app.placeStripCandidates([60, 60], 0, 132, 6), 2);
+  assert.strictEqual(app.placeStripCandidates([60, 60], 0, 131, 6), 1);
+});
+
+test('layoutStrip Case A: everything fits → no Other Sessions pill at all', () => {
+  const r = app.layoutStrip({ fixedWidth: 100, groups: [], candidateWidths: [150, 150], otherWidth: 160, needOther: false }, 500, 0);
+  assert.deepStrictEqual(r, { counts: [], placed: 2, showOther: false },
+    'both candidates fit only WITHOUT Other Sessions (a reserve-first layout would overflow one)');
+});
+
+test('layoutStrip Case B: reserves Other Sessions, then fills the rest in order', () => {
+  const r = app.layoutStrip({ fixedWidth: 100, groups: [], candidateWidths: [150, 150, 150], otherWidth: 160, needOther: false }, 500, 0);
+  assert.deepStrictEqual(r, { counts: [], placed: 1, showOther: true });
+  const r2 = app.layoutStrip({ fixedWidth: 100, groups: [], candidateWidths: [50], otherWidth: 160, needOther: true }, 500, 0);
+  assert.deepStrictEqual(r2, { counts: [], placed: 1, showOther: true },
+    'ungrouped sessions always need Other Sessions');
+});
+
+test('layoutStrip gives home-group siblings width first, then candidates (D2)', () => {
+  const groups = [{ sessionWidths: [100, 100], collapsedWidth: 90 }];
+  // 450: siblings (300 incl. current) expand; with Other Sessions reserved
+  // (330 left) no candidate fits — siblings keep their width, candidates yield
+  const r = app.layoutStrip({ fixedWidth: 100, groups, candidateWidths: [100, 100], otherWidth: 120, needOther: false }, 450, 0);
+  assert.deepStrictEqual(r.counts, [2], 'siblings fully expanded');
+  assert.strictEqual(r.placed, 0, 'no room left for candidates after siblings + Other Sessions');
+  assert.strictEqual(r.showOther, true);
+  const siblingsOnly = app.layoutStrip({ fixedWidth: 100, groups, candidateWidths: [], otherWidth: 120, needOther: false }, 250, 0);
+  assert.strictEqual(siblingsOnly.showOther, false, 'a home-group overflow uses its own +N dropdown, not Other Sessions');
+});
+
+test('layoutStrip degenerate minimum layout still reports Other Sessions', () => {
+  const r = app.layoutStrip({ fixedWidth: 200, groups: [], candidateWidths: [100], otherWidth: 150, needOther: false }, 0, 6);
+  assert.deepStrictEqual(r, { counts: [], placed: 0, showOther: true });
+});
+
+test('_epUniqueSessionCount counts a session shared by a view and a folder once', () => {
+  const s = { name: 'x', remoteId: '' };
+  assert.strictEqual(app._epUniqueSessionCount([[s, { name: 'y', remoteId: '' }], [s], [{ name: 'x', remoteId: 'dev2' }]]), 3);
+});
+
+test('_epFindByAttr compares values exactly — folder names with quotes/backslashes never break a selector', () => {
+  const tricky = 'c:f:client "north" \\ x';
+  const els = [
+    { getAttribute: (a) => (a === 'data-pill-menu' ? 'c:f:other' : null) },
+    { getAttribute: (a) => (a === 'data-pill-menu' ? tricky : null) },
+  ];
+  let selectorSeen = null;
+  const root = { querySelectorAll: (sel) => { selectorSeen = sel; return els; } };
+  assert.strictEqual(app._epFindByAttr([root], 'data-pill-menu', tricky), els[1]);
+  assert.strictEqual(selectorSeen, '[data-pill-menu]', 'the key is never interpolated into the selector');
+});
+
+// --- render + menus with a real width (measurement stubbed) ---
+
+function epStubMeasure(width) {
+  const orig = { body: globalThis.document.body, create: globalThis.document.createElement };
+  globalThis.document.body = { appendChild: () => {} };
+  globalThis.document.createElement = () => ({
+    style: {},
+    _h: '',
+    set innerHTML(v) { this._h = v; },
+    get innerHTML() { return this._h; },
+    get firstElementChild() { return { offsetWidth: width }; },
+  });
+  return () => {
+    globalThis.document.body = orig.body;
+    globalThis.document.createElement = orig.create;
+  };
+}
+
+function epMenuMock() {
+  const classes = new Set(['hidden']);
+  return {
+    _h: '',
+    set innerHTML(v) { this._h = v; },
+    get innerHTML() { return this._h; },
+    classList: { add: (c) => classes.add(c), remove: (c) => classes.delete(c), contains: (c) => classes.has(c) },
+    style: {},
+    querySelectorAll: () => [],
+    hidden: () => classes.has('hidden'),
+  };
+}
+
+// querySelectorAll('[attr]') over a mock's innerHTML — enough for the
+// exact-match lookups (_epFindByAttr) the renderer uses to re-find pills.
+function epAttrQuery(host) {
+  host.querySelectorAll = (sel) => {
+    const m = /^\[([a-z-]+)\]$/.exec(sel);
+    if (!m) return [];
+    const out = [];
+    const tagRe = /<[a-z]+\b([^>]*)>/g;
+    let t;
+    while ((t = tagRe.exec(host.innerHTML || ''))) {
+      const attrs = {};
+      for (const a of t[1].matchAll(/([a-z-]+)="([^"]*)"/g)) attrs[a[1]] = a[2];
+      if (m[1] in attrs) out.push({ getAttribute: (k) => (k in attrs ? attrs[k] : null), setAttribute: () => {} });
+    }
+    return out;
+  };
+  return host;
+}
+
+function epRenderWorld({ width, sessions, settings }) {
+  const { nav, header } = epMockDom();
+  epAttrQuery(nav);
+  const otherHost = epAttrQuery(epMenuMock());
+  const wrap = { clientWidth: width };
+  const menu = epMenuMock();
+  const sub = epMenuMock();
+  const ids = {
+    'expanded-pills': nav, 'expanded-pills-other': otherHost, 'expanded-pills-wrap': wrap,
+    'expanded-pill-menu': menu, 'expanded-pill-submenu': sub,
+  };
+  const orig = { byId: globalThis.document.getElementById, qs: globalThis.document.querySelector };
+  globalThis.document.getElementById = (id) => ids[id] || null;
+  globalThis.document.querySelector = (sel) => (sel === '.expanded-header' ? header : null);
+  app._setServerSettings(settings);
+  app._setCurrentSessions(sessions);
+  app._setViewMode('fullscreen');
+  app._setViewingSession('cur');
+  app._setViewingRemoteId('');
+  app.renderExpandedHeaderPills();
+  const restore = () => {
+    app._epCloseMenu();
+    globalThis.document.getElementById = orig.byId;
+    globalThis.document.querySelector = orig.qs;
+    app._setViewMode('grid');
+    app._setViewingSession(null);
+    app._setServerSettings(null);
+    app._setCurrentSessions([]);
+  };
+  return { nav, otherHost, menu, sub, restore };
+}
+
+const mruFleet = [
+  { name: 'cur', gitRepo: 'here', lastAttached: 9000, snapshot: '' },
+  { name: 'p1', gitRepo: 'proj1', lastAttached: 8000, snapshot: '' },
+  { name: 'p2', gitRepo: 'proj2', lastAttached: 7000, snapshot: '' },
+  { name: 'p3a', gitRepo: 'proj3', lastAttached: 6000, snapshot: '' },
+  { name: 'p3b', gitRepo: 'proj3', created: 6500, bell: { unseen_count: 2 }, snapshot: '' },
+  { name: 'p4', gitRepo: 'proj4', lastAttached: 5000, snapshot: '' },
+  { name: 'orphan', snapshot: '' },
+];
+
+test('render: folders fill the strip MRU-first; the rest go to an always-visible Other Sessions host', () => {
+  const unstub = epStubMeasure(100);
+  // wrap 500: current 100+6 → proj1 → proj2 fit beside the reserved Other (100+6); proj3/4 overflow
+  const w = epRenderWorld({ width: 500, sessions: mruFleet, settings: { views: [], hidden_sessions: [] } });
+  try {
+    const html = w.nav.innerHTML;
+    assert.ok(html.includes('data-pill-menu="c:f:proj1"') && html.includes('data-pill-menu="c:f:proj2"'),
+      'two most recent folders inline');
+    assert.ok(html.indexOf('c:f:proj1') < html.indexOf('c:f:proj2'), 'most recent leftmost');
+    assert.ok(!html.includes('c:f:proj3') && !html.includes('c:f:proj4'), 'older folders not inline');
+    assert.ok(!html.includes('data-pill-menu="other"'), 'Other Sessions is NOT inside the scrolling strip');
+    assert.ok(w.otherHost.innerHTML.includes('data-pill-menu="other"'), 'Other Sessions renders in its own host');
+    assert.ok(w.otherHost.innerHTML.includes('<span class="nav-pill__count">4</span>'),
+      'count = unique overflow sessions (p3a, p3b, p4, orphan)');
+
+    app._epToggleMenu({ dataset: { pillMenu: 'other' }, setAttribute: () => {} });
+    const menuHtml = w.menu.innerHTML;
+    assert.ok(!w.menu.hidden(), 'menu shown');
+    const rows = [...menuHtml.matchAll(/data-sub-key="([^"]+)"/g)].map(m => m[1]);
+    assert.deepStrictEqual(rows, ['f:proj3', 'f:proj4', 'ungrouped'],
+      'folder rows in strip (MRU) order, then (no folder)');
+    assert.ok(/data-sub-key="f:proj3"[\s\S]*?nav-pill__bell[\s\S]*?data-sub-key="f:proj4"/.test(menuHtml),
+      'a folder row aggregates its sessions\' bell');
+    assert.ok(!menuHtml.includes('data-session='), 'Other Sessions lists folders, not loose sessions');
+
+    app._epSubRowClick('f:proj3');
+    assert.strictEqual(app._getExpandedPillSubmenuFor(), 'f:proj3');
+    assert.ok(!w.sub.hidden(), 'submenu shown');
+    assert.ok(w.sub.innerHTML.indexOf('data-session="p3b"') < w.sub.innerHTML.indexOf('data-session="p3a"'),
+      'submenu sessions most recent first');
+    assert.ok(w.sub.innerHTML.includes('data-rename'), 'Rename (✎) available from submenu rows');
+    app._epSubRowClick('f:proj3');
+    assert.strictEqual(app._getExpandedPillSubmenuFor(), null, 'a second tap/click toggles it closed');
+  } finally {
+    w.restore();
+    unstub();
+  }
+});
+
+test('render: wide enough → every folder inline and NO Other Sessions pill', () => {
+  const unstub = epStubMeasure(100);
+  const fleet = mruFleet.filter(s => s.name !== 'orphan');
+  const w = epRenderWorld({ width: 2000, sessions: fleet, settings: { views: [], hidden_sessions: [] } });
+  try {
+    assert.ok(['proj1', 'proj2', 'proj3', 'proj4'].every(f => w.nav.innerHTML.includes('c:f:' + f)));
+    assert.strictEqual(w.otherHost.innerHTML, '', 'Other Sessions omitted when nothing overflows');
+  } finally {
+    w.restore();
+    unstub();
+  }
+});
+
+test('render: the Directory auto-views toggle off → no folder pills, flat Other Sessions', () => {
+  const unstub = epStubMeasure(100);
+  const w = epRenderWorld({ width: 2000, sessions: mruFleet, settings: { views: [], hidden_sessions: [], autoViewsEnabled: false } });
+  try {
+    assert.ok(!w.nav.innerHTML.includes('c:f:'), 'no folder pills');
+    app._epToggleMenu({ dataset: { pillMenu: 'other' }, setAttribute: () => {} });
+    assert.ok(w.menu.innerHTML.includes('data-session="p1"') && !w.menu.innerHTML.includes('data-sub-key'),
+      'Other Sessions is the pre-#24 flat session list');
+  } finally {
+    w.restore();
+    unstub();
+  }
+});
+
+test('submenu hover: mouse opens; touch does not; hover-open then click stays open', () => {
+  const unstub = epStubMeasure(100);
+  const w = epRenderWorld({ width: 500, sessions: mruFleet, settings: { views: [], hidden_sessions: [] } });
+  try {
+    app._epToggleMenu({ dataset: { pillMenu: 'other' }, setAttribute: () => {} });
+    const row = (key) => ({ closest: () => ({ getAttribute: () => key }) });
+    app._epSubRowHover({ pointerType: 'touch', target: row('f:proj3') });
+    assert.strictEqual(app._getExpandedPillSubmenuFor(), null, 'touch pointerover never opens (tap = click toggles)');
+    app._epSubRowHover({ pointerType: 'mouse', target: row('f:proj3') });
+    assert.strictEqual(app._getExpandedPillSubmenuFor(), 'f:proj3', 'mouse hover opens');
+    app._epSubRowClick('f:proj3');
+    assert.strictEqual(app._getExpandedPillSubmenuFor(), 'f:proj3',
+      'the click that follows a hover-open confirms it instead of toggling it shut');
+    app._epSubRowClick('f:proj3');
+    assert.strictEqual(app._getExpandedPillSubmenuFor(), null, 'a further click toggles');
+  } finally {
+    w.restore();
+    unstub();
+  }
+});
+
+test('submenu hover: switching rows waits for the diagonal-travel grace period', async () => {
+  const unstub = epStubMeasure(100);
+  const w = epRenderWorld({ width: 500, sessions: mruFleet, settings: { views: [], hidden_sessions: [] } });
+  try {
+    app._epToggleMenu({ dataset: { pillMenu: 'other' }, setAttribute: () => {} });
+    const row = (key) => ({ closest: () => ({ getAttribute: () => key }) });
+    app._epSubRowHover({ pointerType: 'mouse', target: row('f:proj3') });
+    app._epSubRowHover({ pointerType: 'mouse', target: row('f:proj4') });
+    assert.strictEqual(app._getExpandedPillSubmenuFor(), 'f:proj3', 'crossing another row does not switch at once');
+    await new Promise((r) => setTimeout(r, 220));
+    assert.strictEqual(app._getExpandedPillSubmenuFor(), 'f:proj4', 'lingering on it does');
+  } finally {
+    w.restore();
+    unstub();
+  }
+});
+
+test('Escape: closes the submenu, then the menu — and NEVER also exits the terminal', () => {
+  const unstub = epStubMeasure(100);
+  const w = epRenderWorld({ width: 500, sessions: mruFleet, settings: { views: [], hidden_sessions: [] } });
+  const origClose = globalThis.window._closeTerminal;
+  let terminalClosed = 0;
+  globalThis.window._closeTerminal = () => { terminalClosed++; };
+  const esc = () => ({ key: 'Escape', preventDefault() {}, ctrlKey: false, metaKey: false });
+  try {
+    app.closeSettings(); // earlier tests leave the settings dialog "open", which owns Escape
+    app._epToggleMenu({ dataset: { pillMenu: 'other' }, setAttribute: () => {} });
+    app._epSubRowClick('f:proj3');
+    app.handleGlobalKeydown(esc());
+    assert.strictEqual(app._getExpandedPillSubmenuFor(), null, '1st Escape closes the submenu');
+    assert.strictEqual(app._getExpandedPillMenuFor(), 'other', '…and leaves the menu open');
+    app.handleGlobalKeydown(esc());
+    assert.strictEqual(app._getExpandedPillMenuFor(), null, '2nd Escape closes the menu');
+    assert.strictEqual(terminalClosed, 0, 'no Escape that closed a menu also closed the session');
+    app.handleGlobalKeydown(esc());
+    assert.strictEqual(terminalClosed, 1, 'with nothing open, Escape still leaves the terminal as before');
+  } finally {
+    globalThis.window._closeTerminal = origClose;
+    w.restore();
+    unstub();
+  }
+});
+
+test('an open menu survives a re-render that REORDERS folders (name keys, not indices)', () => {
+  const unstub = epStubMeasure(100);
+  const sessions = mruFleet.map(s => ({ ...s }));
+  const w = epRenderWorld({ width: 2000, sessions, settings: { views: [], hidden_sessions: [] } });
+  try {
+    app._epToggleMenu({ dataset: { pillMenu: 'c:f:proj4' }, setAttribute: () => {} });
+    assert.ok(w.menu.innerHTML.includes('data-session="p4"'));
+    // proj4 becomes the most recently accessed folder — it moves to the front
+    sessions.find(s => s.name === 'p4').lastAttached = 9500;
+    app._setCurrentSessions(sessions);
+    app.renderExpandedHeaderPills();
+    assert.ok(w.nav.innerHTML.indexOf('c:f:proj4') < w.nav.innerHTML.indexOf('c:f:proj1'), 'reordered');
+    assert.deepStrictEqual(app._epMenuSessions(app._getExpandedPillMenuFor()).map(s => s.name), ['p4'],
+      'the open menu still lists proj4, not whatever now sits at its old index');
+  } finally {
+    w.restore();
+    unstub();
+  }
 });

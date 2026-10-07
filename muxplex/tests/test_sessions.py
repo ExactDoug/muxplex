@@ -119,6 +119,86 @@ async def test_enumerate_sessions_handles_tmux_error(mock_subprocess):
 
 
 # ---------------------------------------------------------------------------
+# enumerate_sessions — per-session recency (issue #24, header MRU order)
+# ---------------------------------------------------------------------------
+
+
+async def test_enumerate_sessions_requests_recency_format(mock_subprocess):
+    """The ONE list-sessions call carries the time fields (no extra tmux spawn),
+    with the name LAST and both times behind never-empty conditionals."""
+    with mock_subprocess("") as mock_create:
+        await enumerate_sessions()
+    args = mock_create.call_args[0]
+    assert args[1:3] == ("list-sessions", "-F")
+    fmt = args[3]
+    assert fmt == sessions_mod._LIST_SESSIONS_FORMAT
+    assert fmt.endswith("#{session_name}"), "name must be the LAST field"
+    assert "#{?session_last_attached,#{session_last_attached},0}" in fmt
+    assert "#{?session_created,#{session_created},0}" in fmt
+
+
+async def test_enumerate_sessions_publishes_times(mock_subprocess):
+    """Names come back as before; times are published for get_session_times()."""
+    out = "1790000100\t1790000000\talpha\n0\t1790000050\tbeta\n"
+    with mock_subprocess(out):
+        names = await enumerate_sessions()
+    assert names == ["alpha", "beta"]
+    times = sessions_mod.get_session_times()
+    assert times["alpha"] == (1790000100, 1790000000)
+    assert times["beta"] == (None, 1790000050), "never attached (0) -> None"
+
+
+def test_parse_session_line_splits_before_trimming():
+    """An EMPTY leading field must not be eaten by a strip — that would shift the
+    timestamp into the name, the name would vanish from enumeration, and the poll
+    cycle would reap the session's ttyd."""
+    assert sessions_mod._parse_session_line("\t1790000000\talpha") == (
+        "alpha",
+        None,
+        1790000000,
+    )
+
+
+def test_parse_session_line_keeps_tabs_inside_the_name():
+    assert sessions_mod._parse_session_line("1\t2\tna\tme") == ("na\tme", 1, 2)
+
+
+def test_parse_session_line_non_numeric_time_keeps_the_name():
+    assert sessions_mod._parse_session_line("x\t2\talpha") == ("alpha", None, 2)
+
+
+def test_parse_session_line_bare_name_is_legacy_shape():
+    """A line with no TAB is a bare name (pre-#24 shape; also what mocks emit)."""
+    assert sessions_mod._parse_session_line("  alpha  ") == ("alpha", None, None)
+    assert sessions_mod._parse_session_line("   ") is None
+
+
+def test_parse_session_line_one_tab_is_never_worse_than_before():
+    """Unreachable with the real format; kept whole, exactly as the pre-#24
+    parser kept every line — never dropped."""
+    assert sessions_mod._parse_session_line("odd\tline") == ("odd\tline", None, None)
+
+
+async def test_enumerate_sessions_replaces_times_wholesale(mock_subprocess):
+    """A deleted session must not keep stale times: the map is REBOUND, not merged."""
+    with mock_subprocess("5\t1\tgone\n6\t2\tstays\n"):
+        await enumerate_sessions()
+    held = sessions_mod.get_session_times()
+    with mock_subprocess("7\t2\tstays\n"):
+        await enumerate_sessions()
+    assert sessions_mod.get_session_times() == {"stays": (7, 2)}
+    assert held == {"gone": (5, 1), "stays": (6, 2)}, "published map never mutated"
+
+
+async def test_enumerate_sessions_tmux_error_leaves_times_untouched(mock_subprocess):
+    with mock_subprocess("5\t1\talpha\n"):
+        await enumerate_sessions()
+    with mock_subprocess(stdout="", stderr="no server running", returncode=1):
+        assert await enumerate_sessions() == []
+    assert sessions_mod.get_session_times() == {"alpha": (5, 1)}
+
+
+# ---------------------------------------------------------------------------
 # capture_pane tests
 # ---------------------------------------------------------------------------
 

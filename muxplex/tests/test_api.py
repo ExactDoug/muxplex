@@ -388,6 +388,62 @@ def test_get_sessions_includes_cwd_and_git_metadata(client, monkeypatch):
     assert by_name["mystery"]["gitRepo"] is None
 
 
+def test_get_sessions_includes_recency_times(client, monkeypatch):
+    """Header MRU order (#24): lastAttached / created epoch seconds per session,
+    None when unknown (never attached, or not in the times map)."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["a", "b", "c"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {})
+    monkeypatch.setattr(
+        "muxplex.main.get_session_times",
+        lambda: {"a": (1790000100, 1790000000), "b": (None, 1790000050)},
+    )
+
+    by_name = {i["name"]: i for i in client.get("/api/sessions").json()}
+    assert (by_name["a"]["lastAttached"], by_name["a"]["created"]) == (
+        1790000100,
+        1790000000,
+    )
+    assert (by_name["b"]["lastAttached"], by_name["b"]["created"]) == (
+        None,
+        1790000050,
+    )
+    assert (by_name["c"]["lastAttached"], by_name["c"]["created"]) == (None, None)
+
+
+def test_get_sessions_rebuilds_when_only_times_change(client, monkeypatch):
+    """Contract #7: the body-cache key covers every payload input — a session
+    switch (new attach time) must not be served from the cache."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {"alpha": "same"})
+    monkeypatch.setattr("muxplex.main.get_session_times", lambda: {"alpha": (5, 1)})
+    calls = _count_payload_builds(monkeypatch)
+    assert client.get("/api/sessions").json()[0]["lastAttached"] == 5
+
+    monkeypatch.setattr("muxplex.main.get_session_times", lambda: {"alpha": (9, 1)})
+    assert client.get("/api/sessions").json()[0]["lastAttached"] == 9
+    assert len(calls) == 2
+
+
+def test_federation_sessions_local_items_include_recency_times(
+    client, monkeypatch, tmp_path
+):
+    """The federation endpoint builds LOCAL items separately from /api/sessions —
+    it must carry the same recency fields (remote items pass through verbatim)."""
+    import json
+
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    settings_path.write_text(json.dumps({"device_name": "ws", "remote_instances": []}))
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {})
+    monkeypatch.setattr("muxplex.main.get_session_times", lambda: {"alpha": (5, 1)})
+
+    item = client.get("/api/federation/sessions").json()[0]
+    assert (item["lastAttached"], item["created"]) == (5, 1)
+
+
 def test_get_sessions_includes_snapshot_text(client, monkeypatch):
     """GET /api/sessions snapshot field must contain the cached capture-pane text."""
     monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["gamma"])

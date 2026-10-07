@@ -5,11 +5,13 @@ In-memory cache:
     _session_list  — most-recently-enumerated list of session names.
     _snapshots     — most-recently-captured pane text, keyed by session name.
     _session_paths — active-pane cwd per session, keyed by session name.
+    _session_times — (last_attached, created) epoch seconds per session name.
 
 Public API:
     get_session_list()                    → list[str]
     get_snapshots()                       → dict[str, str]
     get_session_paths()                   → dict[str, str]
+    get_session_times()                   → dict[str, tuple[int | None, int | None]]
     update_session_cache(names, snapshots) → None
     update_session_paths(paths)           → None
     run_tmux(*args)                       → str   (raises RuntimeError on nonzero exit)
@@ -22,7 +24,10 @@ Public API:
 """
 
 import asyncio
+import logging
 import os
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # In-memory cache
@@ -31,6 +36,10 @@ import os
 _session_list: list[str] = []
 _snapshots: dict[str, str] = {}
 _session_paths: dict[str, str] = {}
+# name -> (last_attached, created), epoch seconds or None when unknown/never.
+# Published by enumerate_sessions(); REBOUND wholesale, never mutated (see
+# get_session_times).
+_session_times: dict[str, tuple[int | None, int | None]] = {}
 
 
 def get_session_list() -> list[str]:
@@ -68,6 +77,18 @@ def update_session_cache(names: list[str], snapshots: dict[str, str]) -> None:
 def get_session_paths() -> dict[str, str]:
     """Return a copy of the cached session→cwd dict."""
     return dict(_session_paths)
+
+
+def get_session_times() -> dict[str, tuple[int | None, int | None]]:
+    """Return the session→(last_attached, created) map from the last enumeration.
+
+    Returns the live reference, NOT a copy: callers read it once per request
+    and must treat it as read-only.  That is safe because enumerate_sessions()
+    REBINDS ``_session_times`` with a complete new dict on every successful
+    enumeration and never mutates the published one, so a held reference stays
+    a consistent snapshot of its own enumeration.
+    """
+    return _session_times
 
 
 def update_session_paths(paths: dict[str, str]) -> None:
@@ -140,20 +161,93 @@ async def run_tmux(*args: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# `tmux list-sessions` format: per-session recency (header strip MRU ordering,
+# issue #24) carried on the SAME single call that enumerates names, so the poll
+# cycle stays O(1) in tmux spawns.
+#
+# - The name is LAST and split off with maxsplit, so a name containing a TAB
+#   survives intact.
+# - Both time fields go through a tmux conditional so they are NEVER empty: a
+#   session that was never attached prints an EMPTY #{session_last_attached}.
+#   An empty leading field is how a line like "<TAB>1790…<TAB>name" used to be one
+#   .strip() away from collapsing into a single bogus "name" — and a name that
+#   goes missing from enumeration gets its ttyd reaped by the poll cycle.
+_LIST_SESSIONS_FORMAT = (
+    "#{?session_last_attached,#{session_last_attached},0}\t"
+    "#{?session_created,#{session_created},0}\t"
+    "#{session_name}"
+)
+
+
+def _epoch_or_none(field: str) -> int | None:
+    """Parse a tmux epoch-seconds field; 0, empty or non-numeric → None."""
+    field = field.strip()
+    if not field.isdigit():
+        return None
+    value = int(field)
+    return value or None
+
+
+def _parse_session_line(line: str) -> tuple[str, int | None, int | None] | None:
+    """Parse one `list-sessions` line into (name, last_attached, created).
+
+    SPLIT FIRST, TRIM AFTER — never strip the raw line, or an empty leading
+    field is eaten and the remaining fields shift into the name.
+
+    - two or more TABs → ``last TAB created TAB name`` (name is everything after
+      the second TAB); a non-numeric time becomes None, the name is still kept;
+    - no TAB → a bare name with unknown times (the pre-#24 shape, and what the
+      test suite's subprocess mocks emit);
+    - exactly one TAB → unreachable with ``_LIST_SESSIONS_FORMAT``; logged and
+      kept whole as the name — exactly what the pre-#24 parser did with every
+      line, so this is never WORSE than before.
+
+    Returns None for a blank line.
+    """
+    raw = line.rstrip("\r")
+    tabs = raw.count("\t")
+    if tabs >= 2:
+        last, created, name = raw.split("\t", 2)
+        name = name.strip()
+        if not name:
+            return None
+        return name, _epoch_or_none(last), _epoch_or_none(created)
+    if tabs == 1:
+        _log.warning("unexpected list-sessions line shape (1 TAB): %r", raw)
+    name = raw.strip()
+    if not name:
+        return None
+    return name, None, None
+
+
 async def enumerate_sessions() -> list[str]:
     """Return the list of currently running tmux session names.
 
-    Calls ``tmux list-sessions -F #{session_name}``, splits on newlines,
-    and strips whitespace from each entry.
+    ONE ``tmux list-sessions`` call.  Besides the names it also publishes each
+    session's (last_attached, created) times for ``get_session_times()`` — the
+    map is REBOUND wholesale on every successful call, so a deleted or
+    recreated name can never keep stale times.
 
-    Returns [] if tmux is not running (RuntimeError from run_tmux).
+    Returns [] if tmux is not running (RuntimeError from run_tmux); the
+    published times are left untouched in that case (every name is gone
+    anyway).
     """
+    global _session_times
     try:
-        output = await run_tmux("list-sessions", "-F", "#{session_name}")
+        output = await run_tmux("list-sessions", "-F", _LIST_SESSIONS_FORMAT)
     except (RuntimeError, FileNotFoundError):
         return []
 
-    names = [line.strip() for line in output.splitlines() if line.strip()]
+    names: list[str] = []
+    times: dict[str, tuple[int | None, int | None]] = {}
+    for line in output.splitlines():
+        parsed = _parse_session_line(line)
+        if parsed is None:
+            continue
+        name, last_attached, created = parsed
+        names.append(name)
+        times[name] = (last_attached, created)
+    _session_times = times
     return names
 
 

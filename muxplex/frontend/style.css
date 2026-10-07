@@ -2207,6 +2207,27 @@ body {
    (docs/plans/2026-06-04-expanded-header-session-pills-design.md)
    ============================================================ */
 
+/* Strip + Other Sessions host (#24). The wrapper takes the header's free
+   width; the strip inside it scrolls only in the degenerate case, while Other
+   Sessions sits outside the scroll container and can never be pushed off. */
+.expanded-pills-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px; /* must match EP_GAP in app.js */
+  flex: 1;
+  min-width: 0;
+}
+
+.expanded-pills-other {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.expanded-pills-other:empty {
+  display: none;
+}
+
 .expanded-pills {
   display: flex;
   align-items: center;
@@ -2235,7 +2256,8 @@ body {
 }
 
 @media (max-width: 599px) {
-  .expanded-pills { display: none; }
+  .expanded-pills,
+  .expanded-pills-wrap { display: none; }
   .expanded-header--pills .expanded-session-name { display: block; }
 }
 
@@ -2355,6 +2377,38 @@ body {
 
 .expanded-pill-menu .nav-pill__bell {
   margin-left: 6px;
+}
+
+/* Other Sessions rows: a folder (or view) that opens a session submenu (#24) */
+.ep-sub-row__label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ep-sub-row .nav-pill__count {
+  flex-shrink: 0;
+}
+
+.ep-sub-row__chev {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.ep-sub-row[aria-expanded="true"] {
+  background: var(--bg-surface);
+}
+
+.ep-sub-row[aria-expanded="true"] .ep-sub-row__chev {
+  color: var(--accent);
+}
+
+/* Submenu sits above its parent menu where they meet */
+.expanded-pill-submenu {
+  z-index: 101;
 }
 
 
