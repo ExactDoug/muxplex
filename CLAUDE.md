@@ -5,97 +5,11 @@ xterm.js frontend, with multi-device federation, PAM/password auth, TLS, and
 user-defined session Views.
 
 **This repo (`ExactDoug/muxplex`) is a fork of `bkrabach/muxplex`** carrying UI/UX
-improvements. Current version: **0.9.6.dev10**, on **`main`** — a **dev/experimental**
-build carrying the Mouse Lab selection-fix harness *and* the mobile terminal keybar (both
-below); last released version is **0.9.5**. All feature branches through PR #12 are
-merged and their branches/worktrees deleted — **start new work from `main`**.
+improvements. The version lives in `pyproject.toml`.
 
----
-
-## ⇢ CURRENT STATE (2026-08-09)
-
-**Just landed — resource efficiency (PRs #11, #12, both merged).** The poll cycle is now
-**O(1) in session count**. Per-cycle tmux spawns went `2N+2` → `N+3` → **`C+3`** where C =
-panes that actually changed; measured on a live 45-session fleet as 45 captures cold then
-**1** on the next cycle. Full design, measurements, rejected options and a revision log:
-**`docs/plans/2026-08-08-resource-efficiency-plan.md`**. Contracts that came out of it are
-in "Hard-won backend contracts" below — read those before touching the poll cycle.
-
-**Just fixed — the "Reconnecting…" infinite loop (v0.9.6.dev7, branch
-`investigate/terminal-reconnect-loop`).** The dev6 attempt was **insufficient** — it
-terminated only after ~5 cycles/~15 s, spammed the terminal with tmux errors, and left the
-doomed ttyd running. dev7 fixes the real drivers: ttyd is a *server* that re-forks
-`tmux attach` per client, so the poll cycle now reaps it and the WS proxy refuses to
-respawn for a vanished session; the reconnect counter no longer treats inbound error text
-as a health signal. See contracts #8(d), #9, #10.
-
-**(historical) The dev6 attempt.** Killing/exiting the process a tmux session was
-invoked to run destroyed the tmux session, so ttyd's `tmux attach` failed forever and the
-terminal retried every ~15 s with no explanation. The hypothesis in the briefing was
-verified and correct. Fix is frontend-only — the backend was already reporting the truth
-(a 404 from `/connect`) and it was being discarded. Full write-up, including the one thing
-the briefing got wrong:
-**`docs/plans/2026-08-09-terminal-reconnect-loop-investigation.md`** (§"Verification and
-outcome"). See frontend contract #8 below.
-
-**Server:** normally run detached — `setsid nohup .venv/bin/muxplex serve >> ~/.local/state/muxplex/serve.log 2>&1 &`.
-
----
-
-**v0.9 session UX (DONE on `feat/v0.9-session-ux`)** — see `CHANGELOG.md` v0.9.0–v0.9.2:
-(1) new sessions reliably auto-open (createNewSession poll now keys off the canonical
-`device_id:name` sessionKey and waits ~120s); (2) **session rename** —
-`POST /api/sessions/{name}/rename` (`tmux rename-session`) with an atomic cascade
-(`views.rename_session_key` → view membership + `hidden_sessions`; plus state
-`active_session`/`session_order`/bell/`viewing_session`); reachable from the tile
-flyout (grid + sidebar) and the expanded-header session dropdown (✎). **Local-only**
-in v0.9 (remote rename would stale peers' keys); (3) View pills carry a leading ⧉
-glyph (auto-views keep 📁) to read distinctly from session pills. Also: narrow-viewport
-idle session-name contrast bumped `--text-dim`→`--text-muted`.
-**v0.9.1**: cross-browser session-view convergence (`reconcileViewingSession`) +
-suppressed redundant hover preview. **v0.9.2**: cwd auto-grouping now spans git
-worktrees — `resolve_git_repo` resolves a linked worktree's `.git`-*file* to the
-**main repo** name (see auto-views contract #6 below), so worktree sessions group
-with their parent repo instead of forming a lone `dir:<worktree>` view.
-**v0.9.3**: terminal mouse fixes — a focus-click no longer starts a text selection
-(`initDeliberateSelection` drag threshold, contract #4b) and right-click-to-copy never
-also pastes (OR-based contextmenu gate, contract #2). **v0.9.4**: returning focus to a
-terminal no longer drags a selection from a stale anchor — first click after refocus is
-a reset+focus click; stale drags are torn down on focus loss (contract #4b part B).
-**v0.9.5**: that v0.9.4 focus approach didn't actually work — root-caused to xterm
-extending selections on buttonless mousemoves (no physical-button check); replaced with
-a focus-independent zombie-drag killer keyed on `e.buttons === 0` (contract #4b part B).
-**v0.9.6.dev2 (IN PROGRESS, uncommitted-then-committed this checkpoint):** the v0.9.5 fix
-may still not stick because the user's tmux has **`set -g mouse on`**, so xterm.js is in
-mouse-tracking mode most of the time and the xterm-side fixes bail / may target the wrong
-layer. Two hypotheses — **A:** the stale highlight is **tmux copy-mode** (server-side), not
-xterm's, so `_term.clearSelection()` is aimed wrong (fix = send Esc to PTY); **B:** tracking
-mode desync. Decisive read: `_term.hasSelection()` false while a highlight is visible ⇒ A.
-Built a **Mouse Lab** harness (Settings tab) — per-device localStorage toggles + profiles
-to A/B-test fixes live without reloads; diagnostics now log `hasSel`/`track`.
-**Defaults reproduce shipped v0.9.5 behavior (tests stay green).** Design + test plan:
-`docs/plans/2026-06-24-mouse-lab-harness.md`. Awaiting the user's over-time testing before
-a winning fix is baked in and the harness removed.
-**v0.9.6.dev3–dev4 (committed): a SECOND, distinct bug — right-click double-paste.** It
-started when the user accepted Claude Code's **fullscreen** prompt (`~/.claude/settings.json`
-`tui:fullscreen`), which turns Claude Code's **mouse capture ON**; with tmux `mouse on`, a
-right-click is handled by BOTH muxplex's `contextmenu` paste AND the click forwarded to
-Claude Code → double paste (Ctrl+V is immune — keystroke, not forwarded). dev3 added
-paste-path diagnostics (`_pasteFromClipboard`/`onData→PTY`/right-click branch, gated by
-lever 7). dev4 added **lever 6 `rightClickPassThru`** (default OFF): when an app owns the
-mouse, muxplex suppresses the browser menu but lets the forwarded right-click reach the app
-instead of also pasting. The Mouse Lab now has **7 levers + 7 profiles**. Open question the
-lever-6 test settles: ON makes double→single ⇒ fix confirmed; double→zero ⇒ muxplex was
-double-sending (different fix).
-
-**v0.9.6.dev5 (MERGED, PR #9): mobile terminal keybar** — a one-row bar of terminal
-control keys (Esc/Tab/arrows/PgUp/PgDn/Home/End/Del + a swap-in-place Ctrl group) for
-phones, all in `muxplex/frontend/mobile-keyboard.js`, enabled per-browser via Settings →
-Display. Two iPhone-only bugs were found and fixed on-device (neither reproduces in
-desktop device-emulation): rounded display corners clipped the outermost keys, and the
-software keyboard buried the whole bar — see **contract #7** below for the
-visual-viewport rule that came out of it. Design doc:
-`docs/plans/2026-07-27-mobile-terminal-keybar.md`. Current version: **0.9.6.dev5**.
+**Status is not tracked here.** The current version, what is in progress, open questions
+and candidate follow-ups are in **`PLAN.md`**; item-level state is in GitHub Issues. This
+file is the durable brief: how to run and test, the architecture, and the contracts below.
 
 ## Running locally (development)
 
@@ -112,7 +26,13 @@ uv run muxplex serve         # http://127.0.0.1:8088 — settings from ~/.config
   lifetime of the server — more than half the server's own ~58 MB RSS, for no runtime
   benefit once the environment is resolved. `uv run` remains the right call for one-shot
   commands and tests. Measured 2026-08-08; see
-  `docs/plans/2026-08-08-resource-efficiency-plan.md` item 5.1.
+  `docs/plans/2026-08-08-resource-efficiency-plan.md` item 5.1. Run it detached:
+  `setsid nohup .venv/bin/muxplex serve >> ~/.local/state/muxplex/serve.log 2>&1 &`.
+- **Only one `serve` per machine.** A second `muxplex serve`, even on another HTTP port with
+  its own state dir, SIGTERMs the live server's ttyd at startup (`kill_orphan_ttyd` frees
+  the hardcoded port 7682) and re-points the global tmux `alert-bell` hook at itself. Verify
+  backend changes through the pytest `TestClient`; to move the live server to another
+  checkout, stop the old one first.
 - **Stopping a foreground `serve` leaves no orphan** as of the Phase 0/1 efficiency work:
   ttyd is spawned with `start_new_session=True` (so it survives the spawning HTTP
   request) and therefore does NOT receive the Ctrl-C SIGINT; the lifespan shutdown now
@@ -123,19 +43,23 @@ uv run muxplex serve         # http://127.0.0.1:8088 — settings from ~/.config
   `Cache-Control` header. Same version ⇒ browsers replay cached JS without
   revalidating. When testing frontend changes, hard-refresh (`Ctrl+Shift+R`) or bump
   `version` in `pyproject.toml` (rotates the cache-buster for every client).
+  **After pulling or merging a version bump, run `uv sync --extra dev` before restarting.**
+  The editable install's package metadata keeps reporting the old version until then, so
+  the server keeps serving the old `?v=` and the bump never reaches browsers.
 - Production-style usage: `uvx --refresh --from git+https://github.com/exactdoug/muxplex muxplex`
   (`--refresh` required or uvx replays its cached build).
 
 ## Tests
 
 ```bash
-uv run pytest -q -m "not integration"              # Python suite (1446 tests)
-node muxplex/frontend/tests/test_app.mjs           # frontend app logic (543 tests)
-node muxplex/frontend/tests/test_terminal.mjs      # terminal/xterm contracts (66 tests)
-node muxplex/frontend/tests/test_mobile_keyboard.mjs # mobile keybar (16 tests)
+uv run pytest -q -m "not integration"              # Python suite
+node muxplex/frontend/tests/test_app.mjs           # frontend app logic
+node muxplex/frontend/tests/test_terminal.mjs      # terminal/xterm contracts
+node muxplex/frontend/tests/test_mobile_keyboard.mjs # mobile keybar
 ```
 
-**All four suites are fully green** as of v0.9.6.dev10. `test_terminal.mjs` previously
+**All four suites are expected to be green**; the last verified counts are in `PLAN.md`.
+`test_terminal.mjs` previously
 carried 27 harness failures (`container.addEventListener is not a function` during module
 require); the `#terminal-container` mock was a bare `{ appendChild }` and terminal.js's
 attach-once IIFEs (contract #3) need a real element. It now uses `makeContainerStub()`.
@@ -155,6 +79,10 @@ it, which makes the failure look like a test problem rather than an environment 
 to `tmp_path`. Before it existed, a new test file wrote to the **real**
 `~/.config/muxplex` — which has destroyed saved views. The 22 older modules still carry
 their own equivalent autouse fixtures; those layer on top and win. Do not remove either.
+The conftest's autouse `never_kill_the_real_ttyd` makes every `lsof` that `muxplex.ttyd`
+runs report nothing. Without it, `kill_ttyd`'s port fallback (`lsof -ti :7682`, no LISTEN
+filter) SIGTERMs whatever holds a socket on 7682 during the run: the live ttyd **and** the
+live muxplex server. Do not remove it.
 
 **`bells.py` mocking gotcha:** `bells.py` does `from muxplex.sessions import run_tmux` at
 import time, so it holds its own reference — patching `muxplex.sessions.run_tmux` does
@@ -209,7 +137,8 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    lever 6 (`rightClickPassThru`, default OFF → contract unchanged). When ON and an app
    owns the mouse (`mouseTrackingMode !== 'none'`), the handler suppresses the browser menu
    but does NOT copy/paste — it lets the forwarded right-click reach the app, fixing the
-   fullscreen-Claude-Code right-click double-paste (see v0.9.6 paragraph above).
+   fullscreen-Claude-Code right-click double-paste (cause and test plan:
+   `docs/plans/2026-06-24-mouse-lab-harness.md` § "Second bug").
 3. **No handler stacking** — `#terminal-container` is static and `openTerminal()`
    re-runs per session switch. Container-level listeners belong in module-level
    attach-once IIFEs (`initRightClickCopyPaste`, `initMobileTerminalScroll`), never
@@ -458,9 +387,12 @@ fails loudly rather than silently costing O(N) again.
 
 ## Documentation map
 
+- **`PLAN.md` — project status**: current version, workstreams, open questions, candidate
+  follow-ups. Update it, not this file, when work advances.
 - `CHANGELOG.md` — user-facing release history (newest first)
 - `docs/plans/` — design + implementation docs per feature, dated (dashboard, sidebar,
-  auth, settings, federation, CLI, TLS, views, hidden-state redesign)
+  auth, settings, federation, CLI, TLS, views, hidden-state redesign). They record what
+  was decided and why; some carry a phase table for their own feature only.
 - `docs/TRUSTING_THE_LOCAL_CA.md` — client CA-trust walkthrough for `setup-tls --method ca`
 - Views navigation: `docs/plans/2026-04-15-views-design.md` (+ phase1–3 implementation
   docs); header pills (2026-06-04) extend it — see CHANGELOG v0.6.8
@@ -485,7 +417,7 @@ fails loudly rather than silently costing O(N) again.
   unscoped `document.querySelector('[data-session=…]')`, which hijacked header
   nav-pills into full-viewport elements. Hover-preview resolves sessions by
   name + remoteId. Enforced by regression tests in `test_app.mjs`.
-- v0.9 session UX (DONE, branch `feat/v0.9-session-ux`):
+- v0.9 session UX (v0.9.0–v0.9.2, PR #8):
   requirements `docs/plans/2026-06-11-v0.9-session-ux-requirements.md`; shipped in
   `CHANGELOG.md` v0.9.0 — reliable new-session auto-open, **local** session rename
   (`POST /api/sessions/{name}/rename` + `views.rename_session_key` cascade; flyout +
@@ -494,21 +426,20 @@ fails loudly rather than silently costing O(N) again.
   session-view convergence + suppressed redundant hover preview. **v0.9.2**
   (`CHANGELOG.md`): cwd auto-grouping spans git worktrees — backend-only
   `resolve_git_repo` change (see auto-views contract #6); no design doc.
-- Mouse Lab selection-fix harness (v0.9.6.dev2, IN PROGRESS):
+- Mouse Lab selection-fix harness (v0.9.6.dev2–dev4; status in `PLAN.md`):
   `docs/plans/2026-06-24-mouse-lab-harness.md` — per-device localStorage toggle harness
   (**7 levers + 7 profiles** as of dev4) to A/B-test candidate fixes for TWO bugs: the
   stale-selection bug (tmux-`mouse on` "wrong-layer" reframing; Hyp. A = tmux copy-mode,
   not xterm's; levers 4/5) **and** the right-click double-paste from fullscreen Claude Code
   mouse capture (lever 6 `rightClickPassThru`). Defaults preserve shipped v0.9.5 behavior.
   Research artifact that prompted the reframing: `docs/Claude Code + tmux + Mouse.md` (NOT
-  muxplex-specific; its env-var fixes don't apply — different stack). No CHANGELOG entry yet
-  (dev build, no release).
-- Mobile terminal keybar (v0.9.6.dev5, DONE — PR #9):
+  muxplex-specific; its env-var fixes don't apply — different stack).
+- Mobile terminal keybar (v0.9.6.dev5, PR #9; terminal sizing + Paste key v0.9.6.dev9, PR #21):
   `docs/plans/2026-07-27-mobile-terminal-keybar.md` — module shape, the per-browser
   enablement rationale, and the two iPhone-only bugs (rounded-corner key clipping; the
   software keyboard burying the bar) with the visual-viewport dock that fixes the second.
   See contract #7. Shipped in `CHANGELOG.md` v0.9.6.dev5.
-- **Resource efficiency (DONE — PRs #11/#12, merged 2026-08-09):**
+- **Resource efficiency (PRs #11/#12):**
   `docs/plans/2026-08-08-resource-efficiency-plan.md` — the poll cycle made O(1) in N.
   Read this before touching the poll cycle, snapshots, bells, the `/api/sessions` cache,
   or ttyd lifecycle; the backend contracts above are its distilled output. Notable for
@@ -519,13 +450,13 @@ fails loudly rather than silently costing O(N) again.
   visible-set snapshot scoping (unsound — federation hands every local snapshot to peers
   who filter by their *own* view). The doc carries a revision log of what its own first
   draft got wrong, after adversarial review corrected four risk ratings.
-- **Header project-folder pills (v0.9.6.dev10, #24):**
+- **Header project-folder pills (v0.9.6.dev10, #24, PR #25):**
   `docs/plans/2026-10-06-header-project-folders-plan.md` — every folder as a 📁 pill, MRU
   order from tmux attach times, fill-to-width, Other Sessions as a folder → session menu.
   Carries a revision log of what an adversarial Codex review corrected (list-sessions
   parse, the pre-existing Escape bug, placement, menu mechanics). Distilled into frontend
   contract #12 and backend contract #10.
-- **Terminal "Reconnecting…" loop (FIXED — v0.9.6.dev6):**
+- **Terminal "Reconnecting…" loop (v0.9.6.dev6–dev7, PR #13):**
   `docs/plans/2026-08-09-terminal-reconnect-loop-investigation.md` — killing the process
   a session was invoked to run left the terminal retrying forever. Pre-existing; the
   briefing's hypothesis (the reconnect path has no notion of session liveness and

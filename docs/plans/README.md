@@ -1,5 +1,9 @@
-# Implementation Plans (Historical)
+# Design and Implementation Plans
 
-These are historical design and implementation plan documents from the initial build of muxplex. All plans have been fully implemented. They are retained as architectural decision records (ADRs) and build logs.
+One document per feature, dated by when the work started. Together they record what was
+decided and why: requirements, findings, rejected options, and revision logs where an
+adversarial review corrected a draft. Some carry a phase table for their own feature.
 
-See the main [README.md](../../README.md) for current documentation.
+**Project status is not tracked here.** For what is current, in progress or next, see
+[`PLAN.md`](../../PLAN.md). The user-facing documentation is the main
+[`README.md`](../../README.md).

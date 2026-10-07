@@ -1,7 +1,7 @@
 # Header strip: every project folder as a pill, most-recently-used first — Plan
 
 **Issue:** #24 (owns acceptance criteria and open/closed state; not restated here)
-**Branch / worktree:** `feat/header-project-groups-fill-width` at `.worktrees/header-project-fill`
+**Branch:** `feat/header-project-groups-fill-width`, merged to `main` in PR #25 on 2026-10-06 (branch and worktree since removed)
 **Extends:** `2026-06-04-expanded-header-session-pills-design.md` (strip layout and allocator),
 `2026-06-05-cwd-auto-grouping-*.md` (auto-views, A7/A8/A9)
 
@@ -28,7 +28,7 @@
 | 2 | Frontend model: strip-local folder groups, recency-ordered | DONE (2026-10-06) |
 | 3 | Layout: fill width, overflow list, Other Sessions always visible | DONE (2026-10-06) |
 | 4 | Other Sessions folder → session menu with submenu; Escape fix | DONE (2026-10-06) |
-| 5 | Docs, version (0.9.6.dev10) DONE; manual check on the live instance | IN PROGRESS |
+| 5 | Docs, version (0.9.6.dev10); manual check on the live instance | DONE (2026-10-06): the user accepted it on the live instance and merged PR #25. The separate touch-device tap check (§5) was not individually recorded |
 
 ## Revision log
 
