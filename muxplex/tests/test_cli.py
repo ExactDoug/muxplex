@@ -3290,3 +3290,81 @@ def test_doctor_reports_launchd_registered_but_not_serving(
         f"doctor() must warn 'not serving' when launchd is registered but port is down;"
         f" got: {out!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# issue #28 — _kill_stale_port_holder must target the listener, not its clients
+# ---------------------------------------------------------------------------
+
+
+def test_kill_stale_port_holder_scopes_lsof_to_listening_sockets(monkeypatch):
+    """_kill_stale_port_holder must ask lsof for LISTENING sockets only (issue #28).
+
+    Plain ``lsof -ti :<port>`` matches EITHER end of a connection, so clients
+    of the port (ssh tunnels, test harnesses) get SIGTERMed on every ``serve``
+    startup even though they are not the port holder.  ``-sTCP:LISTEN`` limits
+    the match to the actual holder.
+    """
+    import subprocess
+
+    import muxplex.cli as cli_mod
+
+    lsof_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kw):  # noqa: ANN001
+        lsof_calls.append(list(cmd))
+        return type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    cli_mod._kill_stale_port_holder(8088)
+
+    assert lsof_calls, "_kill_stale_port_holder must invoke lsof"
+    cmd = lsof_calls[0]
+    assert "TCP:8088" in cmd, (
+        "lsof argv must scope the port as TCP:<port>, got %r" % (cmd,)
+    )
+    assert "-sTCP:LISTEN" in cmd, (
+        "lsof argv must restrict the match to listening sockets, got %r" % (cmd,)
+    )
+
+
+def test_kill_stale_port_holder_never_signals_clients(monkeypatch):
+    """A PID holding only a CLIENT socket to the port must never be signalled (issue #28).
+
+    On the old argv (``lsof -ti :<port>``) lsof lists both ends of every
+    connection to the port; the loop SIGTERMed each one, killing innocents
+    (and the server itself via its own ttyd client sockets).  With
+    ``-sTCP:LISTEN`` the client PID is simply never listed — and the loop
+    skips our own PID as a second layer of protection.
+    """
+    import os as os_mod
+    import subprocess
+
+    import muxplex.cli as cli_mod
+
+    my_pid = os_mod.getpid()
+    client_pid = my_pid + 100000  # a foreign PID standing in for a port client
+
+    def fake_run(cmd, **kw):  # noqa: ANN001
+        # Old behavior returned both the listener and its clients:
+        return type(
+            "R",
+            (),
+            {"returncode": 0, "stdout": f"{client_pid}\n{my_pid}\n", "stderr": ""},
+        )()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    killed_pids: list[int] = []
+
+    def fake_kill(pid, sig):  # noqa: ANN001
+        killed_pids.append(pid)
+
+    monkeypatch.setattr(os_mod, "kill", fake_kill)
+
+    cli_mod._kill_stale_port_holder(8088)
+
+    assert my_pid not in killed_pids, (
+        "_kill_stale_port_holder must never signal its own process (issue #28)"
+    )
