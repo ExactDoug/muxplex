@@ -524,3 +524,74 @@ async def test_kill_orphan_ttyd_handles_invalid_pid_file_content():
 
     assert result is False
     assert not pid_path.exists(), "Invalid PID file should be removed"
+
+
+# ---------------------------------------------------------------------------
+# issue #28 — the port-based fallback must never signal our own process
+# ---------------------------------------------------------------------------
+
+
+def test_kill_pids_on_port_scopes_lsof_to_listening_sockets():
+    """_kill_pids_on_port must ask lsof for LISTENING sockets only (issue #28).
+
+    Plain ``lsof -ti :<port>`` matches EITHER end of a connection, so the
+    muxplex server's own client sockets to ttyd put its PID in the list and
+    the fallback SIGTERM/SIGKILLs the server itself.  ``-sTCP:LISTEN`` limits
+    the match to the actual port holder.
+    """
+    captured_cmds: list[list[str]] = []
+
+    def mock_subprocess_run(cmd, **kwargs):  # noqa: ANN001
+        captured_cmds.append(list(cmd))
+        result = MagicMock()
+        result.returncode = 1  # nothing found
+        result.stdout = ""
+        return result
+
+    with patch("muxplex.ttyd._subprocess.run", side_effect=mock_subprocess_run):
+        result = ttyd_mod._kill_pids_on_port(ttyd_mod.TTYD_PORT, signal.SIGTERM)
+
+    assert result is False
+    assert captured_cmds, "_kill_pids_on_port must invoke lsof"
+    cmd = captured_cmds[0]
+    assert f"TCP:{ttyd_mod.TTYD_PORT}" in cmd, (
+        "lsof argv must scope the port as TCP:<port>, got %r" % (cmd,)
+    )
+    assert "-sTCP:LISTEN" in cmd, (
+        "lsof argv must restrict the match to listening sockets (-sTCP:LISTEN), "
+        "got %r" % (cmd,)
+    )
+
+
+def test_kill_pids_on_port_never_signals_own_pid():
+    """_kill_pids_on_port must skip our own PID even if lsof lists it (issue #28).
+
+    Belt-and-braces: if a future lsof regression (or an unexpected socket
+    shape) puts the calling process's PID in the output, the function must not
+    signal it — SIGTERM would shut the server down gracefully and SIGKILL
+    would kill it instantly.
+    """
+    import os
+
+    my_pid = os.getpid()
+    mock_lsof_result = MagicMock()
+    mock_lsof_result.returncode = 0
+    # Simulate the bug scenario: our own PID listed alongside the real listener.
+    mock_lsof_result.stdout = f"{my_pid}\n12345\n"
+
+    killed_pids: list[tuple[int, int]] = []
+
+    def mock_os_kill(pid: int, sig: int) -> None:
+        killed_pids.append((pid, sig))
+
+    with (
+        patch("os.kill", side_effect=mock_os_kill),
+        patch("muxplex.ttyd._subprocess.run", return_value=mock_lsof_result),
+    ):
+        result = ttyd_mod._kill_pids_on_port(ttyd_mod.TTYD_PORT, signal.SIGTERM)
+
+    assert result is True, "the real listener (12345) must still be signalled"
+    assert (12345, signal.SIGTERM) in killed_pids
+    assert my_pid not in [pid for pid, _sig in killed_pids], (
+        "_kill_pids_on_port must never signal its own process (issue #28)"
+    )
