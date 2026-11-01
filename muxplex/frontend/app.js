@@ -3757,6 +3757,7 @@ function _queueNavigationMutation(navigationId, mutation) {
 async function openSession(name, opts = {}) {
   if (!name || !name.trim()) return;
   var remoteId = opts.remoteId != null ? String(opts.remoteId) : '';
+  var _deviceId = remoteId; // federation device ID, never a positional array index
   var navId = ++_navigationSeq;
   var oldName = _viewingSession;
   var oldRid = _viewingRemoteId || '';
@@ -3855,8 +3856,8 @@ async function openSession(name, opts = {}) {
         return response;
       });
       if (!connected || navId !== _navigationSeq) return;
-      if (remoteId !== '') {
-        api('POST', '/api/federation/' + encodeURIComponent(remoteId) +
+      if (_deviceId !== '') {
+        api('POST', '/api/federation/' + encodeURIComponent(_deviceId) +
           '/sessions/' + encodeURIComponent(name) + '/bell/clear').catch(function() {});
       }
     } catch (err) {
