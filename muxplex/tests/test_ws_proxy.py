@@ -791,3 +791,40 @@ def test_missing_ttyd_lease_is_rejected_before_any_ttyd_connect(monkeypatch):
         with c.websocket_connect("/terminal/ws") as ws:
             assert ws.receive()["code"] == 4409
     assert attaches == []
+
+def test_federation_forwards_remote_4409_without_retrying_wrong_terminal(monkeypatch):
+    """The remote can change independently after coordinator CAS; preserve 4409."""
+    from muxplex.state import empty_state, save_state
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+
+    state = empty_state()
+    state["active_session"] = "alpha"
+    state["active_remote_id"] = "node-b"
+    state["active_connection_id"] = "lease-alpha"
+    save_state(state)
+    monkeypatch.setattr(
+        "muxplex.main._lookup_remote_by_device_id",
+        lambda rid: {"url": "http://node-b:8088", "key": "secret"}
+        if rid == "node-b" else None,
+    )
+
+    class RemoteRejected(FakeTtydWs):
+        async def _async_gen(self):
+            # The remote accepted WS then rejected the lease before sending
+            # ttyd output, as its local active session became beta.
+            raise ConnectionClosedError(
+                Close(4409, "Active remote session changed"),
+                Close(4409, "Active remote session changed"),
+            )
+            yield  # mark as async generator
+
+    monkeypatch.setattr(
+        "muxplex.main.websockets.connect",
+        lambda *args, **kwargs: RemoteRejected(),
+    )
+    with _make_authed_client() as c:
+        with c.websocket_connect(
+            "/federation/node-b/terminal/ws?expected_session=alpha&connection_id=lease-alpha"
+        ) as ws:
+            assert ws.receive()["code"] == 4409
