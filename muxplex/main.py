@@ -18,6 +18,7 @@ import os
 import pathlib
 import pwd
 import re
+import secrets
 import socket
 import ssl
 import shutil
@@ -117,6 +118,12 @@ def _active_remote_id(state: dict) -> str:
     """Normalize legacy integer device indexes (including 0) as identities."""
     value = state.get("active_remote_id")
     return "" if value is None else str(value)
+
+
+def _active_connection_id(state: dict) -> str:
+    """The active ttyd lease. A missing lease is never valid for attachment."""
+    value = state.get("active_connection_id")
+    return value if isinstance(value, str) else ""
 
 # Monotonic counter bumped once per completed poll cycle.  It is part of the
 # /api/sessions payload cache key so a cached body can never outlive the cycle
@@ -284,6 +291,7 @@ async def _run_poll_cycle() -> None:
             stale_ttyd_session = state["active_session"]
             state["active_session"] = None
             state["active_remote_id"] = None
+            state["active_connection_id"] = None
 
         # 8. Process bell flags (detect 0→1 transitions, update unseen_count)
         await process_bell_flags(names, state)
@@ -751,6 +759,10 @@ async def patch_state(patch: StatePatch) -> dict:
             state["active_session"] = patch.active_session
         if "active_remote_id" in changed:
             state["active_remote_id"] = patch.active_remote_id
+        if "active_session" in changed or "active_remote_id" in changed:
+            # An external PATCH does not perform a ttyd transition and cannot
+            # authorize a connection to the newly described target.
+            state["active_connection_id"] = None
         if "active_view" in changed:
             state["active_view"] = patch.active_view
         save_state(state)
@@ -886,6 +898,9 @@ def _viewing_headers(state: dict) -> dict[str, str]:
     return {
         "X-Muxplex-Active-Session": urllib.parse.quote(str(name), safe=""),
         "X-Muxplex-Active-Remote-Id": urllib.parse.quote(remote_id, safe=""),
+        "X-Muxplex-Active-Connection-Id": urllib.parse.quote(
+            _active_connection_id(state), safe=""
+        ),
     }
 
 
@@ -1047,6 +1062,10 @@ async def connect_session(name: str, reconnect: bool = False) -> dict:
         if known and name not in known:
             raise HTTPException(status_code=404, detail=f"Session '{name}' not found")
 
+        # Reconnecting the *same* ttyd session keeps its lease so an existing
+        # browser can safely reattach. A user navigation always gets a new
+        # lease, even for an A -> B -> A sequence.
+        lease = (_active_connection_id(latest) if reconnect else "") or secrets.token_urlsafe(24)
         _log.info("Connecting to session '%s'", name)
         await kill_ttyd()
         await spawn_ttyd(name)
@@ -1055,15 +1074,22 @@ async def connect_session(name: str, reconnect: bool = False) -> dict:
             state = load_state()
             state["active_session"] = name
             state["active_remote_id"] = None
+            state["active_connection_id"] = lease
             save_state(state)
 
-    return {"active_session": name, "active_remote_id": None, "ttyd_port": TTYD_PORT}
+    return {
+        "active_session": name,
+        "active_remote_id": None,
+        "connection_id": lease,
+        "ttyd_port": TTYD_PORT,
+    }
 
 
 @app.delete("/api/sessions/current")
 async def delete_current_session(
     expected_session: str | None = None,
     expected_remote_id: str | None = None,
+    expected_connection_id: str | None = None,
 ) -> dict:
     """Disconnect only the session this browser actually intended to close.
 
@@ -1080,6 +1106,8 @@ async def delete_current_session(
             if expected_session is not None and (
                 current_name != expected_session
                 or current_rid != (expected_remote_id or "")
+                or (expected_connection_id is not None
+                    and _active_connection_id(state) != expected_connection_id)
             ):
                 return {
                     "active_session": current_name,
@@ -1094,6 +1122,7 @@ async def delete_current_session(
             state = load_state()
             state["active_session"] = None
             state["active_remote_id"] = None
+            state["active_connection_id"] = None
             save_state(state)
 
     return {"active_session": None, "active_remote_id": None}
@@ -2015,6 +2044,11 @@ async def federation_connect(
             resp.raise_for_status()
             result = resp.json()
         except httpx.HTTPStatusError as exc:
+            # The remote is authoritative for its own shared ttyd. Preserve a
+            # guarded reconnect's 409 rather than hiding it as a 502; otherwise
+            # the browser retries and may attach to the wrong remote session.
+            if reconnect and exc.response.status_code == 409:
+                raise HTTPException(status_code=409, detail="Active remote session changed")
             raise HTTPException(
                 status_code=502,
                 detail=f"Remote returned {exc.response.status_code}",
@@ -2026,10 +2060,21 @@ async def federation_connect(
                 detail=f"Remote unreachable: {remote_url} ({type(exc).__name__}: {exc})",
             )
 
+        # Require upgraded peers to prove their ttyd attachment identity;
+        # silently accepting an older peer would reintroduce the exact
+        # session-agnostic WebSocket race this change fixes.
+        lease = result.get("connection_id") if isinstance(result, dict) else None
+        if not isinstance(lease, str) or not lease:
+            raise HTTPException(
+                status_code=502,
+                detail="Remote muxplex must support connection_id; upgrade the remote instance",
+            )
+
         async with state_lock:
             state = load_state()
             state["active_session"] = session_name
             state["active_remote_id"] = device_id
+            state["active_connection_id"] = lease
             save_state(state)
 
     return {**result, "active_session": session_name, "active_remote_id": device_id}
