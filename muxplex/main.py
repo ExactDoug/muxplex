@@ -112,6 +112,12 @@ _settings_sync_counter: int = 0
 # wait for the OS and must not block unrelated poll and heartbeat state reads.
 _ttyd_transition_lock: asyncio.Lock = asyncio.Lock()
 
+
+def _active_remote_id(state: dict) -> str:
+    """Normalize legacy integer device indexes (including 0) as identities."""
+    value = state.get("active_remote_id")
+    return "" if value is None else str(value)
+
 # Monotonic counter bumped once per completed poll cycle.  It is part of the
 # /api/sessions payload cache key so a cached body can never outlive the cycle
 # that produced it, even for inputs the key does not enumerate (e.g. a git repo
@@ -273,7 +279,7 @@ async def _run_poll_cycle() -> None:
         # A remote session is NOT in the local tmux name list. Never clear a
         # federated active session or reap local ttyd based on that mismatch.
         if (state.get("active_session") is not None
-                and not state.get("active_remote_id")
+                and not _active_remote_id(state)
                 and state["active_session"] not in name_set):
             stale_ttyd_session = state["active_session"]
             state["active_session"] = None
@@ -350,7 +356,7 @@ async def _run_poll_cycle() -> None:
                 async with state_lock:
                     latest = load_state()
                     still_idle = (latest.get("active_session") is None
-                                  and not latest.get("active_remote_id"))
+                                  and not _active_remote_id(latest))
                 if still_idle:
                     await kill_ttyd()
         except Exception:
@@ -876,10 +882,10 @@ def _viewing_headers(state: dict) -> dict[str, str]:
     key, so a session switch is reflected immediately.
     """
     name = state.get("active_session") or ""
-    remote_id = state.get("active_remote_id") or ""
+    remote_id = _active_remote_id(state)
     return {
         "X-Muxplex-Active-Session": urllib.parse.quote(str(name), safe=""),
-        "X-Muxplex-Active-Remote-Id": urllib.parse.quote(str(remote_id), safe=""),
+        "X-Muxplex-Active-Remote-Id": urllib.parse.quote(remote_id, safe=""),
     }
 
 
@@ -1063,7 +1069,7 @@ async def delete_current_session(
         async with state_lock:
             state = load_state()
             current_name = state.get("active_session")
-            current_rid = state.get("active_remote_id") or ""
+            current_rid = _active_remote_id(state)
             if expected_session is not None and (
                 current_name != expected_session
                 or current_rid != (expected_remote_id or "")
@@ -1495,7 +1501,7 @@ async def terminal_ws_proxy(websocket: WebSocket) -> None:
                     session_name = state.get("active_session")
                     # A remote target must never be auto-spawned as a local
                     # tmux session, even if names happen to match.
-                    if state.get("active_remote_id"):
+                    if _active_remote_id(state):
                         session_name = None
                     known = get_session_list()
                     if session_name and known and session_name not in known:
