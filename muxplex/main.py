@@ -1504,66 +1504,66 @@ async def _ws_auth_check(websocket: WebSocket) -> bool:
     return True
 
 
+async def _reject_stale_terminal_ws(websocket: WebSocket) -> None:
+    """Return an explicit app close code, never attach an incorrect ttyd."""
+    await websocket.accept(subprotocol="tty")
+    await websocket.close(code=4409, reason="Active terminal session changed")
+
+
+def _ws_expected_connection(websocket: WebSocket) -> tuple[str, str]:
+    """Require a session label AND opaque server-issued ttyd connection lease."""
+    return (
+        websocket.query_params.get("expected_session", ""),
+        websocket.query_params.get("connection_id", ""),
+    )
+
+
 @app.websocket("/terminal/ws")
 async def terminal_ws_proxy(websocket: WebSocket) -> None:
-    """Proxy WebSocket frames between the browser and ttyd.
+    """Attach only to the ttyd proven to match the browser's expected session.
 
-    Checks that ttyd is alive BEFORE accepting the browser WebSocket.  If ttyd
-    is not listening (e.g. after a service restart), auto-spawns it using the
-    active_session from state, then waits briefly for it to bind its port.
-
-    Only after ttyd is confirmed reachable does the function call
-    websocket.accept() — so the browser's 'open' event only fires once a real
-    relay is possible.  This prevents the reconnect-counter bounce bug where
-    the proxy accepted immediately (resetting _reconnectAttempts to 0) and
-    then closed as soon as it couldn't reach the dead ttyd.
+    The shared ttyd is replaced by /connect. Keep its transition lock from
+    checking the session/lease until the *upstream ttyd websocket is attached*,
+    not merely until a TCP liveness probe succeeds. A newer /connect can then
+    close the old socket, but can never redirect a labeled session to a new one.
     """
-    # Auth check before accepting — BaseHTTPMiddleware doesn't cover WebSocket scope
     if not await _ws_auth_check(websocket):
         return
 
-    # Ensure ttyd is reachable BEFORE accepting the browser WS.
-    # After a service restart ttyd is dead but clients reconnect immediately.
-    # Auto-spawn from active_session so the browser's 'open' event only fires
-    # when a real relay is possible — eliminates the 0→1→0→1 counter bounce.
-    if not _ttyd_is_listening():
-        try:
-            async with _ttyd_transition_lock:
-                # Re-check under the same mutex as /connect. Otherwise a WS
-                # reconnect can kill ttyd spawned by a concurrent navigation.
-                if not _ttyd_is_listening():
-                    async with state_lock:
-                        state = load_state()
-                    session_name = state.get("active_session")
-                    # A remote target must never be auto-spawned as a local
-                    # tmux session, even if names happen to match.
-                    if _active_remote_id(state):
-                        session_name = None
-                    known = get_session_list()
-                    if session_name and known and session_name not in known:
-                        _log.info(
-                            "WS proxy: refusing to spawn ttyd for vanished session '%s'",
-                            session_name,
-                        )
-                        session_name = None
-                    if session_name:
-                        _log.info(
-                            "WS proxy: ttyd not listening, auto-spawning for '%s'",
-                            session_name,
-                        )
-                        await kill_ttyd()
-                        await spawn_ttyd(session_name)
-                        await asyncio.sleep(0.8)  # wait until ttyd binds its port
-        except Exception as exc:
-            _log.warning("WS proxy: failed to auto-spawn ttyd: %s", exc)
-
-    await websocket.accept(subprotocol="tty")
-
+    expected, lease = _ws_expected_connection(websocket)
     ttyd_url = f"ws://localhost:{TTYD_PORT}/ws"
     try:
-        async with websockets.connect(
-            ttyd_url, subprotocols=[Subprotocol("tty")]
-        ) as ttyd_ws:
+        async with contextlib.AsyncExitStack() as stack:
+            async with _ttyd_transition_lock:
+                async with state_lock:
+                    state = load_state()
+                if (not expected or not lease
+                        or state.get("active_session") != expected
+                        or _active_remote_id(state)
+                        or not hmac.compare_digest(_active_connection_id(state), lease)):
+                    await _reject_stale_terminal_ws(websocket)
+                    return
+
+                # Restart after service failure is permitted only for the
+                # matching active lease. Never auto-spawn a stale browser's
+                # different session, or one that no longer exists in tmux.
+                if not _ttyd_is_listening():
+                    known = get_session_list()
+                    if known and expected not in known:
+                        _log.info("WS proxy: refusing to revive vanished session '%s'", expected)
+                    else:
+                        _log.info("WS proxy: re-spawning ttyd for '%s'", expected)
+                        await kill_ttyd()
+                        await spawn_ttyd(expected)
+                        await asyncio.sleep(0.8)
+
+                # IMPORTANT: websocket.connect and accept are inside the
+                # transition lock; relay happens outside it. AsyncExitStack
+                # keeps the established upstream socket open during the relay.
+                ttyd_ws = await stack.enter_async_context(
+                    websockets.connect(ttyd_url, subprotocols=[Subprotocol("tty")])
+                )
+                await websocket.accept(subprotocol="tty")
 
             async def client_to_ttyd() -> None:
                 try:
@@ -1640,56 +1640,63 @@ def _lookup_remote_by_device_id(device_id: str) -> dict | None:
 
 @app.websocket("/federation/{device_id}/terminal/ws")
 async def federation_terminal_ws_proxy(websocket: WebSocket, device_id: str) -> None:
-    """Proxy WebSocket frames between the browser and a remote muxplex ttyd.
+    """Bind both coordinator and remote ttyd to the expected session/lease.
 
-    *device_id* is the device_id string of the remote instance in
-    settings.  Authenticates to the remote instance using the configured
-    ``key`` field via a Bearer header.
-
-    Auth check uses the same cookie + bearer pattern as terminal_ws_proxy.
-    Closes with code 4004 if device_id does not match any remote.
+    The remote /terminal/ws enforces its own lease under its ttyd transition
+    lock. A coordinator switch cannot silently redirect an existing tab's
+    federated terminal to another remote or another remote session.
     """
-    # Auth check before accepting — same pattern as terminal_ws_proxy
     if not await _ws_auth_check(websocket):
         return
 
-    # Look up remote instance by device_id
+    expected, lease = _ws_expected_connection(websocket)
     remote = _lookup_remote_by_device_id(device_id)
     if remote is None:
         await websocket.close(code=4004)
         return
+
     remote_url: str = remote.get("url", "").rstrip("/")
     remote_key: str = remote.get("key", "")
-
-    # Convert http(s) URL to ws(s)
     if remote_url.startswith("https://"):
         ws_url = "wss://" + remote_url[8:] + "/terminal/ws"
     elif remote_url.startswith("http://"):
         ws_url = "ws://" + remote_url[7:] + "/terminal/ws"
     else:
-        ws_url = remote_url + "/terminal/ws"  # assume already ws:// or wss://
+        ws_url = remote_url + "/terminal/ws"
 
-    # Build an SSL context that skips verification for self-signed certs on
-    # remote instances.  Same rationale as httpx verify=False: federation
-    # peers may use self-signed or Tailscale-issued certs that don't pass the
-    # system CA store.  None tells websockets to use default behaviour (no
-    # TLS) for plain ws:// URLs.
+    # Remote validates the same opaque lease from its own /connect response;
+    # the coordinator alone cannot know if another browser switched the remote.
+    ws_url += "?" + urllib.parse.urlencode(
+        {"expected_session": expected, "connection_id": lease}
+    )
     ssl_context: ssl.SSLContext | None = None
     if ws_url.startswith("wss://"):
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-    await websocket.accept(subprotocol="tty")
-
     auth_headers = {"Authorization": f"Bearer {remote_key}"} if remote_key else {}
     try:
-        async with websockets.connect(
-            ws_url,
-            subprotocols=[Subprotocol("tty")],
-            additional_headers=auth_headers,
-            ssl=ssl_context,
-        ) as remote_ws:
+        async with contextlib.AsyncExitStack() as stack:
+            async with _ttyd_transition_lock:
+                async with state_lock:
+                    state = load_state()
+                if (not expected or not lease
+                        or state.get("active_session") != expected
+                        or _active_remote_id(state) != device_id
+                        or not hmac.compare_digest(_active_connection_id(state), lease)):
+                    await _reject_stale_terminal_ws(websocket)
+                    return
+
+                remote_ws = await stack.enter_async_context(
+                    websockets.connect(
+                        ws_url,
+                        subprotocols=[Subprotocol("tty")],
+                        additional_headers=auth_headers,
+                        ssl=ssl_context,
+                    )
+                )
+                await websocket.accept(subprotocol="tty")
 
             async def client_to_remote() -> None:
                 try:
@@ -1709,6 +1716,14 @@ async def federation_terminal_ws_proxy(websocket: WebSocket, device_id: str) -> 
                             await websocket.send_bytes(message)
                         else:
                             await websocket.send_text(message)
+                except websockets.exceptions.ConnectionClosed as exc:
+                    # A remote instance can switch after coordinator validation.
+                    # Forward its explicit mismatch close, not an ordinary 1000
+                    # that would cause an endless retry loop in the browser.
+                    if exc.code == 4409:
+                        await websocket.close(code=4409, reason="Active remote session changed")
+                    else:
+                        _log.debug("federation ws remote closed: %s", exc)
                 except Exception as exc:
                     _log.debug("federation ws relay closed (remote_to_client): %s", exc)
 
