@@ -4454,6 +4454,32 @@ function _epPillRoots() {
   return roots;
 }
 
+// A poll can reorder/rebuild pill/menu DOM between pointerdown and click.
+// Never turn a press on A into a click on B merely because B now occupies the
+// same pixel. Keyboard-initiated clicks (detail === 0) are unaffected.
+let _epPointerIdentity = null;
+function _epActionIdentity(target) {
+  var el = target && target.closest && target.closest('[data-rename], [data-session], [data-pill-menu], [data-sub-key]');
+  if (!el || !el.dataset) return '';
+  var d = el.dataset;
+  if (d.rename != null) return 'rename\u0000' + (d.remoteId || '') + '\u0000' + (d.session || '');
+  if (d.session != null) return 'session\u0000' + (d.remoteId || '') + '\u0000' + d.session;
+  if (d.pillMenu != null) return 'menu\u0000' + d.pillMenu;
+  if (d.subKey != null) return 'folder\u0000' + d.subKey;
+  return '';
+}
+function _epRecordPointerDown(e) {
+  if (e.button != null && e.button !== 0) return;
+  _epPointerIdentity = _epActionIdentity(e.target);
+}
+function _epClickMatchesPointer(e) {
+  if (e.detail === 0) { _epPointerIdentity = null; return true; }
+  if (_epPointerIdentity === null) return true;
+  var allowed = _epActionIdentity(e.target) === _epPointerIdentity;
+  _epPointerIdentity = null;
+  return allowed;
+}
+
 /** Find an element under `roots` whose `attr` EQUALS `value` — compared, never
  *  interpolated into a CSS selector, so keys built from folder/view names
  *  containing quotes or backslashes are safe. */
@@ -6811,6 +6837,7 @@ function bindStaticEventListeners() {
   // the hosts are static, so listeners attach ONCE here — contract #3). The
   // Other Sessions pill lives in its own host outside the scrolling strip.
   function onPillHostClick(e) {
+    if (!_epClickMatchesPointer(e)) return;
     var menuPill = e.target.closest && e.target.closest('[data-pill-menu]');
     if (menuPill) {
       _epToggleMenu(menuPill);
@@ -6835,6 +6862,7 @@ function bindStaticEventListeners() {
   var expandedPillMenu = $('expanded-pill-menu');
   if (expandedPillMenu) {
     expandedPillMenu.addEventListener('click', function (e) {
+      if (!_epClickMatchesPointer(e)) return;
       var subRow = e.target.closest && e.target.closest('[data-sub-key]');
       if (subRow) {
         _epSubRowClick(subRow.getAttribute('data-sub-key'));
@@ -6848,10 +6876,20 @@ function bindStaticEventListeners() {
   }
   var expandedPillSubmenu = $('expanded-pill-submenu');
   if (expandedPillSubmenu) {
-    expandedPillSubmenu.addEventListener('click', _epHandleMenuSessionClick);
+    expandedPillSubmenu.addEventListener('click', function(e) {
+      if (_epClickMatchesPointer(e)) _epHandleMenuSessionClick(e);
+    });
     // Pointer reached the open submenu — cancel any pending hover switch
     expandedPillSubmenu.addEventListener('pointerover', _epClearSubmenuTimer);
   }
+
+  // Capture the identity at pointer-down on the static hosts. This guards
+  // against a poll-driven DOM replacement/reorder changing the click target.
+  [expandedPills, expandedPillsOther, expandedPillMenu, expandedPillSubmenu].forEach(function(host) {
+    if (!host) return;
+    host.addEventListener('pointerdown', _epRecordPointerDown);
+    host.addEventListener('pointercancel', function() { _epPointerIdentity = null; });
+  });
 
   // Click-outside closes the expanded-header pill dropdown (and submenu).
   // Escape is handled in handleGlobalKeydown, which owns the whole precedence
@@ -7512,6 +7550,9 @@ if (typeof module !== 'undefined' && module.exports) {
     _epSubRowHover,
     _epFindByAttr,
     _epUniqueSessionCount,
+    _epActionIdentity,
+    _epRecordPointerDown,
+    _epClickMatchesPointer,
     _getExpandedPillMenuFor: function () { return _expandedPillMenuFor; },
     _getExpandedPillSubmenuFor: function () { return _expandedPillSubmenuFor; },
     _setViewingRemoteId,
