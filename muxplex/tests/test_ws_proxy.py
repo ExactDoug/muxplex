@@ -814,8 +814,7 @@ def test_federation_forwards_remote_4409_without_retrying_wrong_terminal(monkeyp
             # The remote accepted WS then rejected the lease before sending
             # ttyd output, as its local active session became beta.
             raise ConnectionClosedError(
-                Close(4409, "Active remote session changed"),
-                Close(4409, "Active remote session changed"),
+                Close(4409, "Active remote session changed"), None
             )
             yield  # mark as async generator
 
