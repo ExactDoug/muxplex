@@ -16,6 +16,11 @@ from muxplex.main import app
 @pytest.fixture(autouse=True)
 def patch_startup_and_state(tmp_path, monkeypatch):
     """Redirect state/PID files to tmp_path, mock kill_orphan_ttyd, replace _poll_loop with no-op."""
+    # A new lock per test avoids binding the shared ttyd mutex to the
+    # different event loops used by TestClient and async regression tests.
+    import asyncio
+    monkeypatch.setattr("muxplex.main._ttyd_transition_lock", asyncio.Lock())
+
     # Redirect state files
     tmp_state_dir = tmp_path / "state"
     tmp_state_path = tmp_state_dir / "state.json"
@@ -2428,7 +2433,11 @@ def test_federation_connect_proxies_to_remote(client, monkeypatch, tmp_path):
     # Verify the response is the remote's JSON
     data = response.json()
     assert data["active_session"] == "my-session"
+    assert data["active_remote_id"] == "0"
     assert data["ttyd_port"] == 7682
+    from muxplex.state import load_state
+    state = load_state()
+    assert (state["active_session"], state["active_remote_id"]) == ("my-session", "0")
 
 
 def test_federation_connect_returns_404_for_invalid_remote_id(
@@ -4108,3 +4117,149 @@ def test_rename_session_blank_name_is_422(client, monkeypatch, tmp_path):
     )
     response = client.post("/api/sessions/old/rename", json={"new_name": "   "})
     assert response.status_code == 422
+
+# ---------------------------------------------------------------------------
+# Regression #31: shared ttyd navigation must be serialized and identity-safe.
+# ---------------------------------------------------------------------------
+
+
+async def test_two_concurrent_connects_never_interleave_ttyd_kill_spawn(monkeypatch):
+    """A blocked first spawn cannot let a second /connect kill its new ttyd."""
+    import asyncio
+    import muxplex.main as main_mod
+    from muxplex.state import load_state
+
+    monkeypatch.setattr(main_mod, "get_session_list", lambda: ["alpha", "beta"])
+    events = []
+    first_spawn_started = asyncio.Event()
+    allow_first_spawn = asyncio.Event()
+
+    async def mock_kill():
+        events.append("kill")
+
+    async def mock_spawn(name):
+        events.append(f"spawn:{name}")
+        if name == "alpha":
+            first_spawn_started.set()
+            await allow_first_spawn.wait()
+
+    monkeypatch.setattr(main_mod, "kill_ttyd", mock_kill)
+    monkeypatch.setattr(main_mod, "spawn_ttyd", mock_spawn)
+
+    first = asyncio.create_task(main_mod.connect_session("alpha"))
+    await asyncio.wait_for(first_spawn_started.wait(), timeout=2)
+    second = asyncio.create_task(main_mod.connect_session("beta"))
+    await asyncio.sleep(0)
+    assert events == ["kill", "spawn:alpha"], "second operation must wait for first"
+    allow_first_spawn.set()
+    await asyncio.gather(first, second)
+    assert events == ["kill", "spawn:alpha", "kill", "spawn:beta"]
+    state = load_state()
+    assert state["active_session"] == "beta"
+    assert state["active_remote_id"] is None
+
+
+def test_local_connect_clears_previous_remote_id_atomically(client, monkeypatch):
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "same-name"
+    state["active_remote_id"] = "remote-uuid"
+    save_state(state)
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["same-name"])
+
+    async def mock_kill():
+        return True
+
+    async def mock_spawn(name):
+        assert name == "same-name"
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+    response = client.post("/api/sessions/same-name/connect")
+    assert response.status_code == 200
+    state = load_state()
+    assert (state["active_session"], state["active_remote_id"]) == ("same-name", None)
+
+
+def test_stale_tab_close_skips_current_other_tab_connection(client, monkeypatch):
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "beta"
+    save_state(state)
+    killed = []
+
+    async def mock_kill():
+        killed.append(True)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    response = client.delete(
+        "/api/sessions/current?expected_session=alpha&expected_remote_id="
+    )
+    assert response.status_code == 200
+    assert response.json()["skipped"] is True
+    assert load_state()["active_session"] == "beta"
+    assert killed == [], "stale Back must not kill beta's ttyd"
+
+
+def test_closing_remote_clears_coordinator_pair_without_killing_local_ttyd(client, monkeypatch):
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "remote-chat"
+    state["active_remote_id"] = "fed-b"
+    save_state(state)
+    killed = []
+
+    async def mock_kill():
+        killed.append(True)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    response = client.delete(
+        "/api/sessions/current?expected_session=remote-chat&expected_remote_id=fed-b"
+    )
+    assert response.status_code == 200
+    assert load_state()["active_session"] is None
+    assert load_state()["active_remote_id"] is None
+    assert killed == [], "closing coordinator view must not terminate remote ttyd"
+
+
+async def test_poll_never_clears_a_remote_active_session_using_local_tmux_names(monkeypatch):
+    import muxplex.main as main_mod
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "remote-chat"
+    state["active_remote_id"] = "remote-uuid"
+    save_state(state)
+
+    async def enumerate_local():
+        return ["local-chat"]
+
+    async def snapshot(names):
+        return {"local-chat": "ok"}
+
+    async def paths():
+        return {}
+
+    async def bells(names, state):
+        return None
+
+    monkeypatch.setattr(main_mod, "enumerate_sessions", enumerate_local)
+    monkeypatch.setattr(main_mod, "snapshot_all", snapshot)
+    monkeypatch.setattr(main_mod, "list_session_paths", paths)
+    monkeypatch.setattr(main_mod, "process_bell_flags", bells)
+    monkeypatch.setattr(main_mod, "apply_bell_clear_rule", lambda state: None)
+    monkeypatch.setattr(main_mod, "_federation_client", None)
+    monkeypatch.setattr(main_mod, "_settings_sync_counter", 0)
+
+    async def forbidden_kill():
+        raise AssertionError("remote active session must not be reaped")
+
+    monkeypatch.setattr(main_mod, "kill_ttyd", forbidden_kill)
+    await main_mod._run_poll_cycle()
+    latest = load_state()
+    assert (latest["active_session"], latest["active_remote_id"]) == (
+        "remote-chat", "remote-uuid"
+    )
