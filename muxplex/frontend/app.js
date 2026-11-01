@@ -3899,8 +3899,9 @@ function closeSession(opts = {}) {
   // disconnects when that exact name+remoteId is STILL active. A stale tab
   // cannot kill a newer tab's ttyd. A remote close clears coordinator state
   // without killing the remote machine's ttyd.
+  var disconnectDone = Promise.resolve();
   if (!opts.skipDisconnect && hadSession) {
-    _queueNavigationMutation(navId, function() {
+    disconnectDone = _queueNavigationMutation(navId, function() {
       var connected = _lastCommittedNavigation;
       if (!connected) return null;
       var url = '/api/sessions/current?expected_session=' +
@@ -3932,7 +3933,7 @@ function closeSession(opts = {}) {
   if (pill) pill.classList.add('hidden');
   const fab = $('new-session-fab');
   if (fab) fab.classList.remove('hidden');
-  return Promise.resolve();
+  return disconnectDone;
 }
 
 /** Test-only helper: set _viewingSession directly. */
