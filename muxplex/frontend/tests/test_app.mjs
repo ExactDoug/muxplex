@@ -1226,21 +1226,28 @@ test('openSession is exported', () => {
   assert.strictEqual(typeof app.openSession, 'function');
 });
 
-test('openSession returns a Promise', () => {
+test('openSession returns a Promise', async () => {
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true });
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = () => {};
   globalThis.window._openTerminal = () => {};
 
-  const result = app.openSession('test-session', { skipConnect: true });
-
-  assert.ok(result instanceof Promise, 'openSession should return a Promise');
-  globalThis.document.getElementById = origGetById;
-  globalThis.document.querySelector = origQS;
-  globalThis.setTimeout = origSetTimeout;
+  try {
+    const result = app.openSession('test-session', { skipConnect: true });
+    assert.ok(result instanceof Promise, 'openSession should return a Promise');
+    // Serialize test cleanup with this now-queued navigation operation.
+    await result;
+  } finally {
+    globalThis.fetch = origFetch;
+    globalThis.document.getElementById = origGetById;
+    globalThis.document.querySelector = origQS;
+    globalThis.setTimeout = origSetTimeout;
+  }
 });
 
 test('openSession with skipAnimation calls window._openTerminal after connect POST', async () => {
