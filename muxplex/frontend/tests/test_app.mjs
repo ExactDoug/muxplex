@@ -3885,7 +3885,7 @@ test('openSession gates connect/PATCH writes behind reconcileOnly', () => {
   const fnStart = source.indexOf('async function openSession');
   const fnBody = source.substring(fnStart, source.indexOf('\nfunction closeSession', fnStart));
   assert.ok(/if \(!opts\.reconcileOnly\)/.test(fnBody),
-    'openSession must guard the /connect POST + PATCH /api/state behind !opts.reconcileOnly so a reconcile follows the server without re-spawning the shared ttyd');
+    'openSession must guard /connect behind !opts.reconcileOnly: a reconcile must not re-spawn shared ttyd or mutate server active state');
   // Terminal still mounts in both paths (client-only re-attach for reconcile).
   const openTermIdx = fnBody.indexOf('_openTerminal');
   assert.ok(openTermIdx !== -1, 'openSession must still mount the terminal in the reconcile path');
@@ -4607,7 +4607,7 @@ test('openSession with integer remoteId=0 passes 0 to window._openTerminal as se
   globalThis.setTimeout = origSetTimeout;
 });
 
-test('closeSession after openSession with remoteId=0 does NOT fire DELETE /api/sessions/current', async () => {
+test('closeSession with numeric remoteId=0 issues only a guarded coordinator disconnect', async () => {
   const origFetch = globalThis.fetch;
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
@@ -4633,8 +4633,10 @@ test('closeSession after openSession with remoteId=0 does NOT fire DELETE /api/s
   await app.closeSession();
   await new Promise((r) => setTimeout(r, 0));
 
-  const deleteCall = fetchCalls.find((c) => c.url === '/api/sessions/current' && c.opts && c.opts.method === 'DELETE');
-  assert.ok(!deleteCall, 'closeSession must NOT fire DELETE for remoteId=0 session (it is a remote session)');
+  const deleteCall = fetchCalls.find((c) => c.url.startsWith('/api/sessions/current?') && c.opts && c.opts.method === 'DELETE');
+  assert.ok(deleteCall, 'remote view should clear only the coordinator active pair');
+  assert.match(deleteCall.url, /expected_session=muxplex-updates/);
+  assert.match(deleteCall.url, /expected_remote_id=0/);
 
   globalThis.fetch = origFetch;
   globalThis.document.getElementById = origGetById;
@@ -4958,65 +4960,54 @@ test('renderSheetList item HTML includes data-remote-id attribute for remote ses
   globalThis.document.getElementById = origGetById;
 });
 
-test('openSession PATCHes /api/state with active_remote_id after successful connect', async () => {
-  const fetchCalls = [];
-  const origFetch = globalThis.fetch;
-  const origGetById = globalThis.document.getElementById;
-  const origQS = globalThis.document.querySelector;
-  const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
-  globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
-  globalThis.document.querySelector = () => null;
-  globalThis.setTimeout = (fn) => { fn(); };  // invoke immediately so animation resolves
-  globalThis.window._openTerminal = () => {};
-
-  await app.openSession('remote-session', { remoteId: 'fed-abc123' });
-
-  const patchCall = fetchCalls.find((c) => c.url === '/api/state' && c.opts && c.opts.method === 'PATCH');
-  assert.ok(patchCall, 'openSession should PATCH /api/state after successful connect');
-  const body = JSON.parse(patchCall.opts.body);
-  assert.strictEqual(body.active_remote_id, 'fed-abc123', 'PATCH body should include active_remote_id');
-
-  globalThis.fetch = origFetch;
-  globalThis.document.getElementById = origGetById;
-  globalThis.document.querySelector = origQS;
-  globalThis.setTimeout = origSetTimeout;
+test('remote open does not perform a late /api/state PATCH (server owns the pair)', async () => {
+  const calls = [];
+  const old = { fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout };
+  globalThis.fetch = async (url, opts) => { calls.push({ url, opts }); return { ok: true }; };
+  document.getElementById = () => ({ textContent: '', style: {}, classList: { add() {}, remove() {} } });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = () => {};
+  try {
+    await app.openSession('remote-session', { remoteId: 'fed-abc123' });
+    assert.ok(calls.some(c => c.url === '/api/federation/fed-abc123/connect/remote-session'),
+      'remote /connect now commits session and remote ID atomically');
+    assert.ok(!calls.some(c => c.url === '/api/state' && c.opts?.method === 'PATCH'),
+      'a stale PATCH used to overwrite another tab’s later navigation');
+  } finally {
+    app.closeSession({ skipDisconnect: true });
+    globalThis.fetch = old.fetch;
+    document.getElementById = old.get;
+    document.querySelector = old.qs;
+    globalThis.setTimeout = old.timer;
+  }
 });
 
-test('closeSession PATCHes /api/state to clear active_remote_id', async () => {
-  const origFetch = globalThis.fetch;
-  const origGetById = globalThis.document.getElementById;
-  const origQS = globalThis.document.querySelector;
-  const origSetTimeout = globalThis.setTimeout;
-
-  // Open a remote session first so _viewingRemoteId is set
-  globalThis.fetch = async () => ({ ok: true });
-  globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
-  globalThis.document.querySelector = () => null;
-  globalThis.setTimeout = (fn) => { fn(); };
-  globalThis.window._openTerminal = () => {};
-  globalThis.window._closeTerminal = () => {};
-
-  await app.openSession('remote-sess', { remoteId: 'fed-abc123' });
-
-  globalThis.setTimeout = origSetTimeout;
-
-  // Reset fetch tracking
-  const fetchCalls = [];
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
-
-  await app.closeSession();
-  await new Promise((r) => setTimeout(r, 0));
-
-  const patchCall = fetchCalls.find((c) => c.url === '/api/state' && c.opts && c.opts.method === 'PATCH');
-  assert.ok(patchCall, 'closeSession should PATCH /api/state to clear remote session state');
-  const body = JSON.parse(patchCall.opts.body);
-  assert.strictEqual(body.active_remote_id, null, 'PATCH should clear active_remote_id to null');
-
-  globalThis.fetch = origFetch;
-  globalThis.document.getElementById = origGetById;
-  globalThis.document.querySelector = origQS;
-  globalThis.setTimeout = origSetTimeout;
+test('a remote close uses expected pair instead of unconditional active-state PATCH', async () => {
+  const calls = [];
+  const old = { fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout };
+  globalThis.fetch = async (url, opts) => { calls.push({ url, opts }); return { ok: true }; };
+  document.getElementById = () => ({ textContent: '', style: {}, classList: { add() {}, remove() {} } });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = () => {};
+  window._closeTerminal = () => {};
+  try {
+    await app.openSession('remote-sess', { remoteId: 'fed-abc123' });
+    await app.closeSession();
+    await Promise.resolve();
+    const del = calls.find(c => c.opts?.method === 'DELETE');
+    assert.ok(del && del.url.includes('expected_session=remote-sess') &&
+      del.url.includes('expected_remote_id=fed-abc123'));
+    assert.ok(!calls.some(c => c.url === '/api/state' && c.opts?.method === 'PATCH'));
+  } finally {
+    globalThis.fetch = old.fetch;
+    document.getElementById = old.get;
+    document.querySelector = old.qs;
+    globalThis.setTimeout = old.timer;
+  }
 });
 
 // ─── Task 2: Replace localStorage storage layer with server-settings-cache ───
