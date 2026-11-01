@@ -8448,3 +8448,76 @@ test('header press identity blocks a click retargeted by poll-driven pill/menu r
   assert.equal(app._epClickMatchesPointer({ detail: 0, target: b }), true,
     'keyboard-triggered clicks must remain usable');
 });
+
+test('initial openSession forwards exactly the server-issued connection lease to terminal', async () => {
+  const previous = {
+    fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout,
+    open: window._openTerminal, close: window._closeTerminal
+  };
+  const mounted = [];
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    calls.push(url);
+    return {
+      ok: true,
+      json: async () => ({ connection_id: 'server-lease-of-alpha' })
+    };
+  };
+  document.getElementById = () => ({
+    style: {}, textContent: '',
+    classList: { add() {}, remove() {} },
+  });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = (...args) => mounted.push(args);
+  window._closeTerminal = () => {};
+  try {
+    await app.openSession('alpha', { skipAnimation: true });
+    assert.ok(calls.includes('/api/sessions/alpha/connect'));
+    assert.equal(mounted.length, 1);
+    assert.equal(mounted[0][0], 'alpha');
+    assert.equal(mounted[0][1], '');
+    assert.equal(mounted[0][3], 'server-lease-of-alpha',
+      'socket must carry the exact /connect response lease');
+  } finally {
+    await app.closeSession({ skipDisconnect: true });
+    globalThis.fetch = previous.fetch;
+    document.getElementById = previous.get;
+    document.querySelector = previous.qs;
+    globalThis.setTimeout = previous.timer;
+    window._openTerminal = previous.open;
+    window._closeTerminal = previous.close;
+  }
+});
+
+test('openSession refuses to mount when a legacy server omits connection_id', async () => {
+  const previous = {
+    fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout,
+    open: window._openTerminal, close: window._closeTerminal
+  };
+  let mounted = 0;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+  document.getElementById = () => ({
+    style: {}, textContent: '',
+    classList: { add() {}, remove() {} },
+  });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = () => mounted++;
+  window._closeTerminal = () => {};
+  try {
+    await app.openSession('legacy-peer', { skipAnimation: true });
+    assert.equal(mounted, 0, 'unbound WebSocket is unsafe');
+    assert.equal(app._getViewingSession(), null);
+  } finally {
+    await app.closeSession({ skipDisconnect: true });
+    globalThis.fetch = previous.fetch;
+    document.getElementById = previous.get;
+    document.querySelector = previous.qs;
+    globalThis.setTimeout = previous.timer;
+    window._openTerminal = previous.open;
+    window._closeTerminal = previous.close;
+  }
+});
