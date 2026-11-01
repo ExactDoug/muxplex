@@ -8297,3 +8297,147 @@ test('an open menu survives a re-render that REORDERS folders (name keys, not in
     unstub();
   }
 });
+
+// ─── Regression #31: stale navigation and header pointer identity ───────────
+async function withNavigationHarness(run) {
+  const old = { fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout,
+    open: window._openTerminal, close: window._closeTerminal };
+  const pending = new Map();
+  const requests = [];
+  const terminals = [];
+  globalThis.fetch = (url, opts = {}) => {
+    requests.push({ url, opts });
+    if (opts.method === 'POST' && url.includes('/connect')) {
+      return new Promise((resolve, reject) => { pending.set(url, { resolve, reject }); });
+    }
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  document.getElementById = () => ({
+    textContent: '', style: {},
+    classList: { add() {}, remove() {} },
+  });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = (name, rid) => terminals.push([name, rid]);
+  window._closeTerminal = () => {};
+  async function waitFor(url) {
+    for (let i = 0; i < 20 && !pending.has(url); i++) await Promise.resolve();
+    assert.ok(pending.has(url), 'expected request ' + url);
+    return pending.get(url);
+  }
+  try {
+    await run({ pending, requests, terminals, waitFor });
+  } finally {
+    // Cancel stray UI work without issuing any new server mutation.
+    app.closeSession({ skipDisconnect: true });
+    app._setLastLocalOpenAt(0);
+    globalThis.fetch = old.fetch;
+    document.getElementById = old.get;
+    document.querySelector = old.qs;
+    globalThis.setTimeout = old.timer;
+    window._openTerminal = old.open;
+    window._closeTerminal = old.close;
+  }
+}
+
+test('rapid A then B switch waits for A server operation, and only mounts B', async () => {
+  await withNavigationHarness(async ({ requests, terminals, waitFor }) => {
+    const a = app.openSession('alpha', { skipAnimation: true });
+    const first = await waitFor('/api/sessions/alpha/connect');
+    const b = app.openSession('beta', { skipAnimation: true });
+    assert.deepEqual(requests.filter(x => x.url.includes('/connect')).map(x => x.url),
+      ['/api/sessions/alpha/connect'], 'B must be serialized behind in-flight A');
+    first.resolve({ ok: true });
+    await a;
+    const second = await waitFor('/api/sessions/beta/connect');
+    second.resolve({ ok: true });
+    await b;
+    assert.deepEqual(terminals, [['beta', '']], 'stale A continuation must not mount');
+    assert.equal(app._getViewingSession(), 'beta');
+  });
+});
+
+test('rapid A, B, C drops B before it sends a /connect POST', async () => {
+  await withNavigationHarness(async ({ requests, terminals, waitFor }) => {
+    const a = app.openSession('alpha', { skipAnimation: true });
+    const first = await waitFor('/api/sessions/alpha/connect');
+    const b = app.openSession('beta', { skipAnimation: true });
+    const c = app.openSession('charlie', { skipAnimation: true });
+    first.resolve({ ok: true });
+    await a;
+    await b;
+    const last = await waitFor('/api/sessions/charlie/connect');
+    last.resolve({ ok: true });
+    await c;
+    assert.deepEqual(requests.filter(x => x.url.includes('/connect')).map(x => x.url),
+      ['/api/sessions/alpha/connect', '/api/sessions/charlie/connect']);
+    assert.deepEqual(terminals, [['charlie', '']]);
+  });
+});
+
+test('an older failed /connect does not close a newer successful chat', async () => {
+  await withNavigationHarness(async ({ terminals, waitFor }) => {
+    const a = app.openSession('alpha', { skipAnimation: true });
+    const first = await waitFor('/api/sessions/alpha/connect');
+    const b = app.openSession('beta', { skipAnimation: true });
+    first.reject(new Error('stale failed connect'));
+    await a;
+    const second = await waitFor('/api/sessions/beta/connect');
+    second.resolve({ ok: true });
+    await b;
+    assert.equal(app._getViewingSession(), 'beta');
+    assert.deepEqual(terminals, [['beta', '']]);
+  });
+});
+
+test('a delayed local /connect cannot be overwritten by old poll reconciliation', async () => {
+  await withNavigationHarness(async ({ waitFor }) => {
+    const open = app.openSession('slow', { skipAnimation: true });
+    const slow = await waitFor('/api/sessions/slow/connect');
+    app._setLastLocalOpenAt(0); // simulate a request taking longer than 3s
+    await app.reconcileViewingSession({ name: 'old-session', remoteId: '' });
+    assert.equal(app._getViewingSession(), 'slow',
+      'pending navigation must win over old shared active-session hints');
+    slow.resolve({ ok: true });
+    await open;
+  });
+});
+
+test('same-named federated sessions preserve device ID through serialized navigation', async () => {
+  await withNavigationHarness(async ({ terminals, waitFor }) => {
+    const a = app.openSession('shared', { remoteId: 'device-a', skipAnimation: true });
+    const first = await waitFor('/api/federation/device-a/connect/shared');
+    const b = app.openSession('shared', { remoteId: 'device-b', skipAnimation: true });
+    first.resolve({ ok: true });
+    await a;
+    const second = await waitFor('/api/federation/device-b/connect/shared');
+    second.resolve({ ok: true });
+    await b;
+    assert.deepEqual(terminals, [['shared', 'device-b']]);
+  });
+});
+
+test('header press identity blocks a click retargeted by poll-driven pill/menu reorder', () => {
+  const el = (data) => {
+    const node = { dataset: data };
+    node.closest = () => node;
+    return node;
+  };
+  const a = el({ session: 'alpha', remoteId: 'device-a' });
+  const b = el({ session: 'beta', remoteId: 'device-a' });
+  const anotherDevice = el({ session: 'alpha', remoteId: 'device-b' });
+  app._epRecordPointerDown({ button: 0, target: a });
+  assert.equal(app._epClickMatchesPointer({ detail: 1, target: b }), false);
+  app._epRecordPointerDown({ button: 0, target: a });
+  assert.equal(app._epClickMatchesPointer({ detail: 1, target: anotherDevice }), false);
+  app._epRecordPointerDown({ button: 0, target: a });
+  assert.equal(app._epClickMatchesPointer({ detail: 1, target: a }), true);
+  app._epRecordPointerDown({ button: 0, target: el({ pillMenu: 'c:f:old' }) });
+  assert.equal(app._epClickMatchesPointer({
+    detail: 1, target: el({ pillMenu: 'c:f:new' }),
+  }), false);
+  app._epRecordPointerDown({ button: 0, target: a });
+  assert.equal(app._epClickMatchesPointer({ detail: 0, target: b }), true,
+    'keyboard-triggered clicks must remain usable');
+});
