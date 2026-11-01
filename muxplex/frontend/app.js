@@ -3885,6 +3885,7 @@ async function openSession(name, opts = {}) {
  * @returns {Promise<void>}
  */
 function closeSession(opts = {}) {
+  const hadSession = _viewingSession != null;
   const navId = ++_navigationSeq;
   _pendingNavigationId = 0;
   _viewMode = 'grid';
@@ -3898,7 +3899,7 @@ function closeSession(opts = {}) {
   // disconnects when that exact name+remoteId is STILL active. A stale tab
   // cannot kill a newer tab's ttyd. A remote close clears coordinator state
   // without killing the remote machine's ttyd.
-  if (!opts.skipDisconnect) {
+  if (!opts.skipDisconnect && hadSession) {
     _queueNavigationMutation(navId, function() {
       var connected = _lastCommittedNavigation;
       if (!connected) return null;
