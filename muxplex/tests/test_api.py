@@ -4287,6 +4287,7 @@ def test_stale_local_reconnect_returns_409_without_killing_ttyd(client, monkeypa
 
     state = empty_state()
     state["active_session"] = "newer-chat"
+    state["active_connection_id"] = "newer-lease"
     save_state(state)
     calls = []
 
@@ -4301,7 +4302,7 @@ def test_stale_local_reconnect_returns_409_without_killing_ttyd(client, monkeypa
     monkeypatch.setattr(
         "muxplex.main.get_session_list", lambda: ["old-chat", "newer-chat"]
     )
-    response = client.post("/api/sessions/old-chat/connect?reconnect=true")
+    response = client.post("/api/sessions/old-chat/connect?reconnect=true&connection_id=old-lease")
     assert response.status_code == 409
     assert calls == []
     assert load_state()["active_session"] == "newer-chat"
@@ -4312,6 +4313,7 @@ def test_reconnect_of_current_local_chat_remains_allowed(client, monkeypatch):
 
     state = empty_state()
     state["active_session"] = "current-chat"
+    state["active_connection_id"] = "current-lease"
     save_state(state)
     calls = []
 
@@ -4326,10 +4328,12 @@ def test_reconnect_of_current_local_chat_remains_allowed(client, monkeypatch):
     monkeypatch.setattr(
         "muxplex.main.get_session_list", lambda: ["current-chat"]
     )
-    response = client.post("/api/sessions/current-chat/connect?reconnect=true")
+    response = client.post("/api/sessions/current-chat/connect?reconnect=true&connection_id=current-lease")
     assert response.status_code == 200
+    assert response.json()["connection_id"] == "current-lease"
     assert calls == ["kill", "spawn:current-chat"]
     assert load_state()["active_session"] == "current-chat"
+    assert load_state()["active_connection_id"] == "current-lease"
 
 
 def test_stale_federation_reconnect_returns_409_without_remote_POST(
@@ -4348,6 +4352,7 @@ def test_stale_federation_reconnect_returns_409_without_remote_POST(
     state = empty_state()
     state["active_session"] = "other-chat"
     state["active_remote_id"] = "dev-a"
+    state["active_connection_id"] = "other-lease"
     save_state(state)
     posts = []
 
@@ -4356,7 +4361,7 @@ def test_stale_federation_reconnect_returns_409_without_remote_POST(
         raise AssertionError("must not contact remote for stale reconnect")
 
     monkeypatch.setattr(client.app.state.federation_client, "post", mock_post)
-    response = client.post("/api/federation/dev-a/connect/old-chat?reconnect=true")
+    response = client.post("/api/federation/dev-a/connect/old-chat?reconnect=true&connection_id=old-lease")
     assert response.status_code == 409
     assert posts == []
     assert load_state()["active_session"] == "other-chat"
@@ -4377,6 +4382,7 @@ def test_remote_reconnect_for_active_pair_forwards_guard(client, monkeypatch, tm
     state = empty_state()
     state["active_session"] = "active-chat"
     state["active_remote_id"] = "dev-a"
+    state["active_connection_id"] = "existing-remote-lease"
     save_state(state)
     posts = []
 
@@ -4388,9 +4394,10 @@ def test_remote_reconnect_for_active_pair_forwards_guard(client, monkeypatch, tm
         return resp
 
     monkeypatch.setattr(client.app.state.federation_client, "post", mock_post)
-    response = client.post("/api/federation/dev-a/connect/active-chat?reconnect=true")
+    response = client.post("/api/federation/dev-a/connect/active-chat?reconnect=true&connection_id=existing-remote-lease")
     assert response.status_code == 200
-    assert posts == ["http://remote:8088/api/sessions/active-chat/connect?reconnect=true"]
+    assert response.json()["connection_id"] == "existing-remote-lease"
+    assert posts == ["http://remote:8088/api/sessions/active-chat/connect?reconnect=true&connection_id=existing-remote-lease"]
 
 def test_upstream_reconnect_409_remains_409_at_coordinator(client, monkeypatch, tmp_path):
     """An actual httpx 409 from a remote must not be converted to 502."""
@@ -4421,9 +4428,9 @@ def test_upstream_reconnect_409_remains_409_at_coordinator(client, monkeypatch, 
         )
 
     monkeypatch.setattr(client.app.state.federation_client, "post", reject_post)
-    response = client.post("/api/federation/node-b/connect/alpha?reconnect=true")
+    response = client.post("/api/federation/node-b/connect/alpha?reconnect=true&connection_id=original-remote-lease")
     assert response.status_code == 409, response.text
-    assert calls == ["http://node-b:8088/api/sessions/alpha/connect?reconnect=true"]
+    assert calls == ["http://node-b:8088/api/sessions/alpha/connect?reconnect=true&connection_id=original-remote-lease"]
     latest = load_state()
     assert (latest["active_session"], latest["active_remote_id"],
             latest["active_connection_id"]) == (
