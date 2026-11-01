@@ -1494,98 +1494,71 @@ test('closeSession calls window._closeTerminal', async () => {
   globalThis.fetch = undefined;
 });
 
-test('closeSession fires DELETE /api/sessions/current', async () => {
-  const fetchCalls = [];
-  const origFetch = globalThis.fetch;
-  const origGetById = globalThis.document.getElementById;
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
-  globalThis.document.getElementById = () => ({ style: {}, classList: { add: () => {}, remove: () => {} } });
-  globalThis.window._closeTerminal = () => {};
-
-  await app.closeSession();
-  // yield microtask queue for fire-and-forget DELETE
-  await new Promise((r) => setTimeout(r, 0));
-
-  const deleteCall = fetchCalls.find((c) => c.url === '/api/sessions/current' && c.opts && c.opts.method === 'DELETE');
-  assert.ok(deleteCall, 'should fire DELETE /api/sessions/current');
-  globalThis.fetch = origFetch;
-  globalThis.document.getElementById = origGetById;
+test('closeSession only disconnects the exact previously committed local identity', async () => {
+  const original = { fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout };
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    calls.push({ url, opts });
+    return { ok: true, json: async () => ({}) };
+  };
+  document.getElementById = () => ({
+    textContent: '', style: {},
+    classList: { add() {}, remove() {} },
+  });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = () => {};
+  window._closeTerminal = () => {};
+  try {
+    await app.openSession('local-a', { skipAnimation: true });
+    await app.closeSession();
+    await Promise.resolve();
+    const deletion = calls.find((x) => x.opts?.method === 'DELETE');
+    assert.ok(deletion, 'Back should clear this tab’s committed local session');
+    assert.match(deletion.url, /expected_session=local-a/);
+    assert.match(deletion.url, /expected_remote_id=$/);
+    assert.equal(calls.some(x => x.opts?.method === 'PATCH' && x.url === '/api/state'), false,
+      'do not issue a late unconditional PATCH that can clobber a newer tab');
+  } finally {
+    globalThis.fetch = original.fetch;
+    document.getElementById = original.get;
+    document.querySelector = original.qs;
+    globalThis.setTimeout = original.timer;
+  }
 });
 
-test('closeSession does NOT fire DELETE for remote session (non-empty _viewingRemoteId)', async () => {
-  const origFetch = globalThis.fetch;
-  const origGetById = globalThis.document.getElementById;
-  const origQS = globalThis.document.querySelector;
-  const origSetTimeout = globalThis.setTimeout;
-
-  // Setup to call openSession with remote remoteId
-  globalThis.fetch = async () => ({ ok: true });
-  globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
-  globalThis.document.querySelector = () => null;
-  globalThis.setTimeout = () => {};
-  globalThis.window._openTerminal = () => {};
-  globalThis.window._closeTerminal = () => {};
-
-  // Open a remote session - this sets _viewingRemoteId = 'fed-abc123'
-  await app.openSession('remote-sess', { remoteId: 'fed-abc123' });
-
-  // Restore setTimeout so Promise-based yielding works
-  globalThis.setTimeout = origSetTimeout;
-
-  // Reset fetch tracking
-  const fetchCalls = [];
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
-
-  // Close session
-  await app.closeSession();
-  // yield microtask queue for any fire-and-forget calls
-  await new Promise((r) => setTimeout(r, 0));
-
-  const deleteCall = fetchCalls.find((c) => c.url === '/api/sessions/current' && c.opts && c.opts.method === 'DELETE');
-  assert.ok(!deleteCall, 'closeSession should NOT fire DELETE for remote session');
-
-  globalThis.fetch = origFetch;
-  globalThis.document.getElementById = origGetById;
-  globalThis.document.querySelector = origQS;
-  globalThis.setTimeout = origSetTimeout;
-});
-
-test('closeSession still fires DELETE /api/sessions/current for local session', async () => {
-  const origFetch = globalThis.fetch;
-  const origGetById = globalThis.document.getElementById;
-  const origQS = globalThis.document.querySelector;
-  const origSetTimeout = globalThis.setTimeout;
-
-  // Setup to call openSession for a local session (no remoteId)
-  globalThis.fetch = async () => ({ ok: true });
-  globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
-  globalThis.document.querySelector = () => null;
-  globalThis.setTimeout = () => {};
-  globalThis.window._openTerminal = () => {};
-  globalThis.window._closeTerminal = () => {};
-
-  // Open a local session - this sets _viewingRemoteId = ''
-  await app.openSession('local-sess', {});
-
-  // Restore setTimeout so Promise-based yielding works
-  globalThis.setTimeout = origSetTimeout;
-
-  // Reset fetch tracking
-  const fetchCalls = [];
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
-
-  // Close session
-  await app.closeSession();
-  // yield microtask queue for fire-and-forget DELETE
-  await new Promise((r) => setTimeout(r, 0));
-
-  const deleteCall = fetchCalls.find((c) => c.url === '/api/sessions/current' && c.opts && c.opts.method === 'DELETE');
-  assert.ok(deleteCall, 'closeSession should fire DELETE /api/sessions/current for local session');
-
-  globalThis.fetch = origFetch;
-  globalThis.document.getElementById = origGetById;
-  globalThis.document.querySelector = origQS;
-  globalThis.setTimeout = origSetTimeout;
+test('closeSession sends guarded coordinator cleanup for a remote view', async () => {
+  const original = { fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout };
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    calls.push({ url, opts });
+    return { ok: true, json: async () => ({}) };
+  };
+  document.getElementById = () => ({
+    textContent: '', style: {},
+    classList: { add() {}, remove() {} },
+  });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = () => {};
+  window._closeTerminal = () => {};
+  try {
+    await app.openSession('remote-a', { remoteId: 'fed-abc123', skipAnimation: true });
+    await app.closeSession();
+    await Promise.resolve();
+    const deletion = calls.find((x) => x.opts?.method === 'DELETE');
+    assert.ok(deletion, 'coordinator should clear its remote active pair');
+    assert.match(deletion.url, /expected_session=remote-a/);
+    assert.match(deletion.url, /expected_remote_id=fed-abc123/);
+    assert.ok(!calls.some(x => x.url === '/api/state' && x.opts?.method === 'PATCH'));
+  } finally {
+    globalThis.fetch = original.fetch;
+    document.getElementById = original.get;
+    document.querySelector = original.qs;
+    globalThis.setTimeout = original.timer;
+  }
 });
 
 // ─── Command Palette ─────────────────────────────────────────────────────────
@@ -2220,25 +2193,21 @@ test('openSession mounts terminal AFTER connect POST, not inside animation timer
     new URL('../app.js', import.meta.url), 'utf8'
   );
 
-  // Find the openSession function body
-  // Window widened 4000→4800 when reconcileOnly gating grew the function body
-  // (terminal mount stays last, just further from fnStart). Stays < closeSession.
+  // Scope to the actual function rather than a brittle character window.
   const fnStart = source.indexOf('async function openSession');
-  const fnBody = source.substring(fnStart, fnStart + 4800);
+  const fnBody = source.substring(fnStart, source.indexOf('\nfunction closeSession', fnStart));
 
-  // _openTerminal must NOT appear inside setTimeout
-  const setTimeoutIdx = fnBody.indexOf('setTimeout');
-  const setTimeoutEnd = fnBody.indexOf('}, 260)', setTimeoutIdx);
+  // _openTerminal must NOT appear inside the animation callback.
+  const setTimeoutIdx = fnBody.indexOf('setTimeout(function()');
+  const setTimeoutEnd = fnBody.indexOf('}, opts.skipAnimation', setTimeoutIdx);
   const setTimeoutBody = fnBody.substring(setTimeoutIdx, setTimeoutEnd);
-
   assert.ok(!setTimeoutBody.includes('_openTerminal'),
-    '_openTerminal must NOT be inside the 260ms setTimeout — causes race condition with /connect POST');
+    'animation callback must not mount the terminal');
 
-  // _openTerminal must appear AFTER the /connect POST
   const connectIdx = fnBody.indexOf('/api/sessions/');
-  const openTermIdx = fnBody.indexOf('_openTerminal', connectIdx);
-  assert.ok(openTermIdx > connectIdx,
-    '_openTerminal must appear AFTER the /connect POST in the source');
+  const openTermIdx = fnBody.lastIndexOf('_openTerminal');
+  assert.ok(connectIdx >= 0 && openTermIdx > connectIdx,
+    '_openTerminal must appear AFTER the serialized /connect POST');
 });
 
 // --- Zoom-open animation selector (regression: nav-pill viewport hijack, v0.8.2) ---
@@ -3907,7 +3876,7 @@ test('showPreview suppresses the overlay for the already-displayed session', () 
 test('openSession gates connect/PATCH writes behind reconcileOnly', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const fnStart = source.indexOf('async function openSession');
-  const fnBody = source.substring(fnStart, fnStart + 4800);
+  const fnBody = source.substring(fnStart, source.indexOf('\nfunction closeSession', fnStart));
   assert.ok(/if \(!opts\.reconcileOnly\)/.test(fnBody),
     'openSession must guard the /connect POST + PATCH /api/state behind !opts.reconcileOnly so a reconcile follows the server without re-spawning the shared ttyd');
   // Terminal still mounts in both paths (client-only re-attach for reconcile).
