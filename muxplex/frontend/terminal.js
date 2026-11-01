@@ -7,6 +7,7 @@ let _fitAddon = null;
 let _ws = null;
 let _reconnectTimer = null;
 let _currentSession = null;
+let _terminalGeneration = 0;  // invalidates old reconnect timers and fetch continuations
 let _vpHandler = null;
 let _fitFrame = null;   // pending handle for the single terminal-geometry owner
 let _fitCancel = null;  // canceller matching whatever scheduler produced _fitFrame
@@ -51,6 +52,7 @@ function endTerminalSession(message) {
     _reconnectTimer = null;
   }
   _currentSession = null;
+  _terminalGeneration++;  // pending reconnects from this terminal must not resurrect it
   _reconnectAttempts = 0;
   if (_ws) {
     try { _ws.close(); } catch (_) {}
@@ -266,6 +268,13 @@ function _diagOn() {
 // ─── Forward declarations ─────────────────────────────────────────────────────
 
 function connectWebSocket(name, remoteId) {
+  // Every reconnect closure must belong to the terminal that created it.
+  // _currentSession alone is insufficient: after a switch to B it is again
+  // non-empty, so A's delayed reconnect could otherwise attach to B or A.
+  const generation = _terminalGeneration;
+  function isCurrentTerminal() {
+    return generation === _terminalGeneration && _currentSession === name;
+  }
   // Always connect to the same origin — remote sessions route through the
   // federation proxy (ws://host/federation/{remoteId}/terminal/ws) so that
   // no cross-origin WebSocket connections are made from the browser.
@@ -315,6 +324,7 @@ function connectWebSocket(name, remoteId) {
   // session switches cause old handlers to fire on the new _ws while it is still
   // CONNECTING → send error → close → reconnect → infinite loop (Bug 2).
   function _connectWebSocket() {
+    if (!isCurrentTerminal()) return;
     // 'tty' subprotocol is REQUIRED — without it ttyd never starts the PTY.
     // Confirmed via raw Python WebSocket tests: ttyd accepts the TCP upgrade but
     // sits completely silent (no child process spawned) when subprotocol is omitted.
@@ -323,7 +333,7 @@ function connectWebSocket(name, remoteId) {
     ws.binaryType = 'arraybuffer';
 
     ws.addEventListener('open', function() {
-      if (ws !== _ws) return; // stale connection — superseded by a newer one, ignore
+      if (ws !== _ws || !isCurrentTerminal()) return; // stale socket/session
       // Stamp when this connection opened. The close handler uses it to decide
       // whether the connection LIVED long enough to count as healthy — see the
       // HEALTHY_CONNECTION_MS discussion there. Do NOT reset _reconnectAttempts
@@ -342,7 +352,7 @@ function connectWebSocket(name, remoteId) {
     });
 
     ws.addEventListener('message', function(e) {
-      if (ws !== _ws) return; // stale connection — superseded by a newer one, ignore
+      if (ws !== _ws || !isCurrentTerminal()) return; // stale socket/session
       if (!_term) return;
       // NOTE: _reconnectAttempts is deliberately NOT reset here.
       //
@@ -376,8 +386,7 @@ function connectWebSocket(name, remoteId) {
     });
 
     ws.addEventListener('close', function() {
-      if (ws !== _ws) return; // stale connection — don't reconnect for old sockets
-      if (!_currentSession) return; // intentional close — don't reconnect
+      if (ws !== _ws || !isCurrentTerminal()) return; // ignore stale socket/session
       if (reconnectOverlay) reconnectOverlay.classList.remove('hidden');
       // Health check: did this connection LIVE, or did it die on arrival?
       //
@@ -408,80 +417,60 @@ function connectWebSocket(name, remoteId) {
     });
 
     ws.addEventListener('error', function() {
-      if (ws !== _ws) return; // stale connection — ignore
+      if (ws !== _ws || !isCurrentTerminal()) return;
       console.warn('tmux-web: WebSocket error on', url);
     });
   }
 
-  // Schedule the post-/connect settle that gives ttyd time to bind its port.
-  //
-  // Guarded on _currentSession because this runs from a fetch continuation that
-  // may resolve AFTER the terminal was ended (by the retry cap, by the user
-  // navigating away, or by a session switch). Without the guard the
-  // continuation resurrects the loop we just stopped and clobbers the
-  // _reconnectTimer = null that endTerminalSession set. Nulling
-  // _currentSession only halts reconnects if every path actually READS it —
-  // this one did not.
+  // A delayed or in-flight reconnect belongs to exactly this instance.
+  // The backend also checks the server's active pair before mutating ttyd,
+  // since aborting an HTTP fetch would NOT undo a sent POST.
   function _scheduleSettle() {
-    if (!_currentSession) return;
+    if (!isCurrentTerminal()) return;
     _reconnectTimer = setTimeout(function() {
-      if (!_currentSession) return; // ended while the settle timer was pending
+      if (!isCurrentTerminal()) return;
       _connectWebSocket();
     }, 800);
   }
 
   function connect() {
-    if (!_currentSession) return; // terminal was ended — never reconnect
-    // After 2 failed WS attempts, ttyd is likely dead (e.g. after service restart).
-    // AWAIT the /connect POST before opening the WebSocket — ttyd must be alive first.
-    // fetch() includes cookies automatically for same-origin requests so auth is transparent.
-    //
-    // Critical: this path uses .then() so _connectWebSocket() runs only AFTER the POST
-    // response (plus an 800ms settle delay for ttyd to bind its port). The early return
-    // prevents falling through to the direct _connectWebSocket() call below.
-    if (_reconnectAttempts >= 2 && _currentSession) {
+    if (!isCurrentTerminal()) return;
+    if (_reconnectAttempts >= 2) {
       var connectPath;
       if (remoteId) {
-        // Remote session: route through federation proxy
-        connectPath = '/api/federation/' + encodeURIComponent(remoteId) + '/connect/' + encodeURIComponent(_currentSession);
+        connectPath = '/api/federation/' + encodeURIComponent(remoteId) +
+          '/connect/' + encodeURIComponent(name) + '?reconnect=true';
       } else {
-        // Local session
-        connectPath = '/api/sessions/' + encodeURIComponent(_currentSession) + '/connect';
+        connectPath = '/api/sessions/' + encodeURIComponent(name) + '/connect?reconnect=true';
       }
       fetch(connectPath, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       })
-        // NOTE: the .catch() MUST come after the .then() below. It previously
-        // came first, which meant the success path ran unconditionally and the
-        // response was never inspected at all — a 404 ("session not found")
-        // looked exactly like a success and we respawned the WebSocket anyway,
-        // forever. fetch() only rejects on network failure; an HTTP 404 is a
-        // perfectly RESOLVED promise, so swallowing rejections was never the
-        // thing hiding the error — ignoring res.ok was.
         .then(function(res) {
+          if (!isCurrentTerminal()) return null;
+          // CAS rejected: some other tab has switched the shared ttyd. Do
+          // not hijack it again with a retry.
+          if (res && res.status === 409) {
+            endTerminalSession('Session switched in another tab.');
+            return null;
+          }
           return _connectSaysSessionGone(res, remoteId).then(function(gone) {
+            if (!isCurrentTerminal()) return null;
             if (gone) {
-              // The tmux session no longer exists (its process exited, so
-              // tmux's `exit-empty on` destroyed it). Every future attempt
-              // would spawn a `tmux attach` that dies instantly. Stop; explain.
               endTerminalSession('Session ended.');
-              return null;
+            } else {
+              _scheduleSettle();
             }
-            // Brief delay for ttyd to bind its port after /connect spawns it
-            _scheduleSettle();
             return null;
           });
         })
         .catch(function() {
-          // Network-level failure (server down, offline). Not proof the session
-          // died — retry via the normal path; the attempt cap bounds it.
-          _scheduleSettle();
+          if (isCurrentTerminal()) _scheduleSettle();
           return null;
         });
-      return; // Don't fall through — .then() handles the WebSocket creation
+      return;
     }
-
     _connectWebSocket();
   }
 
@@ -767,6 +756,7 @@ function _searchPrev() {
  *   ws://host/federation/{remoteId}/terminal/ws (same origin, no cross-origin).
  */
 function openTerminal(sessionName, remoteId, fontSize) {
+  _terminalGeneration++;
   // Null _currentSession first so any in-flight close handler on the old WS won't
   // schedule a reconnect (it checks `if (!_currentSession) return;`).
   _currentSession = null;
@@ -967,6 +957,7 @@ function openTerminal(sessionName, remoteId, fontSize) {
  * Close the current terminal session and clean up all resources.
  */
 function closeTerminal() {
+  _terminalGeneration++;
   _unbindVisualViewport();
   try {
     var _c = document.getElementById('terminal-container');
