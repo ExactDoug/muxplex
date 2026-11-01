@@ -267,7 +267,7 @@ function _diagOn() {
 
 // ─── Forward declarations ─────────────────────────────────────────────────────
 
-function connectWebSocket(name, remoteId) {
+function connectWebSocket(name, remoteId, connectionId) {
   // Every reconnect closure must belong to the terminal that created it.
   // _currentSession alone is insufficient: after a switch to B it is again
   // non-empty, so A's delayed reconnect could otherwise attach to B or A.
@@ -287,6 +287,10 @@ function connectWebSocket(name, remoteId) {
     // Local session: same origin
     url = proto + '//' + location.host + '/terminal/ws';
   }
+  // Every handshake (initial, retry, federated) carries the lease issued by
+  // the authoritative /connect. The server verifies it before opening ttyd.
+  url += '?expected_session=' + encodeURIComponent(name) +
+    '&connection_id=' + encodeURIComponent(connectionId || '');
   const reconnectOverlay = document.getElementById('reconnect-overlay');
   // Use module-level _encodePayload (hoisted above connectWebSocket)
   var encodePayload = _encodePayload;
@@ -385,8 +389,14 @@ function connectWebSocket(name, remoteId) {
       }
     });
 
-    ws.addEventListener('close', function() {
+    ws.addEventListener('close', function(e) {
       if (ws !== _ws || !isCurrentTerminal()) return; // ignore stale socket/session
+      if (e && e.code === 4409) {
+        // Rejected before attaching to ttyd. No retries can make an old lease
+        // valid again after another browser changed the shared session.
+        endTerminalSession('Session switched in another tab.');
+        return;
+      }
       if (reconnectOverlay) reconnectOverlay.classList.remove('hidden');
       // Health check: did this connection LIVE, or did it die on arrival?
       //
@@ -755,7 +765,7 @@ function _searchPrev() {
  *   When provided, the WebSocket connects via the federation proxy path
  *   ws://host/federation/{remoteId}/terminal/ws (same origin, no cross-origin).
  */
-function openTerminal(sessionName, remoteId, fontSize) {
+function openTerminal(sessionName, remoteId, fontSize, connectionId) {
   _terminalGeneration++;
   // Null _currentSession first so any in-flight close handler on the old WS won't
   // schedule a reconnect (it checks `if (!_currentSession) return;`).
@@ -949,7 +959,7 @@ function openTerminal(sessionName, remoteId, fontSize) {
     newPrev.addEventListener('click', _searchPrev);
   }
 
-  connectWebSocket(sessionName, remoteId);
+  connectWebSocket(sessionName, remoteId, connectionId);
   initVisualViewport(); /* defined in Task 14 */
 }
 
