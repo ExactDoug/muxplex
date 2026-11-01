@@ -48,6 +48,7 @@ function loadTerminal() {
   let capturedWsProtocols = null;
   let capturedOnDataFn = null;
   let capturedOnResizeFn = null;
+  let capturedOsc52Handler = null;
   let termWriteMessages = [];
   let lastWsInstance = null;
 
@@ -69,7 +70,9 @@ function loadTerminal() {
     attachCustomKeyEventHandler: () => {},
     getSelection: () => '',
     onSelectionChange: () => {},
-    parser: { registerOscHandler: () => {} },
+    parser: { registerOscHandler: (code, fn) => {
+      if (code === 52) capturedOsc52Handler = fn;
+    } },
   };
 
   // Capture all messages sent via WebSocket.send()
@@ -158,6 +161,7 @@ function loadTerminal() {
     get capturedWsProtocols() { return capturedWsProtocols; },
     get capturedOnDataFn() { return capturedOnDataFn; },
     get capturedOnResizeFn() { return capturedOnResizeFn; },
+    get osc52Handler() { return capturedOsc52Handler; },
     get termWriteMessages() { return termWriteMessages; },
     get focusCallCount() { return focusCallCount; },
     fireClose() { if (capturedCloseHandler) capturedCloseHandler(); },
@@ -980,6 +984,59 @@ test('terminal.js registers OSC 52 handler for tmux clipboard bridge', () => {
     source.includes('atob'),
     'must decode base64 OSC 52 clipboard payload with atob()',
   );
+});
+
+// Actual OSC 52 integration: execute the registered parser callback, not just
+// inspect source for atob/registerOscHandler tokens (regression #30).
+test('OSC 52 copies UTF-8 text exactly, including box drawings, CJK and emoji', () => {
+  const t = loadTerminal();
+  const copied = [];
+  const oldClipboard = globalThis.navigator && globalThis.navigator.clipboard;
+  const oldTimeout = globalThis.setTimeout;
+  globalThis.navigator.clipboard = { writeText: (value) => {
+    copied.push(value);
+    return Promise.resolve();
+  } };
+  try {
+    globalThis.setTimeout = () => 1; // suppress unrelated initial-fit timers
+    t.openTerminal('unicode-copy');
+    assert.equal(typeof t.osc52Handler, 'function');
+    const unicode = '┌─┬─┐ │✓│…│ └─┴─┘ é “quotes” 日本語 😀';
+    assert.equal(t.osc52Handler('c;' + Buffer.from(unicode, 'utf8').toString('base64')), true);
+    assert.deepEqual(copied, [unicode], 'copy must contain Unicode code points, not UTF-8 byte-valued characters');
+    assert.doesNotMatch(copied[0], /[\u0080-\u009f]/, 'UTF-8 mojibake must not introduce C1 controls');
+    assert.equal(t.osc52Handler('c;' + Buffer.from('ASCII only', 'utf8').toString('base64')), true);
+    assert.equal(copied[1], 'ASCII only');
+  } finally {
+    globalThis.setTimeout = oldTimeout;
+    if (oldClipboard === undefined) delete globalThis.navigator.clipboard;
+    else globalThis.navigator.clipboard = oldClipboard;
+    t.closeTerminal();
+  }
+});
+
+test('OSC 52 ignores clipboard queries, empty and malformed payloads without overwriting', () => {
+  const t = loadTerminal();
+  const copied = [];
+  const oldClipboard = globalThis.navigator && globalThis.navigator.clipboard;
+  const oldTimeout = globalThis.setTimeout;
+  globalThis.navigator.clipboard = { writeText: (value) => {
+    copied.push(value);
+    return Promise.resolve();
+  } };
+  try {
+    globalThis.setTimeout = () => 1;
+    t.openTerminal('unicode-copy');
+    for (const payload of ['c;?', 'c;', 'c;not@base64!', 'c;//8=']) {
+      assert.equal(t.osc52Handler(payload), true);
+    }
+    assert.deepEqual(copied, [], 'no clipboard write for a query, empty or malformed UTF-8');
+  } finally {
+    globalThis.setTimeout = oldTimeout;
+    if (oldClipboard === undefined) delete globalThis.navigator.clipboard;
+    else globalThis.navigator.clipboard = oldClipboard;
+    t.closeTerminal();
+  }
 });
 
 // --- Clickable URLs via xterm-addon-web-links ---
