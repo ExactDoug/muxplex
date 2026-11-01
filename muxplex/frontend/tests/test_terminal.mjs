@@ -51,6 +51,7 @@ function loadTerminal() {
   let capturedOsc52Handler = null;
   let termWriteMessages = [];
   let lastWsInstance = null;
+  let wsCreateCount = 0;
 
   let capturedWsUrl = null;
   let onDataCallCount = 0;
@@ -81,6 +82,7 @@ function loadTerminal() {
   // WebSocket mock — captures 'close' and 'open' handlers so we can fire them manually
   class MockWebSocket {
     constructor(_url, _protocols) {
+      wsCreateCount++;
       this.readyState = 1; // OPEN
       this.binaryType = '';
       this._handlers = {};
@@ -159,6 +161,7 @@ function loadTerminal() {
     get sentMessages() { return sentMessages; },
     get capturedWsUrl() { return capturedWsUrl; },
     get capturedWsProtocols() { return capturedWsProtocols; },
+    get wsCreateCount() { return wsCreateCount; },
     get capturedOnDataFn() { return capturedOnDataFn; },
     get capturedOnResizeFn() { return capturedOnResizeFn; },
     get osc52Handler() { return capturedOsc52Handler; },
@@ -874,6 +877,105 @@ test('terminal.js WebSocket reconnect awaits /connect before creating WS', () =>
     source.indexOf('function _connectWebSocket'),
   );
   assert.ok(connectFn.includes('return;'), 'connect() must return after fetch to prevent falling through to immediate WS creation');
+});
+
+// Reconnect regressions (#31): callbacks retained across a session switch
+// must never mutate server state or resurrect an obsolete WebSocket.
+test('a stale retry timer cannot reopen its previous session after a switch', () => {
+  const t = loadTerminal();
+  const oldTimeout = globalThis.setTimeout;
+  let staleRetry = null;
+  try {
+    globalThis.setTimeout = (fn, ms) => {
+      if (ms >= 1000 && !staleRetry) staleRetry = fn;
+      return 1;
+    };
+    t.openTerminal('old-chat', 'dev-old');
+    t.fireClose();
+    assert.equal(typeof staleRetry, 'function', 'old close must schedule a retry');
+    t.openTerminal('new-chat', 'dev-new');
+    const count = t.wsCreateCount;
+    staleRetry(); // simulate an already-queued browser timer despite clearTimeout
+    assert.equal(t.wsCreateCount, count, 'stale closure must not open another socket');
+    assert.match(t.capturedWsUrl, /dev-new/);
+  } finally {
+    globalThis.setTimeout = oldTimeout;
+    t.closeTerminal();
+  }
+});
+
+test('in-flight old reconnect response cannot schedule a socket for the next chat', async () => {
+  const t = loadTerminal();
+  const oldTimeout = globalThis.setTimeout;
+  const oldFetch = globalThis.fetch;
+  let completeReconnect = null;
+  const calls = [];
+  globalThis.fetch = (url) => {
+    calls.push(url);
+    return new Promise(resolve => { completeReconnect = resolve; });
+  };
+  try {
+    globalThis.setTimeout = () => 1;
+    t.openTerminal('old-chat', 'device-a');
+    // Two rapid failures trigger an HTTP /connect recovery (as opposed to
+    // merely reopening the WebSocket).
+    let retry = null;
+    globalThis.setTimeout = (fn, ms) => {
+      if (ms >= 1000) retry = fn;
+      return 1;
+    };
+    t.fireClose();
+    assert.equal(typeof retry, 'function');
+    retry();
+    t.fireClose();
+    retry();
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /device-a\/connect\/old-chat\?reconnect=true/);
+
+    t.openTerminal('new-chat', 'device-b');
+    const count = t.wsCreateCount;
+    completeReconnect({ ok: true, status: 200 });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(t.wsCreateCount, count, 'old fetch must not create a new socket');
+    assert.match(t.capturedWsUrl, /device-b/);
+  } finally {
+    globalThis.fetch = oldFetch;
+    globalThis.setTimeout = oldTimeout;
+    t.closeTerminal();
+  }
+});
+
+test('a 409 reconnect rejection does not trigger repeated ttyd takeover', async () => {
+  const t = loadTerminal();
+  const oldTimeout = globalThis.setTimeout;
+  const oldFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(url);
+    return { ok: false, status: 409 };
+  };
+  try {
+    let retry = null;
+    globalThis.setTimeout = (fn, ms) => {
+      if (ms >= 1000) retry = fn;
+      return 1;
+    };
+    t.openTerminal('old-chat');
+    t.fireClose();
+    retry();
+    t.fireClose();
+    retry();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(calls.length, 1);
+    assert.equal(t.wsCreateCount, 2, 'CAS rejection must not create another socket');
+  } finally {
+    globalThis.fetch = oldFetch;
+    globalThis.setTimeout = oldTimeout;
+    t.closeTerminal();
+  }
 });
 
 // --- Reconnect counter: must reset on message, not on open ---
