@@ -4225,13 +4225,16 @@ def test_closing_remote_clears_coordinator_pair_without_killing_local_ttyd(clien
     assert killed == [], "closing coordinator view must not terminate remote ttyd"
 
 
-async def test_poll_never_clears_a_remote_active_session_using_local_tmux_names(monkeypatch):
+@pytest.mark.parametrize("remote_id", ["remote-uuid", 0])
+async def test_poll_never_clears_a_remote_active_session_using_local_tmux_names(
+    monkeypatch, remote_id
+):
     import muxplex.main as main_mod
     from muxplex.state import empty_state, save_state, load_state
 
     state = empty_state()
     state["active_session"] = "remote-chat"
-    state["active_remote_id"] = "remote-uuid"
+    state["active_remote_id"] = remote_id
     save_state(state)
 
     async def enumerate_local():
@@ -4261,5 +4264,17 @@ async def test_poll_never_clears_a_remote_active_session_using_local_tmux_names(
     await main_mod._run_poll_cycle()
     latest = load_state()
     assert (latest["active_session"], latest["active_remote_id"]) == (
-        "remote-chat", "remote-uuid"
+        "remote-chat", remote_id
     )
+
+def test_active_session_poll_headers_preserve_legacy_numeric_device_zero(client, monkeypatch):
+    from muxplex.state import empty_state, save_state
+    state = empty_state()
+    state["active_session"] = "shared-name"
+    state["active_remote_id"] = 0
+    save_state(state)
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["local-only"])
+    response = client.get("/api/sessions")
+    assert response.status_code == 200
+    assert response.headers["X-Muxplex-Active-Session"] == "shared-name"
+    assert response.headers["X-Muxplex-Active-Remote-Id"] == "0"
