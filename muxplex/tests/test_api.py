@@ -4399,6 +4399,118 @@ def test_remote_reconnect_for_active_pair_forwards_guard(client, monkeypatch, tm
     assert response.json()["connection_id"] == "existing-remote-lease"
     assert posts == ["http://remote:8088/api/sessions/active-chat/connect?reconnect=true&connection_id=existing-remote-lease"]
 
+@pytest.mark.parametrize("old_lease", ["L1", "", None])
+def test_local_reconnect_aba_lease_rejected_before_ttyd_mutation(
+    client, monkeypatch, old_lease
+):
+    """A delayed alpha/L1 reconnect must not kill the newer alpha/L3 ttyd."""
+    from muxplex.state import empty_state, save_state, load_state
+
+    latest = empty_state()
+    latest["active_session"] = "alpha"  # A -> B -> A ended at the same name
+    latest["active_connection_id"] = "L3"
+    save_state(latest)
+    operations = []
+
+    async def mock_kill():
+        operations.append("kill")
+
+    async def mock_spawn(name):
+        operations.append("spawn:" + name)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha", "beta"])
+
+    path = "/api/sessions/alpha/connect?reconnect=true"
+    if old_lease is not None:
+        path += "&connection_id=" + old_lease
+    response = client.post(path)
+
+    assert response.status_code == 409, response.text
+    assert operations == [], "a stale or missing lease may not restart ttyd"
+    assert load_state() == latest, "stale reconnect must not change persisted state"
+
+
+@pytest.mark.parametrize("old_lease", ["L1", "", None])
+def test_federation_reconnect_aba_lease_rejected_before_remote_post(
+    client, monkeypatch, tmp_path, old_lease
+):
+    """The coordinator must reject alpha/L1 after another tab returned to alpha/L3."""
+    import json
+    import muxplex.settings as settings_mod
+    from muxplex.state import empty_state, save_state, load_state
+
+    settings_path = tmp_path / "settings-reconnect-aba.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [
+            {"url": "http://remote:8088", "device_id": "dev-a", "key": "secret"}
+        ]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+
+    latest = empty_state()
+    latest["active_session"] = "alpha"
+    latest["active_remote_id"] = "dev-a"
+    latest["active_connection_id"] = "L3"
+    save_state(latest)
+    posts = []
+
+    async def forbidden_remote_post(url, **kwargs):
+        posts.append(url)
+        raise AssertionError("stale client lease must never reach the remote")
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", forbidden_remote_post)
+
+    path = "/api/federation/dev-a/connect/alpha?reconnect=true"
+    if old_lease is not None:
+        path += "&connection_id=" + old_lease
+    response = client.post(path)
+
+    assert response.status_code == 409, response.text
+    assert posts == [], "no remote request may be sent for an obsolete lease"
+    assert load_state() == latest, "rejected reconnect must not modify coordinator state"
+
+
+def test_federated_reconnect_rejects_remote_lease_rotation(client, monkeypatch, tmp_path):
+    """Even an incorrect 200 response cannot replace a validated reconnection lease."""
+    import httpx
+    import json
+    import muxplex.settings as settings_mod
+    from muxplex.state import empty_state, save_state, load_state
+
+    settings_path = tmp_path / "settings-remote-lease-change.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [
+            {"url": "http://remote:8088", "device_id": "dev-a", "key": "secret"}
+        ]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+
+    latest = empty_state()
+    latest["active_session"] = "alpha"
+    latest["active_remote_id"] = "dev-a"
+    latest["active_connection_id"] = "L3"
+    save_state(latest)
+    forwarded = []
+
+    async def rotated_lease_post(url, **kwargs):
+        forwarded.append(url)
+        return httpx.Response(
+            200, json={"active_session": "alpha", "connection_id": "L4"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", rotated_lease_post)
+    response = client.post(
+        "/api/federation/dev-a/connect/alpha?reconnect=true&connection_id=L3"
+    )
+
+    assert response.status_code == 409, response.text
+    assert forwarded == ["http://remote:8088/api/sessions/alpha/connect?reconnect=true&connection_id=L3"]
+    assert load_state() == latest, "remote must not rotate coordinator's reconnect lease"
+
+
 def test_upstream_reconnect_409_remains_409_at_coordinator(client, monkeypatch, tmp_path):
     """An actual httpx 409 from a remote must not be converted to 502."""
     import httpx
