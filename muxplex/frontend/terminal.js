@@ -449,10 +449,15 @@ function connectWebSocket(name, remoteId, connectionId) {
       var connectPath;
       if (remoteId) {
         connectPath = '/api/federation/' + encodeURIComponent(remoteId) +
-          '/connect/' + encodeURIComponent(name) + '?reconnect=true';
+          '/connect/' + encodeURIComponent(name);
       } else {
-        connectPath = '/api/sessions/' + encodeURIComponent(name) + '/connect?reconnect=true';
+        connectPath = '/api/sessions/' + encodeURIComponent(name) + '/connect';
       }
+      // The backend must compare the originating ttyd lease before it
+      // kills/spawns a process. Name/device checks alone cannot detect
+      // a stale A -> B -> A reconnect from another browser tab.
+      connectPath += '?reconnect=true&connection_id=' +
+        encodeURIComponent(connectionId || '');
       fetch(connectPath, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
