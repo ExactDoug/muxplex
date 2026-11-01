@@ -167,7 +167,7 @@ function loadTerminal() {
     get osc52Handler() { return capturedOsc52Handler; },
     get termWriteMessages() { return termWriteMessages; },
     get focusCallCount() { return focusCallCount; },
-    fireClose() { if (capturedCloseHandler) capturedCloseHandler(); },
+    fireClose(code) { if (capturedCloseHandler) capturedCloseHandler(code == null ? {} : { code }); },
     fireOpen() { if (lastOpenHandler) lastOpenHandler(); },
     fireMessage(data) {
       if (lastWsInstance && lastWsInstance._handlers['message']) {
@@ -707,15 +707,17 @@ test('connectWebSocket URL uses /terminal/ws path', () => {
   const orig = globalThis.setTimeout;
   globalThis.setTimeout = (_fn, _ms) => 0;
 
-  t.openTerminal('my-session');
+  t.openTerminal('my-session', '', 14, 'lease-for-my-session');
 
   globalThis.setTimeout = orig;
 
   assert.ok(t.capturedWsUrl, 'WebSocket URL should have been captured');
   assert.ok(
-    t.capturedWsUrl.endsWith('/terminal/ws'),
-    `WebSocket URL should end with /terminal/ws, got: ${t.capturedWsUrl}`,
+    t.capturedWsUrl.startsWith('ws://localhost/terminal/ws?'),
+    `WebSocket must use /terminal/ws, got: ${t.capturedWsUrl}`,
   );
+  assert.match(t.capturedWsUrl, /expected_session=my-session/);
+  assert.match(t.capturedWsUrl, /connection_id=lease-for-my-session/);
 });
 
 test('initVisualViewport registers resize handler on window.visualViewport when present', () => {
@@ -766,15 +768,14 @@ test('connectWebSocket uses federation proxy path when remoteId is provided', ()
   const orig = globalThis.setTimeout;
   globalThis.setTimeout = (_fn, _ms) => 0;
 
-  t.openTerminal('remote-session', 'fed-abc123');
+  t.openTerminal('remote-session', 'fed-abc123', 14, 'remote-token');
 
   globalThis.setTimeout = orig;
 
-  assert.ok(t.capturedWsUrl, 'WebSocket URL should have been captured');
-  assert.strictEqual(
+  assert.equal(
     t.capturedWsUrl,
-    'ws://localhost/federation/fed-abc123/terminal/ws',
-    `WebSocket URL should be ws://localhost/federation/fed-abc123/terminal/ws, got: ${t.capturedWsUrl}`,
+    'ws://localhost/federation/fed-abc123/terminal/ws?expected_session=remote-session&connection_id=remote-token',
+    'Remote WS must carry the same lease as the remote /connect response',
   );
 });
 
@@ -974,6 +975,37 @@ test('a 409 reconnect rejection does not trigger repeated ttyd takeover', async 
   } finally {
     globalThis.fetch = oldFetch;
     globalThis.setTimeout = oldTimeout;
+    t.closeTerminal();
+  }
+});
+
+test('the terminal encodes Unicode expected session and lease in every initial handshake', () => {
+  const t = loadTerminal();
+  const old = globalThis.setTimeout;
+  try {
+    globalThis.setTimeout = () => 0;
+    t.openTerminal('prøve mü', 'fed-xyz', 14, 'token+equals=');
+    assert.match(t.capturedWsUrl, /expected_session=pr%C3%B8ve%20m%C3%BC/);
+    assert.match(t.capturedWsUrl, /connection_id=token%2Bequals%3D/);
+    assert.match(t.capturedWsUrl, /\/federation\/fed-xyz\/terminal\/ws\?/);
+  } finally {
+    globalThis.setTimeout = old;
+    t.closeTerminal();
+  }
+});
+
+test('4409 from an initial WebSocket attach stops retries instead of hijacking ttyd', () => {
+  const t = loadTerminal();
+  const old = globalThis.setTimeout;
+  try {
+    globalThis.setTimeout = () => 0;
+    t.openTerminal('alpha', '', 14, 'stale-lease');
+    const opened = t.wsCreateCount;
+    t.fireClose(4409);
+    t.fireReconnect();
+    assert.equal(t.wsCreateCount, opened, 'stale socket may not retry');
+  } finally {
+    globalThis.setTimeout = old;
     t.closeTerminal();
   }
 });
