@@ -4394,10 +4394,22 @@ def test_remote_reconnect_for_active_pair_forwards_guard(client, monkeypatch, tm
         return resp
 
     monkeypatch.setattr(client.app.state.federation_client, "post", mock_post)
-    response = client.post("/api/federation/dev-a/connect/active-chat?reconnect=true&connection_id=existing-remote-lease")
+    response = client.post(
+        "/api/federation/dev-a/connect/active-chat"
+        "?reconnect=true&connection_id=existing-remote-lease"
+    )
     assert response.status_code == 200
     assert response.json()["connection_id"] == "existing-remote-lease"
-    assert posts == ["http://remote:8088/api/sessions/active-chat/connect?reconnect=true&connection_id=existing-remote-lease"]
+    assert posts == [
+        "http://remote:8088/api/sessions/active-chat/connect"
+        "?reconnect=true&connection_id=existing-remote-lease"
+    ]
+    from muxplex.state import load_state
+    persisted = load_state()
+    assert (persisted["active_session"], persisted["active_remote_id"],
+            persisted["active_connection_id"]) == (
+        "active-chat", "dev-a", "existing-remote-lease"
+    )
 
 @pytest.mark.parametrize("old_lease", ["L1", "", None])
 def test_local_reconnect_aba_lease_rejected_before_ttyd_mutation(
