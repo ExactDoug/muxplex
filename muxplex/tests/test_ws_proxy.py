@@ -50,6 +50,15 @@ def patch_startup_and_state(tmp_path, monkeypatch):
     monkeypatch.setattr("muxplex.state.STATE_DIR", tmp_state_dir)
     monkeypatch.setattr("muxplex.state.STATE_PATH", tmp_state_path)
 
+    # Valid ttyd lease for all relay tests. Tests that exercise a mismatch
+    # override the state; no unit test touches a real ttyd listener.
+    from muxplex.state import empty_state, save_state
+    state = empty_state()
+    state["active_session"] = "test-session"
+    state["active_connection_id"] = "test-lease"
+    save_state(state)
+    monkeypatch.setattr("muxplex.main._ttyd_is_listening", lambda: True)
+
     # Redirect PID files
     tmp_pid_dir = tmp_path / "ttyd"
     tmp_pid_path = tmp_pid_dir / "ttyd.pid"
@@ -214,7 +223,8 @@ def test_ws_proxy_auto_spawns_ttyd_when_dead(monkeypatch):
     # Patch load_state to return state with active_session
     monkeypatch.setattr(
         "muxplex.main.load_state",
-        lambda: {"active_session": "test-session", "sessions": {}, "session_order": []},
+        lambda: {"active_session": "test-session", "active_connection_id": "test-lease",
+                 "sessions": {}, "session_order": []},
     )
     # The session must be KNOWN for the proxy to respawn for it.  Pinned
     # explicitly rather than relying on the module-global session cache, which
@@ -222,7 +232,7 @@ def test_ws_proxy_auto_spawns_ttyd_when_dead(monkeypatch):
     monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["test-session"])
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as _:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as _:
             pass
 
     assert spawn_calls == ["test-session"], (
@@ -263,14 +273,15 @@ def test_ws_proxy_refuses_to_spawn_ttyd_for_vanished_session(monkeypatch):
     # State still names the dead session; the live session list no longer has it.
     monkeypatch.setattr(
         "muxplex.main.load_state",
-        lambda: {"active_session": "ghost", "sessions": {}, "session_order": []},
+        lambda: {"active_session": "ghost", "active_connection_id": "test-lease",
+                 "sessions": {}, "session_order": []},
     )
     monkeypatch.setattr(
         "muxplex.main.get_session_list", lambda: ["alive-1", "alive-2"]
     )
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as _:
+        with c.websocket_connect("/terminal/ws?expected_session=ghost&connection_id=test-lease") as _:
             pass
 
     assert spawn_calls == [], (
@@ -309,7 +320,7 @@ def test_ws_auth_rejection_no_cookie():
     # TestClient default host is "testclient" which is treated as non-localhost
     with TestClient(app) as c:
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with c.websocket_connect("/terminal/ws") as _:
+            with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as _:
                 pass
     assert exc_info.value.code == 4001
 
@@ -319,7 +330,7 @@ def test_ws_auth_rejection_invalid_cookie():
     with TestClient(app) as c:
         c.cookies.set("muxplex_session", "tampered.invalid.cookie.value")
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with c.websocket_connect("/terminal/ws") as _:
+            with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as _:
                 pass
     assert exc_info.value.code == 4001
 
@@ -346,7 +357,7 @@ def test_ws_bearer_auth_accepted(monkeypatch):
     with TestClient(app) as c:
         # If Bearer auth is not implemented, this raises WebSocketDisconnect(code=4001)
         with c.websocket_connect(
-            "/terminal/ws",
+            "/terminal/ws?expected_session=test-session&connection_id=test-lease",
             headers={"Authorization": f"Bearer {fed_key}"},
         ) as _ws:
             pass  # Successfully connected — auth was accepted
@@ -363,7 +374,7 @@ def test_browser_text_relayed_to_ttyd(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as ws:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
             ws.send_text("hello from browser")
             _wait_for(lambda: "hello from browser" in fake_ws.sent)
 
@@ -376,7 +387,7 @@ def test_browser_bytes_relayed_to_ttyd(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as ws:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
             ws.send_bytes(b"\x00\x01\x02 binary data")
             _wait_for(lambda: b"\x00\x01\x02 binary data" in fake_ws.sent)
 
@@ -394,7 +405,7 @@ def test_ttyd_text_relayed_to_browser(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as ws:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
             msg = ws.receive_text()
     assert msg == "hello from ttyd"
 
@@ -405,7 +416,7 @@ def test_ttyd_bytes_relayed_to_browser(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as ws:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
             msg = ws.receive_bytes()
     assert msg == b"\xde\xad\xbe\xef binary"
 
@@ -421,7 +432,7 @@ def test_ttyd_close_propagates_to_browser(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as _:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as _:
             # FakeTtydWs has no responses so ttyd_to_client exhausts immediately.
             # Exiting the context manager closes the browser WS, which causes
             # client_to_ttyd to complete, gather finishes, and the proxy
@@ -446,7 +457,7 @@ def test_ttyd_unreachable_closes_browser_ws(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", mock_connect_raises)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as ws:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
             # Proxy accepts, then closes after failing to reach ttyd.
             # Receive the close frame — proves the proxy closed (no hang)
             # and that auth was not rejected (which would use code 4001).
@@ -484,7 +495,7 @@ def test_concurrent_ws_sessions(monkeypatch):
 
         def send_msg(text):
             try:
-                with c.websocket_connect("/terminal/ws") as ws:
+                with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
                     ws.send_text(text)
                     _wait_for(lambda: text in ws_pool[0].sent + ws_pool[1].sent)
             except Exception as exc:
@@ -578,7 +589,7 @@ def test_upstream_end_tears_down_proxy_while_browser_is_idle(monkeypatch):
 
     def body(box):
         with _make_authed_client() as c:
-            with c.websocket_connect("/terminal/ws") as ws:
+            with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
                 # Deliberately send NOTHING — this is the idle-tab case.
                 box["frame"] = ws.receive()
 
@@ -605,7 +616,7 @@ def test_client_disconnect_still_closes_both_sides(monkeypatch):
 
     def body(box):
         with _make_authed_client() as c:
-            with c.websocket_connect("/terminal/ws") as ws:
+            with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
                 ws.send_text("ping")
                 _wait_for(lambda: "ping" in fake_ws.sent)
             # Context exit disconnects the browser.
