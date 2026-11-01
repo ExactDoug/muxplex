@@ -881,12 +881,17 @@ function openTerminal(sessionName, remoteId, fontSize) {
   _term.parser.registerOscHandler(52, function(data) {
     // OSC 52 format: Pc ; Pd — Pc = selection target (c/p/q/s/0-7), Pd = base64 text
     var parts = data.split(';');
-    if (parts.length >= 2) {
+    // OSC 52 queries (Pd='?') and empty payloads must not clear the clipboard.
+    if (parts.length >= 2 && parts[1] && parts[1] !== '?') {
       try {
-        var text = atob(parts[1]);
+        // atob() returns byte-valued characters, NOT a decoded UTF-8 string.
+        // Decode the bytes explicitly so tmux box-drawing/emoji/CJK survives copy.
+        var binary = atob(parts[1]);
+        var bytes = Uint8Array.from(binary, function(ch) { return ch.charCodeAt(0); });
+        var text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
         _copyToClipboard(text);
       } catch (e) {
-        // Invalid base64 or unsupported — silently ignore
+        // Bad base64 or malformed UTF-8: leave the existing clipboard untouched.
       }
     }
     return true;  // Handled — don't pass to xterm's default handler
