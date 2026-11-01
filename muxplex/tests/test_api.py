@@ -657,6 +657,7 @@ def test_connect_session_returns_200(client, monkeypatch):
     assert response.status_code == 200
     data = response.json()
     assert data["active_session"] == "alpha"
+    assert isinstance(data["connection_id"], str) and data["connection_id"]
     assert data["ttyd_port"] == 7682
 
 
@@ -2406,6 +2407,7 @@ def test_federation_connect_proxies_to_remote(client, monkeypatch, tmp_path):
         mock_resp.status_code = 200
         mock_resp.json.return_value = {
             "active_session": "my-session",
+            "connection_id": "remote-test-lease",
             "ttyd_port": 7682,
         }
         return mock_resp
@@ -3865,6 +3867,7 @@ def test_federation_connect_by_device_id(client, monkeypatch, tmp_path):
         mock_resp.status_code = 200
         mock_resp.json.return_value = {
             "active_session": "my-session",
+            "connection_id": "remote-test-lease",
             "ttyd_port": 7682,
         }
         return mock_resp
@@ -4380,10 +4383,78 @@ def test_remote_reconnect_for_active_pair_forwards_guard(client, monkeypatch, tm
     async def mock_post(url, **kwargs):
         posts.append(url)
         resp = MagicMock()
-        resp.json.return_value = {"active_session": "active-chat", "ttyd_port": 7682}
+        resp.json.return_value = {"active_session": "active-chat", "ttyd_port": 7682,
+                                  "connection_id": "existing-remote-lease"}
         return resp
 
     monkeypatch.setattr(client.app.state.federation_client, "post", mock_post)
     response = client.post("/api/federation/dev-a/connect/active-chat?reconnect=true")
     assert response.status_code == 200
     assert posts == ["http://remote:8088/api/sessions/active-chat/connect?reconnect=true"]
+
+def test_upstream_reconnect_409_remains_409_at_coordinator(client, monkeypatch, tmp_path):
+    """An actual httpx 409 from a remote must not be converted to 502."""
+    import httpx
+    import json
+    import muxplex.settings as settings_mod
+    from muxplex.state import empty_state, save_state, load_state
+
+    settings_path = tmp_path / "settings-remote-409.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [
+            {"url": "http://node-b:8088", "device_id": "node-b", "key": "secret"}
+        ]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    state = empty_state()
+    state["active_session"] = "alpha"
+    state["active_remote_id"] = "node-b"
+    state["active_connection_id"] = "original-remote-lease"
+    save_state(state)
+
+    calls = []
+    async def reject_post(url, **kwargs):
+        calls.append(url)
+        return httpx.Response(
+            409, json={"detail": "Active session changed"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", reject_post)
+    response = client.post("/api/federation/node-b/connect/alpha?reconnect=true")
+    assert response.status_code == 409, response.text
+    assert calls == ["http://node-b:8088/api/sessions/alpha/connect?reconnect=true"]
+    latest = load_state()
+    assert (latest["active_session"], latest["active_remote_id"],
+            latest["active_connection_id"]) == (
+        "alpha", "node-b", "original-remote-lease"
+    ), "a rejected reconnect must never publish a different lease"
+
+
+def test_federation_connect_rejects_legacy_peer_without_lease(client, monkeypatch, tmp_path):
+    """A legacy peer cannot safely perform identity-bound WebSocket handshakes."""
+    import httpx
+    import json
+    import muxplex.settings as settings_mod
+    from muxplex.state import empty_state, save_state, load_state
+
+    settings_path = tmp_path / "settings-legacy.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [
+            {"url": "http://legacy:8088", "device_id": "legacy", "key": "secret"}
+        ]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+
+    async def legacy_post(url, **kwargs):
+        return httpx.Response(
+            200, json={"active_session": "alpha", "ttyd_port": 7682},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", legacy_post)
+    save_state(empty_state())
+    response = client.post("/api/federation/legacy/connect/alpha")
+    assert response.status_code == 502
+    assert "connection_id" in response.json()["detail"]
+    assert load_state()["active_session"] is None
