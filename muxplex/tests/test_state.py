@@ -78,6 +78,12 @@ def test_empty_state_active_remote_id_is_none():
     assert state["active_remote_id"] is None
 
 
+def test_empty_state_connection_lease_is_none():
+    state = empty_state()
+    assert "active_connection_id" in state
+    assert state["active_connection_id"] is None
+
+
 def test_empty_state_returns_independent_dicts():
     """Mutating one state must not affect another."""
     s1 = empty_state()
