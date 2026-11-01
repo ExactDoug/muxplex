@@ -132,7 +132,7 @@ let _lastLocalOpenAt = 0;  // Last local navigation commit (reconcile grace guar
 let _navigationSeq = 0;
 let _pendingNavigationId = 0;
 let _navigationQueue = Promise.resolve();
-let _lastCommittedNavigation = null; // last server-acknowledged {name, remoteId}
+let _lastCommittedNavigation = null; // {name, remoteId, connectionId} from server
 let _viewMode = 'grid';
 let _lastInteractionAt = Date.now() / 1000;
 let _pollingTimer;
@@ -387,23 +387,32 @@ async function reconcileViewingSession(viewing) {
   if (_pendingNavigationId || Date.now() - _lastLocalOpenAt < RECONCILE_GRACE_MS) return;
   const observedNavigation = _navigationSeq;
   try {
-    let serverName, serverRid;
+    let serverName, serverRid, serverLease;
     if (viewing) {
       serverName = viewing.name || null;
       serverRid = viewing.remoteId || '';
+      serverLease = viewing.connectionId || '';
     } else {
       const res = await api('GET', '/api/state');
       const state = await res.json();
       serverName = state.active_session || null;
-      serverRid = state.active_remote_id || '';
+      serverRid = state.active_remote_id == null ? '' : String(state.active_remote_id);
+      serverLease = state.active_connection_id || '';
     }
     // A state fallback GET can finish after a new local click. Never adopt its
     // stale result, and never follow an old poll while /connect is in flight.
     if (observedNavigation !== _navigationSeq || _pendingNavigationId ||
         Date.now() - _lastLocalOpenAt < RECONCILE_GRACE_MS) return;
-    if (!serverName) return;
-    if (serverName === _viewingSession && serverRid === (_viewingRemoteId || '')) return;
-    await openSession(serverName, { remoteId: serverRid, skipAnimation: true, reconcileOnly: true });
+    // Never adopt a session without a server-issued ttyd attachment lease:
+    // that would allow a legacy session-agnostic WebSocket to hit the wrong chat.
+    if (!serverName || !serverLease) return;
+    if (serverName === _viewingSession && serverRid === (_viewingRemoteId || '') &&
+        _lastCommittedNavigation &&
+        _lastCommittedNavigation.connectionId === serverLease) return;
+    await openSession(serverName, {
+      remoteId: serverRid, connectionId: serverLease,
+      skipAnimation: true, reconcileOnly: true
+    });
   } catch (err) {
     // Non-fatal: pollSessions owns connection-status; a failed reconcile just
     // leaves local state as-is until the next poll retries.
@@ -425,7 +434,12 @@ function readViewingHeaders(res) {
     const rawName = h.get('X-Muxplex-Active-Session');
     if (rawName === null || rawName === undefined) return null;
     const rawRid = h.get('X-Muxplex-Active-Remote-Id') || '';
-    return { name: decodeURIComponent(rawName) || null, remoteId: decodeURIComponent(rawRid) };
+    const rawLease = h.get('X-Muxplex-Active-Connection-Id') || '';
+    return {
+      name: decodeURIComponent(rawName) || null,
+      remoteId: decodeURIComponent(rawRid),
+      connectionId: decodeURIComponent(rawLease)
+    };
   } catch (_) {
     return null;
   }
@@ -3758,6 +3772,8 @@ async function openSession(name, opts = {}) {
   if (!name || !name.trim()) return;
   var remoteId = opts.remoteId != null ? String(opts.remoteId) : '';
   var _deviceId = remoteId; // federation device ID, never a positional array index
+  var connectionId = opts.connectionId || '';
+  if (opts.reconcileOnly && !connectionId) return; // never mount an unbound terminal
   var navId = ++_navigationSeq;
   var oldName = _viewingSession;
   var oldRid = _viewingRemoteId || '';
@@ -3768,7 +3784,9 @@ async function openSession(name, opts = {}) {
     _lastLocalOpenAt = Date.now();
   } else {
     _pendingNavigationId = 0;
-    _lastCommittedNavigation = { name: name, remoteId: remoteId };
+    _lastCommittedNavigation = {
+      name: name, remoteId: remoteId, connectionId: connectionId
+    };
   }
   hidePreview();
   _viewingSession = name;
@@ -3850,12 +3868,23 @@ async function openSession(name, opts = {}) {
         } else {
           response = await api('POST', '/api/sessions/' + encodeURIComponent(name) + '/connect');
         }
+        // Real fetch Responses always expose json(). Do not silently accept a
+        // peer which cannot provide a lease: we'd be unable to bind the socket.
+        if (!response || typeof response.json !== 'function') {
+          throw new Error('Invalid /connect response: missing connection identity');
+        }
+        var info = await response.json();
+        var lease = info && info.connection_id;
+        if (typeof lease !== 'string' || !lease) {
+          throw new Error('Server missing connection_id; upgrade muxplex instances');
+        }
         // Record even a superseded response: a queued Back may need to close
         // this connection after a later, not-yet-started intent was canceled.
-        _lastCommittedNavigation = { name: name, remoteId: remoteId };
-        return response;
+        _lastCommittedNavigation = { name: name, remoteId: remoteId, connectionId: lease };
+        return lease;
       });
       if (!connected || navId !== _navigationSeq) return;
+      connectionId = connected;
       if (_deviceId !== '') {
         api('POST', '/api/federation/' + encodeURIComponent(_deviceId) +
           '/sessions/' + encodeURIComponent(name) + '/bell/clear').catch(function() {});
@@ -3877,7 +3906,9 @@ async function openSession(name, opts = {}) {
   await animDone;
   if (navId !== _navigationSeq || _viewMode !== 'fullscreen') return;
   // /connect has completed and the server's active identity is authoritative.
-  if (window._openTerminal) window._openTerminal(name, remoteId, getDisplaySettings().fontSize);
+  if (window._openTerminal) {
+    window._openTerminal(name, remoteId, getDisplaySettings().fontSize, connectionId);
+  }
 }
 
 /**
@@ -3906,7 +3937,8 @@ function closeSession(opts = {}) {
       if (!connected) return null;
       var url = '/api/sessions/current?expected_session=' +
         encodeURIComponent(connected.name) + '&expected_remote_id=' +
-        encodeURIComponent(connected.remoteId);
+        encodeURIComponent(connected.remoteId) + '&expected_connection_id=' +
+        encodeURIComponent(connected.connectionId || '');
       return api('DELETE', url).then(function() {
         if (navId === _navigationSeq) _lastCommittedNavigation = null;
       });
