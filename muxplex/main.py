@@ -1028,7 +1028,7 @@ async def create_session(payload: CreateSessionPayload) -> dict:
 
 
 @app.post("/api/sessions/{name}/connect")
-async def connect_session(name: str) -> dict:
+async def connect_session(name: str, reconnect: bool = False) -> dict:
     """Attach the shared local ttyd and atomically publish its local identity.
 
     All connect/disconnect/WS respawns use _ttyd_transition_lock so two
@@ -1036,6 +1036,13 @@ async def connect_session(name: str) -> dict:
     coordinator's active_remote_id is explicitly cleared for local sessions.
     """
     async with _ttyd_transition_lock:
+        if reconnect:
+            # A previously scheduled WebSocket recovery must never hijack ttyd
+            # after a different browser selects another active session.
+            async with state_lock:
+                latest = load_state()
+            if latest.get("active_session") != name or _active_remote_id(latest):
+                raise HTTPException(status_code=409, detail="Active session changed")
         known = get_session_list()
         if known and name not in known:
             raise HTTPException(status_code=404, detail=f"Session '{name}' not found")
@@ -1969,7 +1976,7 @@ async def federation_generate_key() -> dict:
 
 @app.post("/api/federation/{device_id}/connect/{session_name}")
 async def federation_connect(
-    device_id: str, session_name: str, request: Request
+    device_id: str, session_name: str, request: Request, reconnect: bool = False
 ) -> dict:
     """Connect remote ttyd, then atomically publish the coordinator's pair.
 
@@ -1978,6 +1985,14 @@ async def federation_connect(
     request finishing after it.
     """
     async with _ttyd_transition_lock:
+        if reconnect:
+            async with state_lock:
+                latest = load_state()
+            if (
+                latest.get("active_session") != session_name
+                or _active_remote_id(latest) != device_id
+            ):
+                raise HTTPException(status_code=409, detail="Active session changed")
         remote = _lookup_remote_by_device_id(device_id)
         if remote is None:
             raise HTTPException(
@@ -1988,6 +2003,8 @@ async def federation_connect(
         remote_url: str = remote.get("url", "").rstrip("/")
         remote_key: str = remote.get("key", "")
         url = f"{remote_url}/api/sessions/{urllib.parse.quote(session_name, safe='')}/connect"
+        if reconnect:
+            url += "?reconnect=true"
 
         http_client: httpx.AsyncClient = request.app.state.federation_client
         try:
