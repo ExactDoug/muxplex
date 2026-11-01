@@ -948,6 +948,54 @@ test('in-flight old reconnect response cannot schedule a socket for the next cha
   }
 });
 
+for (const { kind, remoteId, expectedPath } of [
+  {
+    kind: 'local',
+    remoteId: '',
+    expectedPath: '/api/sessions/alpha/connect?reconnect=true&connection_id=L1%2Bstale'
+  },
+  {
+    kind: 'federated',
+    remoteId: 'device-b',
+    expectedPath: '/api/federation/device-b/connect/alpha?reconnect=true&connection_id=L1%2Bstale'
+  },
+]) {
+  test(`${kind} reconnect POST sends its original lease and stops on 409`, async () => {
+    const t = loadTerminal();
+    const oldTimeout = globalThis.setTimeout;
+    const oldFetch = globalThis.fetch;
+    const calls = [];
+    let retry = null;
+    try {
+      globalThis.fetch = async (url) => {
+        calls.push(url);
+        return { ok: false, status: 409 };
+      };
+      globalThis.setTimeout = (fn, ms) => {
+        if (ms >= 1000) retry = fn;
+        return 1;
+      };
+      t.openTerminal('alpha', remoteId, 14, 'L1+stale');
+      t.fireClose();
+      assert.equal(typeof retry, 'function');
+      retry(); // first reconnect is direct WebSocket recovery
+      t.fireClose();
+      retry(); // second reconnect is guarded POST
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      assert.deepEqual(calls, [expectedPath],
+        'only the originating L1 lease may be sent, never a fresh server lease');
+      assert.equal(t.wsCreateCount, 2,
+        'HTTP 409 must stop further WebSocket retries');
+    } finally {
+      globalThis.fetch = oldFetch;
+      globalThis.setTimeout = oldTimeout;
+      t.closeTerminal();
+    }
+  });
+}
+
 test('a 409 reconnect rejection does not trigger repeated ttyd takeover', async () => {
   const t = loadTerminal();
   const oldTimeout = globalThis.setTimeout;
