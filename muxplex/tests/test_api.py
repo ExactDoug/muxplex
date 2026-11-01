@@ -4278,3 +4278,112 @@ def test_active_session_poll_headers_preserve_legacy_numeric_device_zero(client,
     assert response.status_code == 200
     assert response.headers["X-Muxplex-Active-Session"] == "shared-name"
     assert response.headers["X-Muxplex-Active-Remote-Id"] == "0"
+
+def test_stale_local_reconnect_returns_409_without_killing_ttyd(client, monkeypatch):
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "newer-chat"
+    save_state(state)
+    calls = []
+
+    async def mock_kill():
+        calls.append("kill")
+
+    async def mock_spawn(name):
+        calls.append("spawn:" + name)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+    monkeypatch.setattr(
+        "muxplex.main.get_session_list", lambda: ["old-chat", "newer-chat"]
+    )
+    response = client.post("/api/sessions/old-chat/connect?reconnect=true")
+    assert response.status_code == 409
+    assert calls == []
+    assert load_state()["active_session"] == "newer-chat"
+
+
+def test_reconnect_of_current_local_chat_remains_allowed(client, monkeypatch):
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "current-chat"
+    save_state(state)
+    calls = []
+
+    async def mock_kill():
+        calls.append("kill")
+
+    async def mock_spawn(name):
+        calls.append("spawn:" + name)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+    monkeypatch.setattr(
+        "muxplex.main.get_session_list", lambda: ["current-chat"]
+    )
+    response = client.post("/api/sessions/current-chat/connect?reconnect=true")
+    assert response.status_code == 200
+    assert calls == ["kill", "spawn:current-chat"]
+    assert load_state()["active_session"] == "current-chat"
+
+
+def test_stale_federation_reconnect_returns_409_without_remote_POST(
+    client, monkeypatch, tmp_path
+):
+    from muxplex.state import empty_state, save_state, load_state
+    import muxplex.settings as settings_mod
+    import json
+
+    settings_path = tmp_path / "settings-reconnect.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [{"url": "http://remote:8088", "device_id": "dev-a",
+                              "name": "Dev A", "key": "secret"}]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    state = empty_state()
+    state["active_session"] = "other-chat"
+    state["active_remote_id"] = "dev-a"
+    save_state(state)
+    posts = []
+
+    async def mock_post(url, **kwargs):
+        posts.append(url)
+        raise AssertionError("must not contact remote for stale reconnect")
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", mock_post)
+    response = client.post("/api/federation/dev-a/connect/old-chat?reconnect=true")
+    assert response.status_code == 409
+    assert posts == []
+    assert load_state()["active_session"] == "other-chat"
+
+
+def test_remote_reconnect_for_active_pair_forwards_guard(client, monkeypatch, tmp_path):
+    from muxplex.state import empty_state, save_state
+    import muxplex.settings as settings_mod
+    import json
+    from unittest.mock import MagicMock
+
+    settings_path = tmp_path / "settings-reconnect.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [{"url": "http://remote:8088", "device_id": "dev-a",
+                              "name": "Dev A", "key": "secret"}]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    state = empty_state()
+    state["active_session"] = "active-chat"
+    state["active_remote_id"] = "dev-a"
+    save_state(state)
+    posts = []
+
+    async def mock_post(url, **kwargs):
+        posts.append(url)
+        resp = MagicMock()
+        resp.json.return_value = {"active_session": "active-chat", "ttyd_port": 7682}
+        return resp
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", mock_post)
+    response = client.post("/api/federation/dev-a/connect/active-chat?reconnect=true")
+    assert response.status_code == 200
+    assert posts == ["http://remote:8088/api/sessions/active-chat/connect?reconnect=true"]
