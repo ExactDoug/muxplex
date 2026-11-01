@@ -1043,7 +1043,9 @@ async def create_session(payload: CreateSessionPayload) -> dict:
 
 
 @app.post("/api/sessions/{name}/connect")
-async def connect_session(name: str, reconnect: bool = False) -> dict:
+async def connect_session(
+    name: str, reconnect: bool = False, connection_id: str | None = None
+) -> dict:
     """Attach the shared local ttyd and atomically publish its local identity.
 
     All connect/disconnect/WS respawns use _ttyd_transition_lock so two
@@ -1056,7 +1058,15 @@ async def connect_session(name: str, reconnect: bool = False) -> dict:
             # after a different browser selects another active session.
             async with state_lock:
                 latest = load_state()
-            if latest.get("active_session") != name or _active_remote_id(latest):
+            # A -> B -> A returns to the same name but has a different ttyd
+            # generation. Only the browser holding the *current* lease may
+            # restart ttyd. A missing lease also fails closed.
+            if (
+                latest.get("active_session") != name
+                or _active_remote_id(latest)
+                or not connection_id
+                or _active_connection_id(latest) != connection_id
+            ):
                 raise HTTPException(status_code=409, detail="Active session changed")
         known = get_session_list()
         if known and name not in known:
@@ -1065,7 +1075,7 @@ async def connect_session(name: str, reconnect: bool = False) -> dict:
         # Reconnecting the *same* ttyd session keeps its lease so an existing
         # browser can safely reattach. A user navigation always gets a new
         # lease, even for an A -> B -> A sequence.
-        lease = (_active_connection_id(latest) if reconnect else "") or secrets.token_urlsafe(24)
+        lease = connection_id if reconnect else secrets.token_urlsafe(24)
         _log.info("Connecting to session '%s'", name)
         await kill_ttyd()
         await spawn_ttyd(name)
@@ -2020,7 +2030,8 @@ async def federation_generate_key() -> dict:
 
 @app.post("/api/federation/{device_id}/connect/{session_name}")
 async def federation_connect(
-    device_id: str, session_name: str, request: Request, reconnect: bool = False
+    device_id: str, session_name: str, request: Request, reconnect: bool = False,
+    connection_id: str | None = None,
 ) -> dict:
     """Connect remote ttyd, then atomically publish the coordinator's pair.
 
@@ -2035,7 +2046,11 @@ async def federation_connect(
             if (
                 latest.get("active_session") != session_name
                 or _active_remote_id(latest) != device_id
+                or not connection_id
+                or _active_connection_id(latest) != connection_id
             ):
+                # No remote POST must occur when the coordinator's ttyd
+                # selection has changed (including same-name A -> B -> A).
                 raise HTTPException(status_code=409, detail="Active session changed")
         remote = _lookup_remote_by_device_id(device_id)
         if remote is None:
@@ -2048,7 +2063,12 @@ async def federation_connect(
         remote_key: str = remote.get("key", "")
         url = f"{remote_url}/api/sessions/{urllib.parse.quote(session_name, safe='')}/connect"
         if reconnect:
-            url += "?reconnect=true"
+            # Forward the *caller's* lease, never replace it with the latest
+            # coordinator state. The remote performs its own guarded CAS before
+            # killing or spawning ttyd.
+            url += "?reconnect=true&connection_id=" + urllib.parse.quote(
+                connection_id, safe=""
+            )
 
         http_client: httpx.AsyncClient = request.app.state.federation_client
         try:
@@ -2084,6 +2104,11 @@ async def federation_connect(
                 status_code=502,
                 detail="Remote muxplex must support connection_id; upgrade the remote instance",
             )
+        if reconnect and lease != connection_id:
+            # A broken/older remote must not silently rotate the lease on a
+            # guarded reconnect. Keep our active identity unchanged and stop
+            # the client's retry rather than trusting a foreign generation.
+            raise HTTPException(status_code=409, detail="Remote connection lease changed")
 
         async with state_lock:
             state = load_state()
