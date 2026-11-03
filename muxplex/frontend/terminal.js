@@ -391,6 +391,11 @@ function connectWebSocket(name, remoteId, connectionId) {
 
     ws.addEventListener('close', function(e) {
       if (ws !== _ws || !isCurrentTerminal()) return; // ignore stale socket/session
+      if (e && e.code === 4404) {
+        // The tmux session exited. A retry cannot revive that session.
+        endTerminalSession('Session ended.');
+        return;
+      }
       if (e && e.code === 4409) {
         // Rejected before attaching to ttyd. No retries can make an old lease
         // valid again after another browser changed the shared session.
