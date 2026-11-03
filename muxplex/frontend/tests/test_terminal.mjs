@@ -1761,14 +1761,16 @@ function createReconnectEnv(fetchImpl) {
       globalThis.setTimeout = (cb, _ms) => { pendingTimer = cb; return 0; };
       try { fn(); } finally { globalThis.setTimeout = orig; }
     },
-    open(name, remoteId) {
-      env.withTimeout(() => globalThis.window._openTerminal(name, remoteId));
+    open(name, remoteId, lease = 'lease-for-recovery') {
+      env.withTimeout(() => globalThis.window._openTerminal(name, remoteId, 14, lease));
     },
     /** Fire the close handler of the most recent WebSocket. */
-    fireClose() {
+    fireClose(code) {
       const ws = wsInstances[wsInstances.length - 1];
       pendingTimer = null;
-      env.withTimeout(() => { if (ws && ws._handlers['close']) ws._handlers['close'](); });
+      env.withTimeout(() => {
+        if (ws && ws._handlers['close']) ws._handlers['close'](code ? { code } : {});
+      });
     },
     /** Run the pending timer callback (reconnect, or the 800ms post-/connect settle). */
     runTimer() {
@@ -1840,6 +1842,27 @@ function createReconnectEnv(fetchImpl) {
   return env;
 }
 
+for (const { closeCode, expectedMessage } of [
+  { closeCode: 4404, expectedMessage: 'Session ended.' },
+  { closeCode: 4409, expectedMessage: 'Session switched in another tab.' },
+]) {
+  test(`WebSocket ${closeCode} is terminal and explains the actual cause`, async () => {
+    const env = createReconnectEnv(() => {
+      throw new Error('a definitive WS close must not start a recovery POST');
+    });
+    env.open('alpha', '', 'lease-alpha');
+    env.fireClose(closeCode);
+    assert.ok(env.endedVisible, 'fatal close must show the terminal-ended overlay');
+    assert.strictEqual(env.endedMessage, expectedMessage);
+    assert.ok(!env.hasPendingTimer, 'fatal close must not schedule another socket');
+    assert.strictEqual(env.fetchCalls.length, 0);
+    const sockets = env.wsInstances.length;
+    env.runTimer();
+    assert.strictEqual(env.wsInstances.length, sockets,
+      'terminal may not resurrect after a definitive close');
+  });
+}
+
 test('POST /connect returning 404 ends the terminal instead of reconnecting forever', async () => {
   // The tmux session was destroyed, so main.py connect_session raises
   // 404 "Session 'x' not found". Before the fix this response was never even
@@ -1855,7 +1878,7 @@ test('POST /connect returning 404 ends the terminal instead of reconnecting fore
   await env.cycle();
 
   assert.strictEqual(env.fetchCalls.length, 1, '/connect must have been POSTed once');
-  assert.match(env.fetchCalls[0].url, /\/api\/sessions\/dead\/connect$/);
+  assert.match(env.fetchCalls[0].url, /\/api\/sessions\/dead\/connect\?reconnect=true&connection_id=lease-for-recovery$/);
   assert.ok(env.endedVisible, 'a 404 from /connect must show the session-ended overlay');
   assert.strictEqual(env.endedMessage, 'Session ended.');
 
@@ -1899,7 +1922,7 @@ test('federated /connect: a peer-side 404 (proxied as 502) ends the terminal', a
   await env.cycle();
   await env.cycle();
 
-  assert.match(env.fetchCalls[0].url, /\/api\/federation\/peer-1\/connect\/gone$/);
+  assert.match(env.fetchCalls[0].url, /\/api\/federation\/peer-1\/connect\/gone\?reconnect=true&connection_id=lease-for-recovery$/);
   assert.ok(env.endedVisible, 'a proxied peer 404 must end the terminal');
 });
 
