@@ -42,7 +42,11 @@ uv run muxplex serve         # http://127.0.0.1:8088 — settings from ~/.config
 - **Browser caching gotcha:** assets are served with `?v=<package version>` and no
   `Cache-Control` header. Same version ⇒ browsers replay cached JS without
   revalidating. When testing frontend changes, hard-refresh (`Ctrl+Shift+R`) or bump
-  `version` in `pyproject.toml` (rotates the cache-buster for every client).
+  `version` in `pyproject.toml` (rotates the cache-buster on page reload).
+  **Already-open tabs do not auto-reload after deployment.** A lease-protocol
+  rollout requires users to close/reopen or hard-refresh stale tabs; otherwise
+  the old JavaScript can keep sending unguarded `/connect` requests and restart
+  the shared ttyd.
   **After pulling or merging a version bump, run `uv sync --extra dev` before restarting.**
   The editable install's package metadata keeps reporting the old version until then, so
   the server keeps serving the old `?v=` and the bump never reaches browsers.
@@ -223,12 +227,15 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    process exits is destroyed by tmux (`exit-empty on`), so `tmux attach -t <name>` fails
    forever and no reconnect can ever succeed. Three parts, all load-bearing:
    (a) **`POST /connect`'s status is inspected.** A **404** (local: `connect_session`
-   raises it once the ~2 s poll cache drops the name) is definitive → end the terminal.
-   Federated sessions arrive as a **502 whose detail reads `Remote returned 404`**, because
-   `federation_connect` flattens every non-2xx from the peer into 502 — so a *bare* 502 is
-   deliberately NOT enough, or a merely-sick peer would be declared dead. 503/500/network
-   errors stay retryable. Note `fetch()` resolves on a 404: a `.catch()` was never what hid
-   this, ignoring `res.status` was. Do not "simplify" back to an unconditional `.then()`.
+   checks the cached tmux membership *before* validating the connection lease, even
+   when the list is empty) is definitive → show "Session ended.". A **409** on
+   reconnect means the session/lease was replaced by another tab → show "Session
+   switched in another tab.", never retry. Federated sessions arrive as a
+   **502 whose detail reads `Remote returned 404`** for a vanished peer session;
+   other peer failures generally become 502, **except a guarded reconnect's upstream
+   409, which stays 409**. A *bare* 502 is not proof that a session died.
+   503/500/network errors remain retryable. `fetch()` resolves on HTTP errors:
+   check `res.status`, not only `.catch()`.
    (b) **`MAX_RECONNECT_ATTEMPTS = 8`** — a backstop. Never remove it in favour of (a)
    alone. (dev6 called this "cause-independent"; it was not — it depended on the counter
    climbing, see (d).)
@@ -263,12 +270,24 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    records it, step 13a kills it *outside* `state_lock`, exactly once — not once per cycle).
    Clearing the name while leaving the process alive is what made the loop self-sustaining
    with zero frontend involvement.
-   (b) `terminal_ws_proxy`'s auto-spawn **checks `get_session_list()` first**, as
-   `connect_session` always has. An unguarded respawn there regenerates the doomed process
-   on every browser reconnect.
-   Both kills remain **single-PID** (contract: never a process group, never the tmux
-   server). Safe here for a second reason: the session is already gone, so nothing live is
-   disturbed.
+   (b) `terminal_ws_proxy` checks `get_session_list()` **before lease CAS and
+   before connecting to ttyd**, even if ttyd is still listening. A vanished session
+   returns WebSocket close **4404** (ended), distinct from **4409** (stale lease /
+   session switched), with no ttyd auto-spawn. Otherwise, auto-spawn requires the
+   matching `expected_session` and `connection_id` under
+   `_ttyd_transition_lock` through upstream attachment. Federation forwards
+   both 4404 and 4409 from the remote; use `exc.rcvd.code`, not deprecated
+   `ConnectionClosed.code`. Neither close code is retryable in `terminal.js`.
+   Both kills remain **single-PID** (never a process group or tmux server).
+   (c) **Federation requires coordinated upgrades** after v0.9.6.dev11. An old
+   coordinator cannot attach to a new peer's lease-guarded WS; a new
+   coordinator rejects an old peer's absent lease. Mixed versions (including
+   unmodified upstream peers) are unsupported. Unleased fallback would
+   reintroduce cross-session input delivery. The coordinator currently holds
+   the transition lock across remote HTTP connect for navigation ordering
+   (5-second client timeout); the federated WS handshake has a 3-second open
+   timeout. Do not release the lock across remote side effects without adding
+   a revalidation/ordering protocol.
 
 10. **`GET /` must send `Cache-Control: no-cache`** (v0.9.6.dev7) — the `?v=<version>`
    cache-buster is applied to asset URLs *inside index.html*, so the scheme is load-bearing
