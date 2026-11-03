@@ -5,16 +5,19 @@ contracts, gotchas) and carries no status. GitHub Issues own item-level state; t
 referenced here by number and never restated. Per-feature design and rationale live in
 `docs/plans/`, linked below.
 
-Last updated: 2026-10-06 (checkpoint after PR #25).
+Last updated: 2026-11-03 (PR #35 in review; dev11 not merged).
 
 ## Current state
 
-- **`main` @ `4d39546`**, version **0.9.6.dev10** (`pyproject.toml`). This is a dev build;
-  the last tagged release is **0.9.5**. The dev builds since then (dev2–dev10) have no
-  release yet.
-- **Test suites, last verified green 2026-10-06 at dev10:** Python 1446,
-  `test_app.mjs` 543, `test_terminal.mjs` 66, `test_mobile_keyboard.mjs` 16. Commands are in
-  `CLAUDE.md` § Tests.
+- **`main` @ `79bbb54`**, version **0.9.6.dev10**; PR #35 proposes
+  **0.9.6.dev11** with mandatory terminal connection leases and the frontend
+  cache-buster update. **Not merged, released, or deployed.** The last tagged
+  release remains **0.9.5**.
+- **Verified baseline on main:** frontend suites 543 / 66 / 16 (review of PR #35,
+  2026-11-03). The reviewer ran 1,472 non-integration Python tests successfully
+  on PR #35 at `77ee447`, but reported five failing frontend tests there. Corrections
+  are committed after that head; **the complete updated suites are not yet verified**.
+  Commands are in `CLAUDE.md` § Tests.
 - **Start new work from `main` in a worktree.** `.worktrees/mobile-keybar-fixes` (branch
   `fix/mobile-keybar-paste-and-geometry`, merged in PR #21) is stale and can be removed.
 
@@ -22,6 +25,7 @@ Last updated: 2026-10-06 (checkpoint after PR #25).
 
 | Workstream | Status | Shipped in | Design / record |
 |---|---|---|---|
+| OSC 52 UTF-8 clipboard + lease-bound local/federated navigation (#30, #31) | **IN REVIEW**, PR #35; coordinate all peers and reload browser tabs | pending v0.9.6.dev11 | PR #35, CHANGELOG.md |
 | Header strip: every project folder as a pill, MRU order, Other Sessions folder menu (#24) | **DONE** 2026-10-06 | PR #25, v0.9.6.dev10 | `docs/plans/2026-10-06-header-project-folders-plan.md` |
 | Mobile keybar: terminal sizing for the iOS keyboard, Paste key | **DONE** 2026-09-16 | PR #21, v0.9.6.dev8–dev9 | `docs/plans/2026-07-27-mobile-terminal-keybar.md` |
 | Mobile keybar follow-ups | **OPEN**: #14, #16, #17, #18, #19, #20, #22, #23 | — | issues |
