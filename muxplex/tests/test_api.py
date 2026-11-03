@@ -4306,6 +4306,11 @@ def test_expired_session_reconnect_returns_404_before_lease_cas(
     # A completed process can leave zero tmux sessions, not just a list that
     # excludes this name; empty must still be interpreted as absent on reconnect.
     monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+
+    async def no_tmux_session(*args):
+        raise RuntimeError("session not found")
+
+    monkeypatch.setattr("muxplex.main.run_tmux", no_tmux_session)
     response = client.post(
         "/api/sessions/dead/connect?reconnect=true&connection_id=old-lease"
     )
