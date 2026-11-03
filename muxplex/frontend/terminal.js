@@ -75,10 +75,10 @@ function endTerminalSession(message) {
  * immediately. That 404 is definitive.
  *
  * Federated sessions: the local `/api/federation/{id}/connect/{name}` proxy
- * translates ANY non-2xx from the peer into a 502 "Remote returned <code>"
- * (main.py federation_connect), so the peer's 404 arrives here as a 502 whose
- * detail names the original status. A bare 502 is NOT enough — it also covers a
- * peer that is merely unhealthy, which we want to keep retrying.
+ * maps a vanished peer's 404 to 502 "Remote returned 404", preserving the
+ * original status in the detail. Guarded reconnect 409 is an exception: it
+ * remains 409 to stop a stale tab. A bare 502 is NOT enough to declare
+ * a session dead — it may mean the peer is unhealthy rather than gone.
  *
  * Everything else (503 unreachable, 500, network error) is treated as possibly
  * transient and left to the retry cap.
