@@ -6,6 +6,7 @@ State schema (all values are plain JSON-serialisable dicts):
     {
         "active_session": str | None,
         "active_remote_id": str | None,
+        "active_connection_id": str | None,  # ttyd attachment lease / epoch
         "active_view": str,  # 'all' | 'hidden' | view name
         "session_order": list[str],
         "sessions": {
@@ -66,6 +67,7 @@ def empty_state() -> dict:
     return {
         "active_session": None,
         "active_remote_id": None,
+        "active_connection_id": None,
         "active_view": "all",
         "session_order": [],
         "sessions": {},

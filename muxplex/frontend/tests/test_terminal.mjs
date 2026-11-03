@@ -48,8 +48,10 @@ function loadTerminal() {
   let capturedWsProtocols = null;
   let capturedOnDataFn = null;
   let capturedOnResizeFn = null;
+  let capturedOsc52Handler = null;
   let termWriteMessages = [];
   let lastWsInstance = null;
+  let wsCreateCount = 0;
 
   let capturedWsUrl = null;
   let onDataCallCount = 0;
@@ -69,7 +71,9 @@ function loadTerminal() {
     attachCustomKeyEventHandler: () => {},
     getSelection: () => '',
     onSelectionChange: () => {},
-    parser: { registerOscHandler: () => {} },
+    parser: { registerOscHandler: (code, fn) => {
+      if (code === 52) capturedOsc52Handler = fn;
+    } },
   };
 
   // Capture all messages sent via WebSocket.send()
@@ -78,6 +82,7 @@ function loadTerminal() {
   // WebSocket mock — captures 'close' and 'open' handlers so we can fire them manually
   class MockWebSocket {
     constructor(_url, _protocols) {
+      wsCreateCount++;
       this.readyState = 1; // OPEN
       this.binaryType = '';
       this._handlers = {};
@@ -156,11 +161,13 @@ function loadTerminal() {
     get sentMessages() { return sentMessages; },
     get capturedWsUrl() { return capturedWsUrl; },
     get capturedWsProtocols() { return capturedWsProtocols; },
+    get wsCreateCount() { return wsCreateCount; },
     get capturedOnDataFn() { return capturedOnDataFn; },
     get capturedOnResizeFn() { return capturedOnResizeFn; },
+    get osc52Handler() { return capturedOsc52Handler; },
     get termWriteMessages() { return termWriteMessages; },
     get focusCallCount() { return focusCallCount; },
-    fireClose() { if (capturedCloseHandler) capturedCloseHandler(); },
+    fireClose(code) { if (capturedCloseHandler) capturedCloseHandler(code == null ? {} : { code }); },
     fireOpen() { if (lastOpenHandler) lastOpenHandler(); },
     fireMessage(data) {
       if (lastWsInstance && lastWsInstance._handlers['message']) {
@@ -700,15 +707,17 @@ test('connectWebSocket URL uses /terminal/ws path', () => {
   const orig = globalThis.setTimeout;
   globalThis.setTimeout = (_fn, _ms) => 0;
 
-  t.openTerminal('my-session');
+  t.openTerminal('my-session', '', 14, 'lease-for-my-session');
 
   globalThis.setTimeout = orig;
 
   assert.ok(t.capturedWsUrl, 'WebSocket URL should have been captured');
   assert.ok(
-    t.capturedWsUrl.endsWith('/terminal/ws'),
-    `WebSocket URL should end with /terminal/ws, got: ${t.capturedWsUrl}`,
+    t.capturedWsUrl.startsWith('ws://localhost/terminal/ws?'),
+    `WebSocket must use /terminal/ws, got: ${t.capturedWsUrl}`,
   );
+  assert.match(t.capturedWsUrl, /expected_session=my-session/);
+  assert.match(t.capturedWsUrl, /connection_id=lease-for-my-session/);
 });
 
 test('initVisualViewport registers resize handler on window.visualViewport when present', () => {
@@ -759,15 +768,14 @@ test('connectWebSocket uses federation proxy path when remoteId is provided', ()
   const orig = globalThis.setTimeout;
   globalThis.setTimeout = (_fn, _ms) => 0;
 
-  t.openTerminal('remote-session', 'fed-abc123');
+  t.openTerminal('remote-session', 'fed-abc123', 14, 'remote-token');
 
   globalThis.setTimeout = orig;
 
-  assert.ok(t.capturedWsUrl, 'WebSocket URL should have been captured');
-  assert.strictEqual(
+  assert.equal(
     t.capturedWsUrl,
-    'ws://localhost/federation/fed-abc123/terminal/ws',
-    `WebSocket URL should be ws://localhost/federation/fed-abc123/terminal/ws, got: ${t.capturedWsUrl}`,
+    'ws://localhost/federation/fed-abc123/terminal/ws?expected_session=remote-session&connection_id=remote-token',
+    'Remote WS must carry the same lease as the remote /connect response',
   );
 });
 
@@ -870,6 +878,184 @@ test('terminal.js WebSocket reconnect awaits /connect before creating WS', () =>
     source.indexOf('function _connectWebSocket'),
   );
   assert.ok(connectFn.includes('return;'), 'connect() must return after fetch to prevent falling through to immediate WS creation');
+});
+
+// Reconnect regressions (#31): callbacks retained across a session switch
+// must never mutate server state or resurrect an obsolete WebSocket.
+test('a stale retry timer cannot reopen its previous session after a switch', () => {
+  const t = loadTerminal();
+  const oldTimeout = globalThis.setTimeout;
+  let staleRetry = null;
+  try {
+    globalThis.setTimeout = (fn, ms) => {
+      if (ms >= 1000 && !staleRetry) staleRetry = fn;
+      return 1;
+    };
+    t.openTerminal('old-chat', 'dev-old');
+    t.fireClose();
+    assert.equal(typeof staleRetry, 'function', 'old close must schedule a retry');
+    t.openTerminal('new-chat', 'dev-new');
+    const count = t.wsCreateCount;
+    staleRetry(); // simulate an already-queued browser timer despite clearTimeout
+    assert.equal(t.wsCreateCount, count, 'stale closure must not open another socket');
+    assert.match(t.capturedWsUrl, /dev-new/);
+  } finally {
+    globalThis.setTimeout = oldTimeout;
+    t.closeTerminal();
+  }
+});
+
+test('in-flight old reconnect response cannot schedule a socket for the next chat', async () => {
+  const t = loadTerminal();
+  const oldTimeout = globalThis.setTimeout;
+  const oldFetch = globalThis.fetch;
+  let completeReconnect = null;
+  const calls = [];
+  globalThis.fetch = (url) => {
+    calls.push(url);
+    return new Promise(resolve => { completeReconnect = resolve; });
+  };
+  try {
+    globalThis.setTimeout = () => 1;
+    t.openTerminal('old-chat', 'device-a');
+    // Two rapid failures trigger an HTTP /connect recovery (as opposed to
+    // merely reopening the WebSocket).
+    let retry = null;
+    globalThis.setTimeout = (fn, ms) => {
+      if (ms >= 1000) retry = fn;
+      return 1;
+    };
+    t.fireClose();
+    assert.equal(typeof retry, 'function');
+    retry();
+    t.fireClose();
+    retry();
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /device-a\/connect\/old-chat\?reconnect=true/);
+
+    t.openTerminal('new-chat', 'device-b');
+    const count = t.wsCreateCount;
+    completeReconnect({ ok: true, status: 200 });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(t.wsCreateCount, count, 'old fetch must not create a new socket');
+    assert.match(t.capturedWsUrl, /device-b/);
+  } finally {
+    globalThis.fetch = oldFetch;
+    globalThis.setTimeout = oldTimeout;
+    t.closeTerminal();
+  }
+});
+
+for (const { kind, remoteId, expectedPath } of [
+  {
+    kind: 'local',
+    remoteId: '',
+    expectedPath: '/api/sessions/alpha/connect?reconnect=true&connection_id=L1%2Bstale'
+  },
+  {
+    kind: 'federated',
+    remoteId: 'device-b',
+    expectedPath: '/api/federation/device-b/connect/alpha?reconnect=true&connection_id=L1%2Bstale'
+  },
+]) {
+  test(`${kind} reconnect POST sends its original lease and stops on 409`, async () => {
+    const t = loadTerminal();
+    const oldTimeout = globalThis.setTimeout;
+    const oldFetch = globalThis.fetch;
+    const calls = [];
+    let retry = null;
+    try {
+      globalThis.fetch = async (url) => {
+        calls.push(url);
+        return { ok: false, status: 409 };
+      };
+      globalThis.setTimeout = (fn, ms) => {
+        if (ms >= 1000) retry = fn;
+        return 1;
+      };
+      t.openTerminal('alpha', remoteId, 14, 'L1+stale');
+      t.fireClose();
+      assert.equal(typeof retry, 'function');
+      retry(); // first reconnect is direct WebSocket recovery
+      t.fireClose();
+      retry(); // second reconnect is guarded POST
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      assert.deepEqual(calls, [expectedPath],
+        'only the originating L1 lease may be sent, never a fresh server lease');
+      assert.equal(t.wsCreateCount, 2,
+        'HTTP 409 must stop further WebSocket retries');
+    } finally {
+      globalThis.fetch = oldFetch;
+      globalThis.setTimeout = oldTimeout;
+      t.closeTerminal();
+    }
+  });
+}
+
+test('a 409 reconnect rejection does not trigger repeated ttyd takeover', async () => {
+  const t = loadTerminal();
+  const oldTimeout = globalThis.setTimeout;
+  const oldFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(url);
+    return { ok: false, status: 409 };
+  };
+  try {
+    let retry = null;
+    globalThis.setTimeout = (fn, ms) => {
+      if (ms >= 1000) retry = fn;
+      return 1;
+    };
+    t.openTerminal('old-chat');
+    t.fireClose();
+    retry();
+    t.fireClose();
+    retry();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(calls.length, 1);
+    assert.equal(t.wsCreateCount, 2, 'CAS rejection must not create another socket');
+  } finally {
+    globalThis.fetch = oldFetch;
+    globalThis.setTimeout = oldTimeout;
+    t.closeTerminal();
+  }
+});
+
+test('the terminal encodes Unicode expected session and lease in every initial handshake', () => {
+  const t = loadTerminal();
+  const old = globalThis.setTimeout;
+  try {
+    globalThis.setTimeout = () => 0;
+    t.openTerminal('prøve mü', 'fed-xyz', 14, 'token+equals=');
+    assert.match(t.capturedWsUrl, /expected_session=pr%C3%B8ve%20m%C3%BC/);
+    assert.match(t.capturedWsUrl, /connection_id=token%2Bequals%3D/);
+    assert.match(t.capturedWsUrl, /\/federation\/fed-xyz\/terminal\/ws\?/);
+  } finally {
+    globalThis.setTimeout = old;
+    t.closeTerminal();
+  }
+});
+
+test('4409 from an initial WebSocket attach stops retries instead of hijacking ttyd', () => {
+  const t = loadTerminal();
+  const old = globalThis.setTimeout;
+  try {
+    globalThis.setTimeout = () => 0;
+    t.openTerminal('alpha', '', 14, 'stale-lease');
+    const opened = t.wsCreateCount;
+    t.fireClose(4409);
+    t.fireReconnect();
+    assert.equal(t.wsCreateCount, opened, 'stale socket may not retry');
+  } finally {
+    globalThis.setTimeout = old;
+    t.closeTerminal();
+  }
 });
 
 // --- Reconnect counter: must reset on message, not on open ---
@@ -980,6 +1166,59 @@ test('terminal.js registers OSC 52 handler for tmux clipboard bridge', () => {
     source.includes('atob'),
     'must decode base64 OSC 52 clipboard payload with atob()',
   );
+});
+
+// Actual OSC 52 integration: execute the registered parser callback, not just
+// inspect source for atob/registerOscHandler tokens (regression #30).
+test('OSC 52 copies UTF-8 text exactly, including box drawings, CJK and emoji', () => {
+  const t = loadTerminal();
+  const copied = [];
+  const oldClipboard = globalThis.navigator && globalThis.navigator.clipboard;
+  const oldTimeout = globalThis.setTimeout;
+  globalThis.navigator.clipboard = { writeText: (value) => {
+    copied.push(value);
+    return Promise.resolve();
+  } };
+  try {
+    globalThis.setTimeout = () => 1; // suppress unrelated initial-fit timers
+    t.openTerminal('unicode-copy');
+    assert.equal(typeof t.osc52Handler, 'function');
+    const unicode = '┌─┬─┐ │✓│…│ └─┴─┘ é “quotes” 日本語 😀';
+    assert.equal(t.osc52Handler('c;' + Buffer.from(unicode, 'utf8').toString('base64')), true);
+    assert.deepEqual(copied, [unicode], 'copy must contain Unicode code points, not UTF-8 byte-valued characters');
+    assert.doesNotMatch(copied[0], /[\u0080-\u009f]/, 'UTF-8 mojibake must not introduce C1 controls');
+    assert.equal(t.osc52Handler('c;' + Buffer.from('ASCII only', 'utf8').toString('base64')), true);
+    assert.equal(copied[1], 'ASCII only');
+  } finally {
+    globalThis.setTimeout = oldTimeout;
+    if (oldClipboard === undefined) delete globalThis.navigator.clipboard;
+    else globalThis.navigator.clipboard = oldClipboard;
+    t.closeTerminal();
+  }
+});
+
+test('OSC 52 ignores clipboard queries, empty and malformed payloads without overwriting', () => {
+  const t = loadTerminal();
+  const copied = [];
+  const oldClipboard = globalThis.navigator && globalThis.navigator.clipboard;
+  const oldTimeout = globalThis.setTimeout;
+  globalThis.navigator.clipboard = { writeText: (value) => {
+    copied.push(value);
+    return Promise.resolve();
+  } };
+  try {
+    globalThis.setTimeout = () => 1;
+    t.openTerminal('unicode-copy');
+    for (const payload of ['c;?', 'c;', 'c;not@base64!', 'c;//8=']) {
+      assert.equal(t.osc52Handler(payload), true);
+    }
+    assert.deepEqual(copied, [], 'no clipboard write for a query, empty or malformed UTF-8');
+  } finally {
+    globalThis.setTimeout = oldTimeout;
+    if (oldClipboard === undefined) delete globalThis.navigator.clipboard;
+    else globalThis.navigator.clipboard = oldClipboard;
+    t.closeTerminal();
+  }
 });
 
 // --- Clickable URLs via xterm-addon-web-links ---
@@ -1522,14 +1761,16 @@ function createReconnectEnv(fetchImpl) {
       globalThis.setTimeout = (cb, _ms) => { pendingTimer = cb; return 0; };
       try { fn(); } finally { globalThis.setTimeout = orig; }
     },
-    open(name, remoteId) {
-      env.withTimeout(() => globalThis.window._openTerminal(name, remoteId));
+    open(name, remoteId, lease = 'lease-for-recovery') {
+      env.withTimeout(() => globalThis.window._openTerminal(name, remoteId, 14, lease));
     },
     /** Fire the close handler of the most recent WebSocket. */
-    fireClose() {
+    fireClose(code) {
       const ws = wsInstances[wsInstances.length - 1];
       pendingTimer = null;
-      env.withTimeout(() => { if (ws && ws._handlers['close']) ws._handlers['close'](); });
+      env.withTimeout(() => {
+        if (ws && ws._handlers['close']) ws._handlers['close'](code ? { code } : {});
+      });
     },
     /** Run the pending timer callback (reconnect, or the 800ms post-/connect settle). */
     runTimer() {
@@ -1601,6 +1842,27 @@ function createReconnectEnv(fetchImpl) {
   return env;
 }
 
+for (const { closeCode, expectedMessage } of [
+  { closeCode: 4404, expectedMessage: 'Session ended.' },
+  { closeCode: 4409, expectedMessage: 'Session switched in another tab.' },
+]) {
+  test(`WebSocket ${closeCode} is terminal and explains the actual cause`, async () => {
+    const env = createReconnectEnv(() => {
+      throw new Error('a definitive WS close must not start a recovery POST');
+    });
+    env.open('alpha', '', 'lease-alpha');
+    env.fireClose(closeCode);
+    assert.ok(env.endedVisible, 'fatal close must show the terminal-ended overlay');
+    assert.strictEqual(env.endedMessage, expectedMessage);
+    assert.ok(!env.hasPendingTimer, 'fatal close must not schedule another socket');
+    assert.strictEqual(env.fetchCalls.length, 0);
+    const sockets = env.wsInstances.length;
+    env.runTimer();
+    assert.strictEqual(env.wsInstances.length, sockets,
+      'terminal may not resurrect after a definitive close');
+  });
+}
+
 test('POST /connect returning 404 ends the terminal instead of reconnecting forever', async () => {
   // The tmux session was destroyed, so main.py connect_session raises
   // 404 "Session 'x' not found". Before the fix this response was never even
@@ -1616,7 +1878,7 @@ test('POST /connect returning 404 ends the terminal instead of reconnecting fore
   await env.cycle();
 
   assert.strictEqual(env.fetchCalls.length, 1, '/connect must have been POSTed once');
-  assert.match(env.fetchCalls[0].url, /\/api\/sessions\/dead\/connect$/);
+  assert.match(env.fetchCalls[0].url, /\/api\/sessions\/dead\/connect\?reconnect=true&connection_id=lease-for-recovery$/);
   assert.ok(env.endedVisible, 'a 404 from /connect must show the session-ended overlay');
   assert.strictEqual(env.endedMessage, 'Session ended.');
 
@@ -1660,7 +1922,7 @@ test('federated /connect: a peer-side 404 (proxied as 502) ends the terminal', a
   await env.cycle();
   await env.cycle();
 
-  assert.match(env.fetchCalls[0].url, /\/api\/federation\/peer-1\/connect\/gone$/);
+  assert.match(env.fetchCalls[0].url, /\/api\/federation\/peer-1\/connect\/gone\?reconnect=true&connection_id=lease-for-recovery$/);
   assert.ok(env.endedVisible, 'a proxied peer 404 must end the terminal');
 });
 

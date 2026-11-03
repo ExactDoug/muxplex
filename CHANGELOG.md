@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.9.6.dev11 (unreleased; PR #35, 2026-11-03) — clipboard and session identity
+
+### Bug fixes
+
+- **OSC 52 clipboard fidelity (#30):** decode UTF-8 payloads correctly; malformed, empty,
+  and unsupported OSC 52 requests do not change the clipboard.
+- **Session navigation races (#31):** serialize navigation and Back against ttyd transitions
+  and bind the initial local/federated WebSocket to the server-issued connection lease.
+  A delayed or stale tab cannot attach to another session's ttyd. Recovery POSTs must
+  present their original lease and receive HTTP 409 without restarting ttyd if it changed
+  (including alpha → beta → alpha).
+- **Dead sessions have a distinct terminal reason:** a missing local tmux session
+  responds with HTTP 404 on reconnect and WebSocket close code 4404, including after
+  the poll clears its active state. Federated WS relays 4404 from the remote; a stale
+  lease / intentional session switch still uses 4409. The browser shows "Session ended."
+  for 4404 and "Session switched in another tab." for 4409.
+- **Remote reconnect conflicts:** preserve an upstream HTTP 409 instead of converting
+  it to 502; reject unexpected lease changes and use the nondeprecated WebSocket
+  close-frame fields for forwarding.
+
+### Deployment and interoperability
+
+- **Frontend cache-buster bump:** the version is 0.9.6.dev11. After updating the
+  server, run `uv sync --extra dev` to refresh editable package metadata before
+  restarting, so `?v=0.9.6.dev11` is served. Existing already-open browser tabs
+  do **not** automatically reload; close/reopen or hard-refresh them during rollout.
+  Otherwise old JavaScript may retry session-agnostic sockets and replace ttyd.
+- **Federation compatibility is intentionally breaking in both directions.**
+  A new coordinator rejects older peers that lack a connection lease; an older
+  coordinator cannot attach to a new peer's lease-guarded WebSocket. Upgrade all
+  federated muxplex instances together; do not mix versions. Unmodified upstream
+  `bkrabach/muxplex` instances cannot federate with this lease-enforcing fork
+  until they support the same protocol. Do **not** bypass lease validation for
+  compatibility: doing so reintroduces cross-session typing.
+- **Same-session navigation from another device:** each new navigation (even to the
+  same tmux name) issues a new lease. Other browser tabs may briefly show the
+  "Session switched in another tab." overlay before polling follows the new lease.
+- **Coordinator lock limitation:** the federated HTTP connect still holds the
+  transition lock while waiting for the peer (client timeout 5 seconds) to
+  preserve serialized navigation. Federation WebSocket handshakes now have an
+  explicit 3-second open timeout; moving remote I/O outside the lock requires
+  a separate ordering-safe design.
+
 ## v0.9.6.dev10 (2026-10-06) — dev build
 
 The terminal-view header strip now shows **every project folder**, most recently used

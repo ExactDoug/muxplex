@@ -125,7 +125,14 @@ let _deviceId = '';
 let _currentSessions = [];
 let _viewingSession = null;
 let _viewingRemoteId = '';
-let _lastLocalOpenAt = 0;  // Date.now() of the last user-initiated openSession (reconcile race-guard)
+let _lastLocalOpenAt = 0;  // Last local navigation commit (reconcile grace guard)
+// A single browser must not overlap /connect mutations on the shared ttyd.
+// Intents are coalesced before starting, and in-flight mutations finish in
+// order; stale continuations are never allowed to re-mount the terminal.
+let _navigationSeq = 0;
+let _pendingNavigationId = 0;
+let _navigationQueue = Promise.resolve();
+let _lastCommittedNavigation = null; // {name, remoteId, connectionId} from server
 let _viewMode = 'grid';
 let _lastInteractionAt = Date.now() / 1000;
 let _pollingTimer;
@@ -377,21 +384,35 @@ function setConnectionStatus(level) {
  * @returns {Promise<void>}
  */
 async function reconcileViewingSession(viewing) {
-  if (Date.now() - _lastLocalOpenAt < RECONCILE_GRACE_MS) return;
+  if (_pendingNavigationId || Date.now() - _lastLocalOpenAt < RECONCILE_GRACE_MS) return;
+  const observedNavigation = _navigationSeq;
   try {
-    let serverName, serverRid;
+    let serverName, serverRid, serverLease;
     if (viewing) {
       serverName = viewing.name || null;
       serverRid = viewing.remoteId || '';
+      serverLease = viewing.connectionId || '';
     } else {
       const res = await api('GET', '/api/state');
       const state = await res.json();
       serverName = state.active_session || null;
-      serverRid = state.active_remote_id || '';
+      serverRid = state.active_remote_id == null ? '' : String(state.active_remote_id);
+      serverLease = state.active_connection_id || '';
     }
-    if (!serverName) return;
-    if (serverName === _viewingSession && serverRid === (_viewingRemoteId || '')) return;
-    await openSession(serverName, { remoteId: serverRid, skipAnimation: true, reconcileOnly: true });
+    // A state fallback GET can finish after a new local click. Never adopt its
+    // stale result, and never follow an old poll during a pending navigation.
+    if (observedNavigation !== _navigationSeq || _pendingNavigationId ||
+        Date.now() - _lastLocalOpenAt < RECONCILE_GRACE_MS) return;
+    // Never adopt a session without a server-issued ttyd attachment lease:
+    // that would allow a legacy session-agnostic WebSocket to hit the wrong chat.
+    if (!serverName || !serverLease) return;
+    if (serverName === _viewingSession && serverRid === (_viewingRemoteId || '') &&
+        _lastCommittedNavigation &&
+        _lastCommittedNavigation.connectionId === serverLease) return;
+    await openSession(serverName, {
+      remoteId: serverRid, connectionId: serverLease,
+      skipAnimation: true, reconcileOnly: true
+    });
   } catch (err) {
     // Non-fatal: pollSessions owns connection-status; a failed reconcile just
     // leaves local state as-is until the next poll retries.
@@ -413,7 +434,12 @@ function readViewingHeaders(res) {
     const rawName = h.get('X-Muxplex-Active-Session');
     if (rawName === null || rawName === undefined) return null;
     const rawRid = h.get('X-Muxplex-Active-Remote-Id') || '';
-    return { name: decodeURIComponent(rawName) || null, remoteId: decodeURIComponent(rawRid) };
+    const rawLease = h.get('X-Muxplex-Active-Connection-Id') || '';
+    return {
+      name: decodeURIComponent(rawName) || null,
+      remoteId: decodeURIComponent(rawRid),
+      connectionId: decodeURIComponent(rawLease)
+    };
   } catch (_) {
     return null;
   }
@@ -427,6 +453,7 @@ function readViewingHeaders(res) {
  * @returns {Promise<void>}
  */
 async function pollSessions() {
+  const pollNavigation = _navigationSeq;
   try {
     var endpoint = (_serverSettings && _serverSettings.multi_device_enabled)
       ? '/api/federation/sessions'
@@ -458,7 +485,8 @@ async function pollSessions() {
     updatePageTitle();
     // Follow cross-browser session switches: while viewing a session, adopt the
     // server's shared active_session if another client repointed the shared ttyd.
-    if (_viewMode === 'fullscreen' && _viewingSession != null) await reconcileViewingSession(viewing);
+    if (_viewMode === 'fullscreen' && _viewingSession != null &&
+        pollNavigation === _navigationSeq) await reconcileViewingSession(viewing);
   } catch (err) {
     _pollFailCount++;
     setConnectionStatus(_pollFailCount <= 2 ? 'warn' : 'err');
@@ -3726,29 +3754,59 @@ function _clearZoomTileStyles(tile) {
  * @param {boolean} [opts.skipAnimation] - if true, skip the zoom animation (e.g. on page restore)
  * @returns {Promise<void>}
  */
+/**
+ * Serialize this browser's mutations of the shared ttyd. Coalesce requests
+ * that were superseded before they reached the server; never assume aborting
+ * a fetch would undo a kill/spawn the server has already begun.
+ */
+function _queueNavigationMutation(navigationId, mutation) {
+  var result = _navigationQueue.then(function() {
+    if (_navigationSeq !== navigationId) return null;
+    return mutation();
+  });
+  _navigationQueue = result.catch(function() {});
+  return result;
+}
+
 async function openSession(name, opts = {}) {
   if (!name || !name.trim()) return;
-  // reconcileOnly: follow the server's shared active_session WITHOUT POSTing
-  // /connect or PATCHing state — used by reconcileViewingSession to adopt a
-  // switch made by another browser/tab. A user-initiated open stamps the
-  // race-guard so an in-flight PATCH isn't read back stale.
-  if (!opts.reconcileOnly) _lastLocalOpenAt = Date.now();
+  var remoteId = opts.remoteId != null ? String(opts.remoteId) : '';
+  var _deviceId = remoteId; // federation device ID, never a positional array index
+  var connectionId = opts.connectionId || '';
+  if (opts.reconcileOnly && !connectionId) return; // never mount an unbound terminal
+  var navId = ++_navigationSeq;
+  var oldName = _viewingSession;
+  var oldRid = _viewingRemoteId || '';
+  // A local request remains protected from poll reconciliation until it is
+  // ACKed by the server, however long the request takes.
+  if (!opts.reconcileOnly) {
+    _pendingNavigationId = navId;
+    _lastLocalOpenAt = Date.now();
+  } else {
+    _pendingNavigationId = 0;
+    _lastCommittedNavigation = {
+      name: name, remoteId: remoteId, connectionId: connectionId
+    };
+  }
   hidePreview();
   _viewingSession = name;
-  _viewingRemoteId = opts.remoteId != null ? opts.remoteId : '';
+  _viewingRemoteId = remoteId;
   _viewMode = 'fullscreen';
 
-  // Pre-render sidebar with current sessions before first poll tick
-  initSidebar();
-  renderSidebar(_currentSessions, name, _viewingRemoteId);
+  // Don't let typing while B is connecting go to A's still-mounted terminal.
+  if ((oldName !== name || oldRid !== remoteId) && window._closeTerminal) {
+    window._closeTerminal();
+  }
 
-  // Update expanded header
+  initSidebar();
+  renderSidebar(_currentSessions, name, remoteId);
   const nameEl = $('expanded-session-name');
   if (nameEl) nameEl.textContent = name;
   renderExpandedHeaderPills();
 
-  // Zoom: animate the grid tile to fullscreen. _findZoomTile scopes by name+remoteId (see its doc).
-  let tile = opts.skipAnimation ? null : _findZoomTile(name, opts.remoteId);
+  // The grid animation is visual only. A superseded animation must never
+  // render a stale session (or re-open fullscreen after Back was pressed).
+  let tile = opts.skipAnimation ? null : _findZoomTile(name, remoteId);
   if (tile) {
     const rect = tile.getBoundingClientRect();
     tile.style.position = 'fixed';
@@ -3757,7 +3815,6 @@ async function openSession(name, opts = {}) {
     tile.style.width = rect.width + 'px';
     tile.style.height = rect.height + 'px';
     tile.style.transition = 'none';
-    // Force reflow
     void tile.offsetWidth;
     tile.style.transition = 'all 250ms ease';
     tile.style.top = '0';
@@ -3766,123 +3823,149 @@ async function openSession(name, opts = {}) {
     tile.style.height = '100vh';
   }
 
-  // Start animation concurrently with /connect POST — resolve when view is ready
-  var animDone = new Promise(function (resolve) {
-    var timerId = setTimeout(function () {
+  var animDone = new Promise(function(resolve) {
+    var timerId = setTimeout(function() {
+      if (navId !== _navigationSeq || _viewMode !== 'fullscreen') {
+        _clearZoomTileStyles(tile);
+        resolve();
+        return;
+      }
       var overview = $('view-overview');
       var expanded = $('view-expanded');
       if (overview) overview.style.display = 'none';
       if (expanded) {
-        expanded.classList.remove('hidden');     // must remove class — !important wins over style.display
-        expanded.classList.add('view--active');  // makes it display:flex
+        expanded.classList.remove('hidden');
+        expanded.classList.add('view--active');
       }
       _clearZoomTileStyles(tile);
-      // Re-render sidebar after DOM is visible and dimensions are correct
       initSidebar();
-      renderSidebar(_currentSessions, name, _viewingRemoteId);
+      renderSidebar(_currentSessions, name, remoteId);
       resolve();
     }, opts.skipAnimation ? 0 : 260);
-    // If setTimeout is stubbed (e.g. in test env), resolve immediately so we don't hang
-    if (timerId == null) resolve();
+    if (timerId == null) resolve(); // node test mocks without timers
   });
 
-  // Mobile pill
   if (isMobile()) {
     const pill = $('session-pill');
     if (pill) {
-      pill.classList.remove('hidden');         // pill starts with hidden class
-      const pillLabel = $('session-pill-label');
-      if (pillLabel) pillLabel.textContent = name;
+      pill.classList.remove('hidden');
+      const label = $('session-pill-label');
+      if (label) label.textContent = name;
     }
     updatePillBell();
     updateSessionPill(_currentSessions);
   }
-
-  // Hide FAB during fullscreen session view
   const fab = $('new-session-fab');
   if (fab) fab.classList.add('hidden');
 
-  // Always spawn ttyd for this session — ensures correct session after service restart or page restore
-  // _deviceId holds the device_id string (was integer remoteId index in old protocol)
-  var _deviceId = opts.remoteId != null ? opts.remoteId : '';
-  // reconcileOnly skips ALL of the connect/PATCH/bell network writes: the shared
-  // ttyd is already serving this session (another client repointed it) and our
-  // PATCH would just echo the value we're following. We still re-mount the
-  // terminal below so this browser's xterm + terminal.js target re-sync client-side.
   if (!opts.reconcileOnly) {
     try {
+      var connected = await _queueNavigationMutation(navId, async function() {
+        var response;
+        if (remoteId !== '') {
+          response = await api('POST', '/api/federation/' + encodeURIComponent(remoteId) +
+            '/connect/' + encodeURIComponent(name));
+        } else {
+          response = await api('POST', '/api/sessions/' + encodeURIComponent(name) + '/connect');
+        }
+        // Real fetch Responses always expose json(). Do not silently accept a
+        // peer which cannot provide a lease: we'd be unable to bind the socket.
+        if (!response || typeof response.json !== 'function') {
+          throw new Error('Invalid /connect response: missing connection identity');
+        }
+        var info = await response.json();
+        var lease = info && info.connection_id;
+        if (typeof lease !== 'string' || !lease) {
+          throw new Error('Server missing connection_id; upgrade muxplex instances');
+        }
+        // Record even a superseded response: a queued Back may need to close
+        // this connection after a later, not-yet-started intent was canceled.
+        _lastCommittedNavigation = { name: name, remoteId: remoteId, connectionId: lease };
+        return lease;
+      });
+      if (!connected || navId !== _navigationSeq) return;
+      connectionId = connected;
       if (_deviceId !== '') {
-        // Remote session: route connect POST through same-origin federation proxy
-        await api('POST', '/api/federation/' + encodeURIComponent(_deviceId) + '/connect/' + encodeURIComponent(name));
-      } else {
-        await api('POST', '/api/sessions/' + encodeURIComponent(name) + '/connect');
+        api('POST', '/api/federation/' + encodeURIComponent(_deviceId) +
+          '/sessions/' + encodeURIComponent(name) + '/bell/clear').catch(function() {});
       }
     } catch (err) {
+      if (navId !== _navigationSeq) return; // stale failure must not close B
       showToast(err.message || 'Connection failed');
-      return closeSession();
-    }
-
-    // Persist active_remote_id so restoreState() can reopen remote sessions after page refresh
-    api('PATCH', '/api/state', { active_session: name, active_remote_id: _deviceId || null }).catch(function() {});
-
-    // Fire-and-forget bell-clear for remote sessions — acknowledge bells on the remote server
-    if (_deviceId !== '') {
-      api('POST', '/api/federation/' + encodeURIComponent(_deviceId) + '/sessions/' + encodeURIComponent(name) + '/bell/clear').catch(function() {});
+      return closeSession({ skipDisconnect: true });
+    } finally {
+      if (_pendingNavigationId === navId) {
+        _pendingNavigationId = 0;
+        // Start the grace after commit, not when the user first clicked. A
+        // slow /connect must never be overridden by a stale poll header.
+        _lastLocalOpenAt = Date.now();
+      }
     }
   }
 
-  // Wait for animation to finish (may already be done if /connect was slow)
   await animDone;
-
-  // Mount terminal NOW — /connect has completed, new ttyd is serving the correct session
-  if (window._openTerminal) window._openTerminal(name, _deviceId, getDisplaySettings().fontSize);
+  if (navId !== _navigationSeq || _viewMode !== 'fullscreen') return;
+  // /connect has completed and the server's active identity is authoritative.
+  if (window._openTerminal) {
+    window._openTerminal(name, remoteId, getDisplaySettings().fontSize, connectionId);
+  }
 }
 
 /**
  * Close the current session and return to the grid view.
  * @returns {Promise<void>}
  */
-function closeSession() {
+function closeSession(opts = {}) {
+  const hadSession = _viewingSession != null;
+  const navId = ++_navigationSeq;
+  _pendingNavigationId = 0;
   _viewMode = 'grid';
   _viewingSession = null;
-  renderExpandedHeaderPills(); // clears the strip + closes any open pill dropdown
+  renderExpandedHeaderPills();
 
   if (window._closeTerminal) window._closeTerminal();
 
-  // Fire-and-forget DELETE — skip for remote sessions (they don't need to know we stopped watching)
-  if (_viewingRemoteId === '') {
-    api('DELETE', '/api/sessions/current').catch(function() {});
+  // The queue serializes Back against an already-started /connect. Use the
+  // last ACKed identity, not an uncommitted pill selection; the server only
+  // disconnects when that exact name+remoteId is STILL active. A stale tab
+  // cannot kill a newer tab's ttyd. A remote close clears coordinator state
+  // without killing the remote machine's ttyd.
+  var disconnectDone = Promise.resolve();
+  if (!opts.skipDisconnect && hadSession) {
+    disconnectDone = _queueNavigationMutation(navId, function() {
+      var connected = _lastCommittedNavigation;
+      if (!connected) return null;
+      var url = '/api/sessions/current?expected_session=' +
+        encodeURIComponent(connected.name) + '&expected_remote_id=' +
+        encodeURIComponent(connected.remoteId) + '&expected_connection_id=' +
+        encodeURIComponent(connected.connectionId || '');
+      return api('DELETE', url).then(function() {
+        if (navId === _navigationSeq) _lastCommittedNavigation = null;
+      });
+    }).catch(function() {});
   }
-  // Clear active_remote_id so a page refresh does not attempt to reopen the remote session
-  api('PATCH', '/api/state', { active_session: null, active_remote_id: null }).catch(function() {});
-  _viewingRemoteId = '';
 
+  _viewingRemoteId = '';
   const expanded = $('view-expanded');
   const overview = $('view-overview');
   if (expanded) {
     expanded.classList.add('hidden');
     expanded.classList.remove('view--active');
   }
-  if (overview) overview.style.display = '';  // overview uses view--active (no !important), style.display clears fine
-
-  // Reapply fit layout after overview becomes visible again
-  var _closDs = getDisplaySettings();
-  if ((_closDs.viewMode || 'auto') === 'fit') {
-    var _closGrid = document.getElementById('session-grid');
-    if (_closGrid) {
-      _closGrid.classList.add('session-grid--fit');
-      applyFitLayout(_closGrid);
+  if (overview) overview.style.display = '';
+  var ds = getDisplaySettings();
+  if ((ds.viewMode || 'auto') === 'fit') {
+    var grid = document.getElementById('session-grid');
+    if (grid) {
+      grid.classList.add('session-grid--fit');
+      applyFitLayout(grid);
     }
   }
-
   const pill = $('session-pill');
   if (pill) pill.classList.add('hidden');
-
-  // Restore FAB when returning to overview
   const fab = $('new-session-fab');
   if (fab) fab.classList.remove('hidden');
-
-  return Promise.resolve();
+  return disconnectDone;
 }
 
 /** Test-only helper: set _viewingSession directly. */
@@ -3893,6 +3976,11 @@ function _setViewingSession(name) {
 /** Test-only helper: set _lastLocalOpenAt (the reconcile grace window). */
 function _setLastLocalOpenAt(ts) {
   _lastLocalOpenAt = ts;
+}
+
+/** Test-only helper: establish the server-ACKed identity for convergence checks. */
+function _setLastCommittedNavigation(connected) {
+  _lastCommittedNavigation = connected;
 }
 
 /** Test-only helper: read _viewingSession directly. */
@@ -4404,6 +4492,32 @@ function _epPillRoots() {
   if (nav) roots.push(nav);
   if (otherHost) roots.push(otherHost);
   return roots;
+}
+
+// A poll can reorder/rebuild pill/menu DOM between pointerdown and click.
+// Never turn a press on A into a click on B merely because B now occupies the
+// same pixel. Keyboard-initiated clicks (detail === 0) are unaffected.
+let _epPointerIdentity = null;
+function _epActionIdentity(target) {
+  var el = target && target.closest && target.closest('[data-rename], [data-session], [data-pill-menu], [data-sub-key]');
+  if (!el || !el.dataset) return '';
+  var d = el.dataset;
+  if (d.rename != null) return 'rename\u0000' + (d.remoteId || '') + '\u0000' + (d.session || '');
+  if (d.session != null) return 'session\u0000' + (d.remoteId || '') + '\u0000' + d.session;
+  if (d.pillMenu != null) return 'menu\u0000' + d.pillMenu;
+  if (d.subKey != null) return 'folder\u0000' + d.subKey;
+  return '';
+}
+function _epRecordPointerDown(e) {
+  if (e.button != null && e.button !== 0) return;
+  _epPointerIdentity = _epActionIdentity(e.target);
+}
+function _epClickMatchesPointer(e) {
+  if (e.detail === 0) { _epPointerIdentity = null; return true; }
+  if (_epPointerIdentity === null) return true;
+  var allowed = _epActionIdentity(e.target) === _epPointerIdentity;
+  _epPointerIdentity = null;
+  return allowed;
 }
 
 /** Find an element under `roots` whose `attr` EQUALS `value` — compared, never
@@ -6763,6 +6877,7 @@ function bindStaticEventListeners() {
   // the hosts are static, so listeners attach ONCE here — contract #3). The
   // Other Sessions pill lives in its own host outside the scrolling strip.
   function onPillHostClick(e) {
+    if (!_epClickMatchesPointer(e)) return;
     var menuPill = e.target.closest && e.target.closest('[data-pill-menu]');
     if (menuPill) {
       _epToggleMenu(menuPill);
@@ -6787,6 +6902,7 @@ function bindStaticEventListeners() {
   var expandedPillMenu = $('expanded-pill-menu');
   if (expandedPillMenu) {
     expandedPillMenu.addEventListener('click', function (e) {
+      if (!_epClickMatchesPointer(e)) return;
       var subRow = e.target.closest && e.target.closest('[data-sub-key]');
       if (subRow) {
         _epSubRowClick(subRow.getAttribute('data-sub-key'));
@@ -6800,10 +6916,20 @@ function bindStaticEventListeners() {
   }
   var expandedPillSubmenu = $('expanded-pill-submenu');
   if (expandedPillSubmenu) {
-    expandedPillSubmenu.addEventListener('click', _epHandleMenuSessionClick);
+    expandedPillSubmenu.addEventListener('click', function(e) {
+      if (_epClickMatchesPointer(e)) _epHandleMenuSessionClick(e);
+    });
     // Pointer reached the open submenu — cancel any pending hover switch
     expandedPillSubmenu.addEventListener('pointerover', _epClearSubmenuTimer);
   }
+
+  // Capture the identity at pointer-down on the static hosts. This guards
+  // against a poll-driven DOM replacement/reorder changing the click target.
+  [expandedPills, expandedPillsOther, expandedPillMenu, expandedPillSubmenu].forEach(function(host) {
+    if (!host) return;
+    host.addEventListener('pointerdown', _epRecordPointerDown);
+    host.addEventListener('pointercancel', function() { _epPointerIdentity = null; });
+  });
 
   // Click-outside closes the expanded-header pill dropdown (and submenu).
   // Escape is handled in handleGlobalKeydown, which owns the whole precedence
@@ -7379,6 +7505,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _setViewingSession,
     _getViewingSession,
     _setLastLocalOpenAt,
+    _setLastCommittedNavigation,
     handleGlobalKeydown,
     bindStaticEventListeners,
     openBottomSheet,
@@ -7464,6 +7591,9 @@ if (typeof module !== 'undefined' && module.exports) {
     _epSubRowHover,
     _epFindByAttr,
     _epUniqueSessionCount,
+    _epActionIdentity,
+    _epRecordPointerDown,
+    _epClickMatchesPointer,
     _getExpandedPillMenuFor: function () { return _expandedPillMenuFor; },
     _getExpandedPillSubmenuFor: function () { return _expandedPillSubmenuFor; },
     _setViewingRemoteId,

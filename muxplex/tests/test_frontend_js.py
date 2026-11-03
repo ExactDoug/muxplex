@@ -1844,7 +1844,7 @@ def test_js_open_session_hides_fab() -> None:
 def test_js_close_session_restores_fab() -> None:
     """closeSession must remove 'hidden' class from the FAB element."""
     match = re.search(
-        r"function closeSession\s*\(\s*\)\s*\{(.*?)\n\}",
+        r"function closeSession\s*\([^)]*\)\s*\{(.*?)\n\}",
         _JS,
         re.DOTALL,
     )

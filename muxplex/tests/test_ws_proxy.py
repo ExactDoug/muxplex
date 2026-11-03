@@ -50,6 +50,18 @@ def patch_startup_and_state(tmp_path, monkeypatch):
     monkeypatch.setattr("muxplex.state.STATE_DIR", tmp_state_dir)
     monkeypatch.setattr("muxplex.state.STATE_PATH", tmp_state_path)
 
+    # Valid ttyd lease for all relay tests. Tests that exercise a mismatch
+    # override the state; no unit test touches a real ttyd listener.
+    from muxplex.state import empty_state, save_state
+    state = empty_state()
+    state["active_session"] = "test-session"
+    state["active_connection_id"] = "test-lease"
+    save_state(state)
+    monkeypatch.setattr("muxplex.main._ttyd_transition_lock", asyncio.Lock())
+    monkeypatch.setattr("muxplex.main._ttyd_is_listening", lambda: True)
+    # WS validates tmux membership even if the ttyd listener is still alive.
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["test-session"])
+
     # Redirect PID files
     tmp_pid_dir = tmp_path / "ttyd"
     tmp_pid_path = tmp_pid_dir / "ttyd.pid"
@@ -214,7 +226,8 @@ def test_ws_proxy_auto_spawns_ttyd_when_dead(monkeypatch):
     # Patch load_state to return state with active_session
     monkeypatch.setattr(
         "muxplex.main.load_state",
-        lambda: {"active_session": "test-session", "sessions": {}, "session_order": []},
+        lambda: {"active_session": "test-session", "active_connection_id": "test-lease",
+                 "sessions": {}, "session_order": []},
     )
     # The session must be KNOWN for the proxy to respawn for it.  Pinned
     # explicitly rather than relying on the module-global session cache, which
@@ -222,7 +235,7 @@ def test_ws_proxy_auto_spawns_ttyd_when_dead(monkeypatch):
     monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["test-session"])
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as _:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as _:
             pass
 
     assert spawn_calls == ["test-session"], (
@@ -263,19 +276,71 @@ def test_ws_proxy_refuses_to_spawn_ttyd_for_vanished_session(monkeypatch):
     # State still names the dead session; the live session list no longer has it.
     monkeypatch.setattr(
         "muxplex.main.load_state",
-        lambda: {"active_session": "ghost", "sessions": {}, "session_order": []},
+        lambda: {"active_session": "ghost", "active_connection_id": "test-lease",
+                 "sessions": {}, "session_order": []},
     )
     monkeypatch.setattr(
         "muxplex.main.get_session_list", lambda: ["alive-1", "alive-2"]
     )
 
+    async def missing_tmux(*args):
+        raise RuntimeError("ghost does not exist")
+
+    monkeypatch.setattr("muxplex.main.run_tmux", missing_tmux)
+
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as _:
-            pass
+        with c.websocket_connect("/terminal/ws?expected_session=ghost&connection_id=test-lease") as ws:
+            assert ws.receive()["code"] == 4404
 
     assert spawn_calls == [], (
         "spawn_ttyd must NOT be called for a session missing from the live list"
     )
+
+
+def test_ws_vanished_after_poll_cleared_active_lease_reports_4404(monkeypatch):
+    """A dead tmux session is ended, not a stale tab, even after poll reaping."""
+    from muxplex.state import empty_state, save_state
+    save_state(empty_state())  # poll already cleared name and connection lease
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["still-live"])
+
+    async def missing_tmux(*args):
+        raise RuntimeError("dead session does not exist")
+
+    monkeypatch.setattr("muxplex.main.run_tmux", missing_tmux)
+    attaches = []
+    monkeypatch.setattr(
+        "muxplex.main.websockets.connect",
+        lambda *args, **kwargs: attaches.append(args[0]) or FakeTtydWs(responses=[]),
+    )
+    with _make_authed_client() as c:
+        with c.websocket_connect(
+            "/terminal/ws?expected_session=dead&connection_id=previous-lease"
+        ) as ws:
+            assert ws.receive()["code"] == 4404
+    assert attaches == [], "a vanished session must not reach ttyd"
+
+
+def test_ws_cache_miss_does_not_end_a_live_new_session(monkeypatch):
+    """A live new session may not appear in the poll cache yet."""
+    probes = []
+
+    async def has_session(*args):
+        probes.append(args)
+        return ""  # tmux has-session exits successfully without output
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    monkeypatch.setattr("muxplex.main.run_tmux", has_session)
+    monkeypatch.setattr(
+        "muxplex.main.websockets.connect",
+        lambda *args, **kw: FakeTtydWs(responses=["live-output"]),
+    )
+    with _make_authed_client() as c:
+        with c.websocket_connect(
+            "/terminal/ws?expected_session=test-session&connection_id=test-lease"
+        ) as ws:
+            assert ws.receive_text() == "live-output"
+
+    assert probes == [("has-session", "-t", "=test-session")]
 
 
 def test_terminal_ws_proxy_does_not_use_receive_bytes():
@@ -309,7 +374,7 @@ def test_ws_auth_rejection_no_cookie():
     # TestClient default host is "testclient" which is treated as non-localhost
     with TestClient(app) as c:
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with c.websocket_connect("/terminal/ws") as _:
+            with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as _:
                 pass
     assert exc_info.value.code == 4001
 
@@ -319,7 +384,7 @@ def test_ws_auth_rejection_invalid_cookie():
     with TestClient(app) as c:
         c.cookies.set("muxplex_session", "tampered.invalid.cookie.value")
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with c.websocket_connect("/terminal/ws") as _:
+            with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as _:
                 pass
     assert exc_info.value.code == 4001
 
@@ -346,7 +411,7 @@ def test_ws_bearer_auth_accepted(monkeypatch):
     with TestClient(app) as c:
         # If Bearer auth is not implemented, this raises WebSocketDisconnect(code=4001)
         with c.websocket_connect(
-            "/terminal/ws",
+            "/terminal/ws?expected_session=test-session&connection_id=test-lease",
             headers={"Authorization": f"Bearer {fed_key}"},
         ) as _ws:
             pass  # Successfully connected — auth was accepted
@@ -363,7 +428,7 @@ def test_browser_text_relayed_to_ttyd(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as ws:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
             ws.send_text("hello from browser")
             _wait_for(lambda: "hello from browser" in fake_ws.sent)
 
@@ -376,7 +441,7 @@ def test_browser_bytes_relayed_to_ttyd(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as ws:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
             ws.send_bytes(b"\x00\x01\x02 binary data")
             _wait_for(lambda: b"\x00\x01\x02 binary data" in fake_ws.sent)
 
@@ -394,7 +459,7 @@ def test_ttyd_text_relayed_to_browser(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as ws:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
             msg = ws.receive_text()
     assert msg == "hello from ttyd"
 
@@ -405,7 +470,7 @@ def test_ttyd_bytes_relayed_to_browser(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as ws:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
             msg = ws.receive_bytes()
     assert msg == b"\xde\xad\xbe\xef binary"
 
@@ -421,7 +486,7 @@ def test_ttyd_close_propagates_to_browser(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", lambda *a, **kw: fake_ws)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as _:
+        with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as _:
             # FakeTtydWs has no responses so ttyd_to_client exhausts immediately.
             # Exiting the context manager closes the browser WS, which causes
             # client_to_ttyd to complete, gather finishes, and the proxy
@@ -437,8 +502,8 @@ def test_ttyd_close_propagates_to_browser(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_ttyd_unreachable_closes_browser_ws(monkeypatch):
-    """OSError on ttyd connect closes the browser WebSocket (no hang, no 4001)."""
+def test_ttyd_unreachable_does_not_accept_browser_before_upstream(monkeypatch):
+    """Do not report a successful socket until ttyd is actually attached."""
 
     def mock_connect_raises(*args, **kwargs):
         raise OSError("Connection refused — ttyd not running")
@@ -446,15 +511,12 @@ def test_ttyd_unreachable_closes_browser_ws(monkeypatch):
     monkeypatch.setattr("muxplex.main.websockets.connect", mock_connect_raises)
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws") as ws:
-            # Proxy accepts, then closes after failing to reach ttyd.
-            # Receive the close frame — proves the proxy closed (no hang)
-            # and that auth was not rejected (which would use code 4001).
-            close_frame = ws.receive()
-    assert close_frame.get("type") == "websocket.close", (
-        "Proxy must close the WebSocket"
-    )
-    assert close_frame.get("code") != 4001, "Must not be an auth rejection (4001)"
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with c.websocket_connect(
+                "/terminal/ws?expected_session=test-session&connection_id=test-lease"
+            ):
+                pass
+    assert exc.value.code != 4001, "not an authentication rejection"
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +546,7 @@ def test_concurrent_ws_sessions(monkeypatch):
 
         def send_msg(text):
             try:
-                with c.websocket_connect("/terminal/ws") as ws:
+                with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
                     ws.send_text(text)
                     _wait_for(lambda: text in ws_pool[0].sent + ws_pool[1].sent)
             except Exception as exc:
@@ -578,7 +640,7 @@ def test_upstream_end_tears_down_proxy_while_browser_is_idle(monkeypatch):
 
     def body(box):
         with _make_authed_client() as c:
-            with c.websocket_connect("/terminal/ws") as ws:
+            with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
                 # Deliberately send NOTHING — this is the idle-tab case.
                 box["frame"] = ws.receive()
 
@@ -605,7 +667,7 @@ def test_client_disconnect_still_closes_both_sides(monkeypatch):
 
     def body(box):
         with _make_authed_client() as c:
-            with c.websocket_connect("/terminal/ws") as ws:
+            with c.websocket_connect("/terminal/ws?expected_session=test-session&connection_id=test-lease") as ws:
                 ws.send_text("ping")
                 _wait_for(lambda: "ping" in fake_ws.sent)
             # Context exit disconnects the browser.
@@ -643,3 +705,179 @@ def test_ws_proxies_use_first_completed_not_gather():
     assert "return_exceptions=True" in helper_src, (
         "the cancelled task must be awaited so no pending task is left behind"
     )
+
+# ---------------------------------------------------------------------------
+# P1: tab A's stale connection is refused after tab B changes the shared ttyd.
+# ---------------------------------------------------------------------------
+
+
+def test_stale_ws_cannot_attach_to_other_tabs_ttyd_after_connect_ack(monkeypatch):
+    from muxplex.state import load_state
+
+    events = []
+
+    async def mock_kill():
+        events.append("kill")
+
+    async def mock_spawn(name):
+        events.append("spawn:" + name)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha", "beta"])
+
+    attached = []
+    fake_ws = FakeTtydWs(responses=["beta-output"])
+
+    def fake_connect(*args, **kwargs):
+        attached.append(args[0])
+        return fake_ws
+
+    monkeypatch.setattr("muxplex.main.websockets.connect", fake_connect)
+
+    with _make_authed_client() as c:
+        # A's initial /connect succeeds but it has NOT attached a WebSocket yet.
+        first = c.post("/api/sessions/alpha/connect")
+        assert first.status_code == 200
+        lease_a = first.json()["connection_id"]
+        # A second tab switches the single shared ttyd to beta first.
+        second = c.post("/api/sessions/beta/connect")
+        assert second.status_code == 200
+        lease_b = second.json()["connection_id"]
+        assert lease_a != lease_b
+
+        with c.websocket_connect(
+            f"/terminal/ws?expected_session=alpha&connection_id={lease_a}"
+        ) as ws_a:
+            assert ws_a.receive()["code"] == 4409
+        assert attached == [], "A must never attach to beta's ttyd"
+
+        # A valid B still attaches and sees B's upstream terminal data.
+        with c.websocket_connect(
+            f"/terminal/ws?expected_session=beta&connection_id={lease_b}"
+        ) as ws_b:
+            assert ws_b.receive_text() == "beta-output"
+        assert len(attached) == 1
+        state = load_state()
+        assert (state["active_session"], state["active_connection_id"]) == (
+            "beta", lease_b
+        )
+
+
+def test_ttyd_lease_prevents_aba_reuse_of_same_session_name(monkeypatch):
+    from muxplex.state import load_state
+
+    async def mock_kill():
+        pass
+
+    async def mock_spawn(name):
+        pass
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha", "beta"])
+
+    attached = []
+    monkeypatch.setattr(
+        "muxplex.main.websockets.connect",
+        lambda *args, **kw: attached.append(args[0]) or FakeTtydWs(responses=[]),
+    )
+
+    with _make_authed_client() as c:
+        first = c.post("/api/sessions/alpha/connect").json()["connection_id"]
+        c.post("/api/sessions/beta/connect")
+        second = c.post("/api/sessions/alpha/connect").json()["connection_id"]
+        assert first != second
+        assert load_state()["active_connection_id"] == second
+        with c.websocket_connect(
+            f"/terminal/ws?expected_session=alpha&connection_id={first}"
+        ) as ws:
+            assert ws.receive()["code"] == 4409
+        assert attached == [], "stale A epoch must not attach to newer A process"
+
+
+def test_federated_ws_validates_coordinator_lease_and_forwards_to_remote(monkeypatch):
+    from muxplex.state import empty_state, save_state
+
+    state = empty_state()
+    state["active_session"] = "project x"
+    state["active_remote_id"] = "dev-a"
+    state["active_connection_id"] = "remote-lease"
+    save_state(state)
+
+    monkeypatch.setattr(
+        "muxplex.main._lookup_remote_by_device_id",
+        lambda device_id: {"url": "http://remote-host:8088", "key": "test-key"}
+        if device_id == "dev-a" else None,
+    )
+    upstream_urls = []
+
+    def fake_connect(url, **kwargs):
+        upstream_urls.append(url)
+        return FakeTtydWs(responses=["remote-output"])
+
+    monkeypatch.setattr("muxplex.main.websockets.connect", fake_connect)
+
+    with _make_authed_client() as c:
+        with c.websocket_connect(
+            "/federation/dev-a/terminal/ws?expected_session=project%20x&connection_id=wrong"
+        ) as ws:
+            assert ws.receive()["code"] == 4409
+        assert upstream_urls == [], "wrong lease may not reach the remote"
+
+        with c.websocket_connect(
+            "/federation/dev-a/terminal/ws?expected_session=project%20x&connection_id=remote-lease"
+        ) as ws:
+            assert ws.receive_text() == "remote-output"
+    assert len(upstream_urls) == 1
+    assert "expected_session=project+x" in upstream_urls[0]
+    assert "connection_id=remote-lease" in upstream_urls[0]
+
+
+def test_missing_ttyd_lease_is_rejected_before_any_ttyd_connect(monkeypatch):
+    attaches = []
+    monkeypatch.setattr(
+        "muxplex.main.websockets.connect",
+        lambda *args, **kw: attaches.append(args) or FakeTtydWs(responses=[]),
+    )
+    with _make_authed_client() as c:
+        with c.websocket_connect("/terminal/ws") as ws:
+            assert ws.receive()["code"] == 4409
+    assert attaches == []
+
+@pytest.mark.parametrize("remote_code", [4409, 4404])
+def test_federation_forwards_remote_terminal_close_code(monkeypatch, remote_code):
+    """Forward stale-lease and ended-session close reasons from remote peers."""
+    from muxplex.state import empty_state, save_state
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+
+    state = empty_state()
+    state["active_session"] = "alpha"
+    state["active_remote_id"] = "node-b"
+    state["active_connection_id"] = "lease-alpha"
+    save_state(state)
+    monkeypatch.setattr(
+        "muxplex.main._lookup_remote_by_device_id",
+        lambda rid: {"url": "http://node-b:8088", "key": "secret"}
+        if rid == "node-b" else None,
+    )
+
+    class RemoteRejected(FakeTtydWs):
+        async def _async_gen(self):
+            # The remote accepted WS then rejected the lease before sending
+            # ttyd output, as its local active session became beta.
+            raise ConnectionClosedError(
+                Close(remote_code, "Remote session unavailable"), None
+            )
+            yield  # mark as async generator
+
+    monkeypatch.setattr(
+        "muxplex.main.websockets.connect",
+        lambda *args, **kwargs: RemoteRejected(),
+    )
+    with _make_authed_client() as c:
+        with c.websocket_connect(
+            "/federation/node-b/terminal/ws?expected_session=alpha&connection_id=lease-alpha"
+        ) as ws:
+            assert ws.receive()["code"] == remote_code

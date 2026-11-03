@@ -18,6 +18,7 @@ import os
 import pathlib
 import pwd
 import re
+import secrets
 import socket
 import ssl
 import shutil
@@ -106,6 +107,40 @@ _log = logging.getLogger(__name__)
 _poll_task: asyncio.Task | None = None
 _federation_client: httpx.AsyncClient | None = None
 _settings_sync_counter: int = 0
+
+# Serialize every operation that replaces/stops the ONE shared ttyd instance.
+# This is intentionally separate from state_lock: process shutdown/spawn may
+# wait for the OS and must not block unrelated poll and heartbeat state reads.
+_ttyd_transition_lock: asyncio.Lock = asyncio.Lock()
+
+
+def _active_remote_id(state: dict) -> str:
+    """Normalize legacy integer device indexes (including 0) as identities."""
+    value = state.get("active_remote_id")
+    return "" if value is None else str(value)
+
+
+def _active_connection_id(state: dict) -> str:
+    """The active ttyd lease. A missing lease is never valid for attachment."""
+    value = state.get("active_connection_id")
+    return value if isinstance(value, str) else ""
+
+
+async def _session_exists_for_attach(name: str) -> bool:
+    """Check cached tmux membership, probing only on a cache miss.
+
+    A freshly created session or a server restart can precede the first
+    poll-cycle cache refresh. Treating an empty cache as proof of a dead tmux
+    session would strand a valid lease. Only the exceptional miss pays for
+    an exact-name tmux has-session probe.
+    """
+    if name in get_session_list():
+        return True
+    try:
+        await run_tmux("has-session", "-t", "=" + name)
+    except (RuntimeError, OSError):
+        return False
+    return True
 
 # Monotonic counter bumped once per completed poll cycle.  It is part of the
 # /api/sessions payload cache key so a cached body can never outlive the cycle
@@ -265,9 +300,15 @@ async def _run_poll_cycle() -> None:
         # _ttyd_is_listening() is a bare TCP probe, so that orphan reads as
         # perfectly healthy and nothing else would ever clean it up.
         stale_ttyd_session: str | None = None
-        if state["active_session"] not in name_set:
+        # A remote session is NOT in the local tmux name list. Never clear a
+        # federated active session or reap local ttyd based on that mismatch.
+        if (state.get("active_session") is not None
+                and not _active_remote_id(state)
+                and state["active_session"] not in name_set):
             stale_ttyd_session = state["active_session"]
             state["active_session"] = None
+            state["active_remote_id"] = None
+            state["active_connection_id"] = None
 
         # 8. Process bell flags (detect 0→1 transitions, update unseen_count)
         await process_bell_flags(names, state)
@@ -334,7 +375,15 @@ async def _run_poll_cycle() -> None:
             "Reaping ttyd for vanished session %r", stale_ttyd_session
         )
         try:
-            await kill_ttyd()
+            async with _ttyd_transition_lock:
+                # A new /connect may have completed after the poll observed a
+                # vanished session. Never kill its newly spawned ttyd.
+                async with state_lock:
+                    latest = load_state()
+                    still_idle = (latest.get("active_session") is None
+                                  and not _active_remote_id(latest))
+                if still_idle:
+                    await kill_ttyd()
         except Exception:
             _log.exception("failed to reap ttyd for %r", stale_ttyd_session)
 
@@ -545,7 +594,8 @@ async def lifespan(app: FastAPI):
         # kill — that is the mechanism behind upstream issue #7, which destroys
         # hosted tmux sessions and everything inside them.
         try:
-            await kill_ttyd()
+            async with _ttyd_transition_lock:
+                await kill_ttyd()
         except Exception:
             _log.exception("ttyd shutdown kill error")
 
@@ -726,6 +776,10 @@ async def patch_state(patch: StatePatch) -> dict:
             state["active_session"] = patch.active_session
         if "active_remote_id" in changed:
             state["active_remote_id"] = patch.active_remote_id
+        if "active_session" in changed or "active_remote_id" in changed:
+            # An external PATCH does not perform a ttyd transition and cannot
+            # authorize a connection to the newly described target.
+            state["active_connection_id"] = None
         if "active_view" in changed:
             state["active_view"] = patch.active_view
         save_state(state)
@@ -857,10 +911,13 @@ def _viewing_headers(state: dict) -> dict[str, str]:
     key, so a session switch is reflected immediately.
     """
     name = state.get("active_session") or ""
-    remote_id = state.get("active_remote_id") or ""
+    remote_id = _active_remote_id(state)
     return {
         "X-Muxplex-Active-Session": urllib.parse.quote(str(name), safe=""),
-        "X-Muxplex-Active-Remote-Id": urllib.parse.quote(str(remote_id), safe=""),
+        "X-Muxplex-Active-Remote-Id": urllib.parse.quote(remote_id, safe=""),
+        "X-Muxplex-Active-Connection-Id": urllib.parse.quote(
+            _active_connection_id(state), safe=""
+        ),
     }
 
 
@@ -1003,47 +1060,105 @@ async def create_session(payload: CreateSessionPayload) -> dict:
 
 
 @app.post("/api/sessions/{name}/connect")
-async def connect_session(name: str) -> dict:
-    """Connect to a tmux session via ttyd.
+async def connect_session(
+    name: str, reconnect: bool = False, connection_id: str | None = None
+) -> dict:
+    """Attach the shared local ttyd and atomically publish its local identity.
 
-    Kills any existing ttyd process, spawns a new one attached to *name*,
-    and updates the active_session in persistent state.
-
-    Returns {active_session: name, ttyd_port: 7682}.
-    Raises HTTP 404 if *name* is not in the known session list (when non-empty).
+    All connect/disconnect/WS respawns use _ttyd_transition_lock so two
+    overlapping requests cannot interleave kill/spawn/state writes. The
+    coordinator's active_remote_id is explicitly cleared for local sessions.
     """
-    known = get_session_list()
-    if known and name not in known:
-        raise HTTPException(status_code=404, detail=f"Session '{name}' not found")
+    async with _ttyd_transition_lock:
+        # The tmux session may have exited while the browser was recovering.
+        # Check existence *before* the connection CAS so a dead session is 404,
+        # not a misleading "another tab switched" 409.
+        known = get_session_list()
+        if reconnect:
+            if not await _session_exists_for_attach(name):
+                raise HTTPException(status_code=404, detail=f"Session '{name}' not found")
+        elif known and name not in known:
+            raise HTTPException(status_code=404, detail=f"Session '{name}' not found")
+        if reconnect:
+            # A previously scheduled WebSocket recovery must never hijack ttyd
+            # after a different browser selects another active session.
+            async with state_lock:
+                latest = load_state()
+            # A -> B -> A returns to the same name but has a different ttyd
+            # generation. Only the browser holding the *current* lease may
+            # restart ttyd. A missing lease also fails closed.
+            if (
+                latest.get("active_session") != name
+                or _active_remote_id(latest)
+                or not connection_id
+                or _active_connection_id(latest) != connection_id
+            ):
+                raise HTTPException(status_code=409, detail="Active session changed")
 
-    _log.info("Connecting to session '%s'", name)
-    await kill_ttyd()
-    await spawn_ttyd(name)
+        # Reconnecting the *same* ttyd session keeps its lease so an existing
+        # browser can safely reattach. A user navigation always gets a new
+        # lease, even for an A -> B -> A sequence.
+        lease = connection_id if reconnect else secrets.token_urlsafe(24)
+        _log.info("Connecting to session '%s'", name)
+        await kill_ttyd()
+        await spawn_ttyd(name)
 
-    async with state_lock:
-        state = load_state()
-        state["active_session"] = name
-        save_state(state)
+        async with state_lock:
+            state = load_state()
+            state["active_session"] = name
+            state["active_remote_id"] = None
+            state["active_connection_id"] = lease
+            save_state(state)
 
-    return {"active_session": name, "ttyd_port": TTYD_PORT}
+    return {
+        "active_session": name,
+        "active_remote_id": None,
+        "connection_id": lease,
+        "ttyd_port": TTYD_PORT,
+    }
 
 
 @app.delete("/api/sessions/current")
-async def delete_current_session() -> dict:
-    """Disconnect the current ttyd session.
+async def delete_current_session(
+    expected_session: str | None = None,
+    expected_remote_id: str | None = None,
+    expected_connection_id: str | None = None,
+) -> dict:
+    """Disconnect only the session this browser actually intended to close.
 
-    Kills the running ttyd process and clears active_session in persistent state.
-
-    Returns {active_session: None}.
+    The optional expected pair protects against a stale tab's Back button
+    killing another tab's newly selected session. Existing unguarded callers
+    remain supported. Remote active sessions only clear coordinator state;
+    their remote ttyd must not be killed through this local endpoint.
     """
-    await kill_ttyd()
+    async with _ttyd_transition_lock:
+        async with state_lock:
+            state = load_state()
+            current_name = state.get("active_session")
+            current_rid = _active_remote_id(state)
+            if expected_session is not None and (
+                current_name != expected_session
+                or current_rid != (expected_remote_id or "")
+                or (expected_connection_id is not None
+                    and _active_connection_id(state) != expected_connection_id)
+            ):
+                return {
+                    "active_session": current_name,
+                    "active_remote_id": current_rid or None,
+                    "skipped": True,
+                }
 
-    async with state_lock:
-        state = load_state()
-        state["active_session"] = None
-        save_state(state)
+        if not current_rid:
+            await kill_ttyd()
 
-    return {"active_session": None}
+        async with state_lock:
+            state = load_state()
+            state["active_session"] = None
+            state["active_remote_id"] = None
+            state["active_connection_id"] = None
+            save_state(state)
+
+    return {"active_session": None, "active_remote_id": None}
 
 
 @app.delete("/api/sessions/{name}")
@@ -1422,63 +1537,76 @@ async def _ws_auth_check(websocket: WebSocket) -> bool:
     return True
 
 
+async def _reject_stale_terminal_ws(websocket: WebSocket) -> None:
+    """Return an explicit app close code, never attach an incorrect ttyd."""
+    await websocket.accept(subprotocol="tty")
+    await websocket.close(code=4409, reason="Active terminal session changed")
+
+
+async def _reject_ended_terminal_ws(websocket: WebSocket) -> None:
+    """4404 means the named tmux session ended; it is not a tab switch."""
+    await websocket.accept(subprotocol="tty")
+    await websocket.close(code=4404, reason="Terminal session ended")
+
+
+def _ws_expected_connection(websocket: WebSocket) -> tuple[str, str]:
+    """Require a session label AND opaque server-issued ttyd connection lease."""
+    return (
+        websocket.query_params.get("expected_session", ""),
+        websocket.query_params.get("connection_id", ""),
+    )
+
+
 @app.websocket("/terminal/ws")
 async def terminal_ws_proxy(websocket: WebSocket) -> None:
-    """Proxy WebSocket frames between the browser and ttyd.
+    """Attach only to the ttyd proven to match the browser's expected session.
 
-    Checks that ttyd is alive BEFORE accepting the browser WebSocket.  If ttyd
-    is not listening (e.g. after a service restart), auto-spawns it using the
-    active_session from state, then waits briefly for it to bind its port.
-
-    Only after ttyd is confirmed reachable does the function call
-    websocket.accept() — so the browser's 'open' event only fires once a real
-    relay is possible.  This prevents the reconnect-counter bounce bug where
-    the proxy accepted immediately (resetting _reconnectAttempts to 0) and
-    then closed as soon as it couldn't reach the dead ttyd.
+    The shared ttyd is replaced by /connect. Keep its transition lock from
+    checking the session/lease until the *upstream ttyd websocket is attached*,
+    not merely until a TCP liveness probe succeeds. A newer /connect can then
+    close the old socket, but can never redirect a labeled session to a new one.
     """
-    # Auth check before accepting — BaseHTTPMiddleware doesn't cover WebSocket scope
     if not await _ws_auth_check(websocket):
         return
 
-    # Ensure ttyd is reachable BEFORE accepting the browser WS.
-    # After a service restart ttyd is dead but clients reconnect immediately.
-    # Auto-spawn from active_session so the browser's 'open' event only fires
-    # when a real relay is possible — eliminates the 0→1→0→1 counter bounce.
-    if not _ttyd_is_listening():
-        try:
-            async with state_lock:
-                state = load_state()
-            session_name = state.get("active_session")
-            # Only respawn for a session that still EXISTS.  connect_session
-            # has always checked this (via get_session_list()); this path did
-            # not, so a stale active_session made every browser reconnect
-            # resurrect a `tmux attach` against a destroyed session — a
-            # self-sustaining loop with no frontend involvement at all.
-            known = get_session_list()
-            if session_name and known and session_name not in known:
-                _log.info(
-                    "WS proxy: refusing to spawn ttyd for vanished session '%s'",
-                    session_name,
-                )
-                session_name = None
-            if session_name:
-                _log.info(
-                    "WS proxy: ttyd not listening, auto-spawning for '%s'",
-                    session_name,
-                )
-                await kill_ttyd()
-                await spawn_ttyd(session_name)
-                await asyncio.sleep(0.8)  # wait for ttyd to bind its port
-        except Exception as exc:
-            _log.warning("WS proxy: failed to auto-spawn ttyd: %s", exc)
-
-    await websocket.accept(subprotocol="tty")
-
+    expected, lease = _ws_expected_connection(websocket)
     ttyd_url = f"ws://localhost:{TTYD_PORT}/ws"
     try:
-        async with websockets.connect(
-            ttyd_url, subprotocols=[Subprotocol("tty")]
-        ) as ttyd_ws:
+        async with contextlib.AsyncExitStack() as stack:
+            async with _ttyd_transition_lock:
+                # A completed tmux session can disappear before the poll clears
+                # its stored connection lease. Always check the live-session
+                # cache first, even if ttyd is still listening and even if the
+                # state already dropped the lease. A missing session is 4404,
+                # whereas a different active lease is 4409.
+                if expected and not await _session_exists_for_attach(expected):
+                    _log.info("WS proxy: refusing vanished session '%s'", expected)
+                    await _reject_ended_terminal_ws(websocket)
+                    return
+                async with state_lock:
+                    state = load_state()
+                if (not expected or not lease
+                        or state.get("active_session") != expected
+                        or _active_remote_id(state)
+                        or not hmac.compare_digest(_active_connection_id(state), lease)):
+                    await _reject_stale_terminal_ws(websocket)
+                    return
+
+                # Only the validated, still-live session can have ttyd
+                # respawned. A dead session must never restart the loop.
+                if not _ttyd_is_listening():
+                    _log.info("WS proxy: re-spawning ttyd for '%s'", expected)
+                    await kill_ttyd()
+                    await spawn_ttyd(expected)
+                    await asyncio.sleep(0.8)
+
+                # IMPORTANT: websocket.connect and accept are inside the
+                # transition lock; relay happens outside it. AsyncExitStack
+                # keeps the established upstream socket open during the relay.
+                ttyd_ws = await stack.enter_async_context(
+                    websockets.connect(ttyd_url, subprotocols=[Subprotocol("tty")])
+                )
+                await websocket.accept(subprotocol="tty")
 
             async def client_to_ttyd() -> None:
                 try:
@@ -1555,56 +1683,64 @@ def _lookup_remote_by_device_id(device_id: str) -> dict | None:
 
 @app.websocket("/federation/{device_id}/terminal/ws")
 async def federation_terminal_ws_proxy(websocket: WebSocket, device_id: str) -> None:
-    """Proxy WebSocket frames between the browser and a remote muxplex ttyd.
+    """Bind both coordinator and remote ttyd to the expected session/lease.
 
-    *device_id* is the device_id string of the remote instance in
-    settings.  Authenticates to the remote instance using the configured
-    ``key`` field via a Bearer header.
-
-    Auth check uses the same cookie + bearer pattern as terminal_ws_proxy.
-    Closes with code 4004 if device_id does not match any remote.
+    The remote /terminal/ws enforces its own lease under its ttyd transition
+    lock. A coordinator switch cannot silently redirect an existing tab's
+    federated terminal to another remote or another remote session.
     """
-    # Auth check before accepting — same pattern as terminal_ws_proxy
     if not await _ws_auth_check(websocket):
         return
 
-    # Look up remote instance by device_id
+    expected, lease = _ws_expected_connection(websocket)
     remote = _lookup_remote_by_device_id(device_id)
     if remote is None:
         await websocket.close(code=4004)
         return
+
     remote_url: str = remote.get("url", "").rstrip("/")
     remote_key: str = remote.get("key", "")
-
-    # Convert http(s) URL to ws(s)
     if remote_url.startswith("https://"):
         ws_url = "wss://" + remote_url[8:] + "/terminal/ws"
     elif remote_url.startswith("http://"):
         ws_url = "ws://" + remote_url[7:] + "/terminal/ws"
     else:
-        ws_url = remote_url + "/terminal/ws"  # assume already ws:// or wss://
+        ws_url = remote_url + "/terminal/ws"
 
-    # Build an SSL context that skips verification for self-signed certs on
-    # remote instances.  Same rationale as httpx verify=False: federation
-    # peers may use self-signed or Tailscale-issued certs that don't pass the
-    # system CA store.  None tells websockets to use default behaviour (no
-    # TLS) for plain ws:// URLs.
+    # Remote validates the same opaque lease from its own /connect response;
+    # the coordinator alone cannot know if another browser switched the remote.
+    ws_url += "?" + urllib.parse.urlencode(
+        {"expected_session": expected, "connection_id": lease}
+    )
     ssl_context: ssl.SSLContext | None = None
     if ws_url.startswith("wss://"):
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-    await websocket.accept(subprotocol="tty")
-
     auth_headers = {"Authorization": f"Bearer {remote_key}"} if remote_key else {}
     try:
-        async with websockets.connect(
-            ws_url,
-            subprotocols=[Subprotocol("tty")],
-            additional_headers=auth_headers,
-            ssl=ssl_context,
-        ) as remote_ws:
+        async with contextlib.AsyncExitStack() as stack:
+            async with _ttyd_transition_lock:
+                async with state_lock:
+                    state = load_state()
+                if (not expected or not lease
+                        or state.get("active_session") != expected
+                        or _active_remote_id(state) != device_id
+                        or not hmac.compare_digest(_active_connection_id(state), lease)):
+                    await _reject_stale_terminal_ws(websocket)
+                    return
+
+                remote_ws = await stack.enter_async_context(
+                    websockets.connect(
+                        ws_url,
+                        subprotocols=[Subprotocol("tty")],
+                        additional_headers=auth_headers,
+                        ssl=ssl_context,
+                        open_timeout=3,
+                    )
+                )
+                await websocket.accept(subprotocol="tty")
 
             async def client_to_remote() -> None:
                 try:
@@ -1624,6 +1760,17 @@ async def federation_terminal_ws_proxy(websocket: WebSocket, device_id: str) -> 
                             await websocket.send_bytes(message)
                         else:
                             await websocket.send_text(message)
+                except websockets.exceptions.ConnectionClosed as exc:
+                    # A remote instance can switch after coordinator validation.
+                    # Forward its explicit mismatch close, not an ordinary 1000
+                    # that would cause an endless retry loop in the browser.
+                    remote_code = exc.rcvd.code if exc.rcvd else None
+                    if remote_code == 4409:
+                        await websocket.close(code=4409, reason="Active remote session changed")
+                    elif remote_code == 4404:
+                        await websocket.close(code=4404, reason="Remote terminal session ended")
+                    else:
+                        _log.debug("federation ws remote closed: %s", exc)
                 except Exception as exc:
                     _log.debug("federation ws relay closed (remote_to_client): %s", exc)
 
@@ -1920,46 +2067,94 @@ async def federation_generate_key() -> dict:
 
 @app.post("/api/federation/{device_id}/connect/{session_name}")
 async def federation_connect(
-    device_id: str, session_name: str, request: Request
+    device_id: str, session_name: str, request: Request, reconnect: bool = False,
+    connection_id: str | None = None,
 ) -> dict:
-    """Proxy a connect POST to a remote instance to spawn its ttyd.
+    """Connect remote ttyd, then atomically publish the coordinator's pair.
 
-    Looks up the remote by device_id string via ``_lookup_remote_by_device_id``,
-    sends ``POST {remote_url}/api/sessions/{session_name}/connect`` with a
-    Bearer auth header, and returns the remote's JSON response.
-
-    Raises HTTP 404 if ``device_id`` does not match any remote instance.
+    This participates in the same serialized navigation order as local
+    /connect: a later local click must not be undone by an older remote
+    request finishing after it.
     """
-    remote = _lookup_remote_by_device_id(device_id)
-    if remote is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Remote instance '{device_id}' not found",
-        )
+    async with _ttyd_transition_lock:
+        if reconnect:
+            async with state_lock:
+                latest = load_state()
+            if (
+                latest.get("active_session") != session_name
+                or _active_remote_id(latest) != device_id
+                or not connection_id
+                or _active_connection_id(latest) != connection_id
+            ):
+                # No remote POST must occur when the coordinator's ttyd
+                # selection has changed (including same-name A -> B -> A).
+                raise HTTPException(status_code=409, detail="Active session changed")
+        remote = _lookup_remote_by_device_id(device_id)
+        if remote is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Remote instance '{device_id}' not found",
+            )
 
-    remote_url: str = remote.get("url", "").rstrip("/")
-    remote_key: str = remote.get("key", "")
-    url = f"{remote_url}/api/sessions/{session_name}/connect"
+        remote_url: str = remote.get("url", "").rstrip("/")
+        remote_key: str = remote.get("key", "")
+        url = f"{remote_url}/api/sessions/{urllib.parse.quote(session_name, safe='')}/connect"
+        if reconnect:
+            # Forward the *caller's* lease, never replace it with the latest
+            # coordinator state. The remote performs its own guarded CAS before
+            # killing or spawning ttyd.
+            url += "?reconnect=true&connection_id=" + urllib.parse.quote(
+                connection_id, safe=""
+            )
 
-    http_client: httpx.AsyncClient = request.app.state.federation_client
-    try:
-        resp = await http_client.post(
-            url,
-            headers={"Authorization": f"Bearer {remote_key}"} if remote_key else {},
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Remote returned {exc.response.status_code}",
-        )
-    except Exception as exc:
-        _log.warning("federation_connect: remote %s unreachable: %s", remote_url, exc)
-        raise HTTPException(
-            status_code=503,
-            detail=f"Remote unreachable: {remote_url} ({type(exc).__name__}: {exc})",
-        )
+        http_client: httpx.AsyncClient = request.app.state.federation_client
+        try:
+            resp = await http_client.post(
+                url,
+                headers={"Authorization": f"Bearer {remote_key}"} if remote_key else {},
+            )
+            resp.raise_for_status()
+            result = resp.json()
+        except httpx.HTTPStatusError as exc:
+            # The remote is authoritative for its own shared ttyd. Preserve a
+            # guarded reconnect's 409 rather than hiding it as a 502; otherwise
+            # the browser retries and may attach to the wrong remote session.
+            if reconnect and exc.response.status_code == 409:
+                raise HTTPException(status_code=409, detail="Active remote session changed")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Remote returned {exc.response.status_code}",
+            )
+        except Exception as exc:
+            _log.warning("federation_connect: remote %s unreachable: %s", remote_url, exc)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Remote unreachable: {remote_url} ({type(exc).__name__}: {exc})",
+            )
+
+        # Require upgraded peers to prove their ttyd attachment identity;
+        # silently accepting an older peer would reintroduce the exact
+        # session-agnostic WebSocket race this change fixes.
+        lease = result.get("connection_id") if isinstance(result, dict) else None
+        if not isinstance(lease, str) or not lease:
+            raise HTTPException(
+                status_code=502,
+                detail="Remote muxplex must support connection_id; upgrade the remote instance",
+            )
+        if reconnect and lease != connection_id:
+            # A broken/older remote must not silently rotate the lease on a
+            # guarded reconnect. Keep our active identity unchanged and stop
+            # the client's retry rather than trusting a foreign generation.
+            raise HTTPException(status_code=409, detail="Remote connection lease changed")
+
+        async with state_lock:
+            state = load_state()
+            state["active_session"] = session_name
+            state["active_remote_id"] = device_id
+            state["active_connection_id"] = lease
+            save_state(state)
+
+    return {**result, "active_session": session_name, "active_remote_id": device_id}
 
 
 @app.post("/api/federation/{device_id}/sessions/{session_name}/bell/clear")

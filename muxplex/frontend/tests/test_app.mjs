@@ -1226,21 +1226,28 @@ test('openSession is exported', () => {
   assert.strictEqual(typeof app.openSession, 'function');
 });
 
-test('openSession returns a Promise', () => {
+test('openSession returns a Promise', async () => {
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ connection_id: 'test-lease' }) });
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = () => {};
   globalThis.window._openTerminal = () => {};
 
-  const result = app.openSession('test-session', { skipConnect: true });
-
-  assert.ok(result instanceof Promise, 'openSession should return a Promise');
-  globalThis.document.getElementById = origGetById;
-  globalThis.document.querySelector = origQS;
-  globalThis.setTimeout = origSetTimeout;
+  try {
+    const result = app.openSession('test-session', { skipConnect: true });
+    assert.ok(result instanceof Promise, 'openSession should return a Promise');
+    // Serialize test cleanup with this now-queued navigation operation.
+    await result;
+  } finally {
+    globalThis.fetch = origFetch;
+    globalThis.document.getElementById = origGetById;
+    globalThis.document.querySelector = origQS;
+    globalThis.setTimeout = origSetTimeout;
+  }
 });
 
 test('openSession with skipAnimation calls window._openTerminal after connect POST', async () => {
@@ -1250,7 +1257,7 @@ test('openSession with skipAnimation calls window._openTerminal after connect PO
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async (url, opts) => ({ ok: true });
+  globalThis.fetch = async (url, opts) => ({ ok: true, json: async () => ({ connection_id: 'test-lease' }) });
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   // Use a synchronous mock so setTimeout callbacks run immediately
@@ -1272,7 +1279,7 @@ test('openSession without skipConnect POSTs to /api/sessions/{name}/connect', as
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
+  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true, json: async () => ({ connection_id: 'test-lease' }) }; };
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = () => {};
@@ -1298,7 +1305,7 @@ test('openSession shows toast and calls closeSession on connect failure', async 
   const origSetTimeout = globalThis.setTimeout;
   globalThis.fetch = async (url) => {
     if (url.includes('/connect')) throw new Error('Connection failed');
-    return { ok: true };
+    return { ok: true, json: async () => ({ connection_id: 'test-lease' }) };
   };
   globalThis.document.getElementById = (id) => {
     if (id === 'toast') return mockToast;
@@ -1325,7 +1332,7 @@ test('openSession with remoteId POSTs connect to federation proxy URL', async ()
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
+  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true, json: async () => ({ connection_id: 'test-lease' }) }; };
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = () => {};
@@ -1348,7 +1355,7 @@ test('openSession with remoteId passes remoteId to window._openTerminal', async 
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async () => ({ ok: true });
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ connection_id: 'test-lease' }) });
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = (fn) => { fn(); };
@@ -1372,7 +1379,7 @@ test('openSession passes getDisplaySettings().fontSize to window._openTerminal a
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async () => ({ ok: true });
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ connection_id: 'test-lease' }) });
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = (fn) => { fn(); };
@@ -1397,7 +1404,7 @@ test('openSession for local session still POSTs to local /api/sessions/{name}/co
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
+  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true, json: async () => ({ connection_id: 'test-lease' }) }; };
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = () => {};
@@ -1420,7 +1427,7 @@ test('openSession bails early when name is empty string', async () => {
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
+  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true, json: async () => ({ connection_id: 'test-lease' }) }; };
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = () => {};
@@ -1443,7 +1450,7 @@ test('openSession bails early when name is whitespace only', async () => {
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
+  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true, json: async () => ({ connection_id: 'test-lease' }) }; };
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = () => {};
@@ -1494,98 +1501,72 @@ test('closeSession calls window._closeTerminal', async () => {
   globalThis.fetch = undefined;
 });
 
-test('closeSession fires DELETE /api/sessions/current', async () => {
-  const fetchCalls = [];
-  const origFetch = globalThis.fetch;
-  const origGetById = globalThis.document.getElementById;
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
-  globalThis.document.getElementById = () => ({ style: {}, classList: { add: () => {}, remove: () => {} } });
-  globalThis.window._closeTerminal = () => {};
-
-  await app.closeSession();
-  // yield microtask queue for fire-and-forget DELETE
-  await new Promise((r) => setTimeout(r, 0));
-
-  const deleteCall = fetchCalls.find((c) => c.url === '/api/sessions/current' && c.opts && c.opts.method === 'DELETE');
-  assert.ok(deleteCall, 'should fire DELETE /api/sessions/current');
-  globalThis.fetch = origFetch;
-  globalThis.document.getElementById = origGetById;
+test('closeSession only disconnects the exact previously committed local identity', async () => {
+  const original = { fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout };
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    calls.push({ url, opts });
+    return { ok: true, json: async () => ({ connection_id: 'test-lease' }) };
+  };
+  document.getElementById = () => ({
+    textContent: '', style: {},
+    classList: { add() {}, remove() {} },
+  });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = () => {};
+  window._closeTerminal = () => {};
+  try {
+    await app.openSession('local-a', { skipAnimation: true });
+    await app.closeSession();
+    await Promise.resolve();
+    const deletion = calls.find((x) => x.opts?.method === 'DELETE');
+    assert.ok(deletion, 'Back should clear this tab’s committed local session');
+    assert.match(deletion.url, /expected_session=local-a/);
+    assert.match(deletion.url, /expected_remote_id=&expected_connection_id=test-lease$/);
+    assert.equal(calls.some(x => x.opts?.method === 'PATCH' && x.url === '/api/state'), false,
+      'do not issue a late unconditional PATCH that can clobber a newer tab');
+  } finally {
+    globalThis.fetch = original.fetch;
+    document.getElementById = original.get;
+    document.querySelector = original.qs;
+    globalThis.setTimeout = original.timer;
+  }
 });
 
-test('closeSession does NOT fire DELETE for remote session (non-empty _viewingRemoteId)', async () => {
-  const origFetch = globalThis.fetch;
-  const origGetById = globalThis.document.getElementById;
-  const origQS = globalThis.document.querySelector;
-  const origSetTimeout = globalThis.setTimeout;
-
-  // Setup to call openSession with remote remoteId
-  globalThis.fetch = async () => ({ ok: true });
-  globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
-  globalThis.document.querySelector = () => null;
-  globalThis.setTimeout = () => {};
-  globalThis.window._openTerminal = () => {};
-  globalThis.window._closeTerminal = () => {};
-
-  // Open a remote session - this sets _viewingRemoteId = 'fed-abc123'
-  await app.openSession('remote-sess', { remoteId: 'fed-abc123' });
-
-  // Restore setTimeout so Promise-based yielding works
-  globalThis.setTimeout = origSetTimeout;
-
-  // Reset fetch tracking
-  const fetchCalls = [];
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
-
-  // Close session
-  await app.closeSession();
-  // yield microtask queue for any fire-and-forget calls
-  await new Promise((r) => setTimeout(r, 0));
-
-  const deleteCall = fetchCalls.find((c) => c.url === '/api/sessions/current' && c.opts && c.opts.method === 'DELETE');
-  assert.ok(!deleteCall, 'closeSession should NOT fire DELETE for remote session');
-
-  globalThis.fetch = origFetch;
-  globalThis.document.getElementById = origGetById;
-  globalThis.document.querySelector = origQS;
-  globalThis.setTimeout = origSetTimeout;
-});
-
-test('closeSession still fires DELETE /api/sessions/current for local session', async () => {
-  const origFetch = globalThis.fetch;
-  const origGetById = globalThis.document.getElementById;
-  const origQS = globalThis.document.querySelector;
-  const origSetTimeout = globalThis.setTimeout;
-
-  // Setup to call openSession for a local session (no remoteId)
-  globalThis.fetch = async () => ({ ok: true });
-  globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
-  globalThis.document.querySelector = () => null;
-  globalThis.setTimeout = () => {};
-  globalThis.window._openTerminal = () => {};
-  globalThis.window._closeTerminal = () => {};
-
-  // Open a local session - this sets _viewingRemoteId = ''
-  await app.openSession('local-sess', {});
-
-  // Restore setTimeout so Promise-based yielding works
-  globalThis.setTimeout = origSetTimeout;
-
-  // Reset fetch tracking
-  const fetchCalls = [];
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
-
-  // Close session
-  await app.closeSession();
-  // yield microtask queue for fire-and-forget DELETE
-  await new Promise((r) => setTimeout(r, 0));
-
-  const deleteCall = fetchCalls.find((c) => c.url === '/api/sessions/current' && c.opts && c.opts.method === 'DELETE');
-  assert.ok(deleteCall, 'closeSession should fire DELETE /api/sessions/current for local session');
-
-  globalThis.fetch = origFetch;
-  globalThis.document.getElementById = origGetById;
-  globalThis.document.querySelector = origQS;
-  globalThis.setTimeout = origSetTimeout;
+test('closeSession sends guarded coordinator cleanup for a remote view', async () => {
+  const original = { fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout };
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    calls.push({ url, opts });
+    return { ok: true, json: async () => ({ connection_id: 'test-lease' }) };
+  };
+  document.getElementById = () => ({
+    textContent: '', style: {},
+    classList: { add() {}, remove() {} },
+  });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = () => {};
+  window._closeTerminal = () => {};
+  try {
+    await app.openSession('remote-a', { remoteId: 'fed-abc123', skipAnimation: true });
+    await app.closeSession();
+    await Promise.resolve();
+    const deletion = calls.find((x) => x.opts?.method === 'DELETE');
+    assert.ok(deletion, 'coordinator should clear its remote active pair');
+    assert.match(deletion.url, /expected_session=remote-a/);
+    assert.match(deletion.url, /expected_remote_id=fed-abc123/);
+    assert.match(deletion.url, /expected_connection_id=test-lease/);
+    assert.ok(!calls.some(x => x.url === '/api/state' && x.opts?.method === 'PATCH'));
+  } finally {
+    globalThis.fetch = original.fetch;
+    document.getElementById = original.get;
+    document.querySelector = original.qs;
+    globalThis.setTimeout = original.timer;
+  }
 });
 
 // ─── Command Palette ─────────────────────────────────────────────────────────
@@ -2220,25 +2201,21 @@ test('openSession mounts terminal AFTER connect POST, not inside animation timer
     new URL('../app.js', import.meta.url), 'utf8'
   );
 
-  // Find the openSession function body
-  // Window widened 4000→4800 when reconcileOnly gating grew the function body
-  // (terminal mount stays last, just further from fnStart). Stays < closeSession.
+  // Scope to the actual function rather than a brittle character window.
   const fnStart = source.indexOf('async function openSession');
-  const fnBody = source.substring(fnStart, fnStart + 4800);
+  const fnBody = source.substring(fnStart, source.indexOf('\nfunction closeSession', fnStart));
 
-  // _openTerminal must NOT appear inside setTimeout
-  const setTimeoutIdx = fnBody.indexOf('setTimeout');
-  const setTimeoutEnd = fnBody.indexOf('}, 260)', setTimeoutIdx);
+  // _openTerminal must NOT appear inside the animation callback.
+  const setTimeoutIdx = fnBody.indexOf('setTimeout(function()');
+  const setTimeoutEnd = fnBody.indexOf('}, opts.skipAnimation', setTimeoutIdx);
   const setTimeoutBody = fnBody.substring(setTimeoutIdx, setTimeoutEnd);
-
   assert.ok(!setTimeoutBody.includes('_openTerminal'),
-    '_openTerminal must NOT be inside the 260ms setTimeout — causes race condition with /connect POST');
+    'animation callback must not mount the terminal');
 
-  // _openTerminal must appear AFTER the /connect POST
   const connectIdx = fnBody.indexOf('/api/sessions/');
-  const openTermIdx = fnBody.indexOf('_openTerminal', connectIdx);
-  assert.ok(openTermIdx > connectIdx,
-    '_openTerminal must appear AFTER the /connect POST in the source');
+  const openTermIdx = fnBody.lastIndexOf('_openTerminal');
+  assert.ok(connectIdx >= 0 && openTermIdx > connectIdx,
+    '_openTerminal must appear AFTER the serialized /connect POST');
 });
 
 // --- Zoom-open animation selector (regression: nav-pill viewport hijack, v0.8.2) ---
@@ -3247,7 +3224,7 @@ test('openSession always POSTs to connect even when skipConnect option is passed
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
+  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true, json: async () => ({ connection_id: 'test-lease' }) }; };
   globalThis.document.getElementById = () => ({ textContent: '', style: { removeProperty: () => {} }, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = () => {};
@@ -3495,7 +3472,9 @@ test('closeSession reapplies fit layout when returning to dashboard', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const fnStart = source.indexOf('function closeSession');
   assert.ok(fnStart !== -1, 'closeSession function must exist');
-  const fnBody = source.substring(fnStart, fnStart + 1500);
+  const fnEnd = source.indexOf('\n}', fnStart);
+  assert.ok(fnEnd !== -1, 'closeSession must have a complete function body');
+  const fnBody = source.substring(fnStart, fnEnd + 2);
   assert.ok(
     fnBody.includes('applyFitLayout'),
     'closeSession must call applyFitLayout for fit mode when returning to dashboard'
@@ -3907,9 +3886,9 @@ test('showPreview suppresses the overlay for the already-displayed session', () 
 test('openSession gates connect/PATCH writes behind reconcileOnly', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const fnStart = source.indexOf('async function openSession');
-  const fnBody = source.substring(fnStart, fnStart + 4800);
+  const fnBody = source.substring(fnStart, source.indexOf('\nfunction closeSession', fnStart));
   assert.ok(/if \(!opts\.reconcileOnly\)/.test(fnBody),
-    'openSession must guard the /connect POST + PATCH /api/state behind !opts.reconcileOnly so a reconcile follows the server without re-spawning the shared ttyd');
+    'openSession must guard /connect behind !opts.reconcileOnly: a reconcile must not re-spawn shared ttyd or mutate server active state');
   // Terminal still mounts in both paths (client-only re-attach for reconcile).
   const openTermIdx = fnBody.indexOf('_openTerminal');
   assert.ok(openTermIdx !== -1, 'openSession must still mount the terminal in the reconcile path');
@@ -3946,12 +3925,12 @@ test('reconcileViewingSession follows the server active_session WITHOUT re-issui
 test('readViewingHeaders decodes the folded active-session headers', () => {
   const mk = (h) => ({ headers: { get: (k) => (k in h ? h[k] : null) } });
   assert.deepEqual(
-    app.readViewingHeaders(mk({ 'X-Muxplex-Active-Session': 'pr%C3%B8ve%20m%C3%BC', 'X-Muxplex-Active-Remote-Id': 'dev-2' })),
-    { name: 'prøve mü', remoteId: 'dev-2' },
+    app.readViewingHeaders(mk({ 'X-Muxplex-Active-Session': 'pr%C3%B8ve%20m%C3%BC', 'X-Muxplex-Active-Remote-Id': 'dev-2', 'X-Muxplex-Active-Connection-Id': 'epoch-2' })),
+    { name: 'prøve mü', remoteId: 'dev-2', connectionId: 'epoch-2' },
     'percent-encoded header values must be decoded (session names may be non-ASCII)');
   assert.deepEqual(
     app.readViewingHeaders(mk({ 'X-Muxplex-Active-Session': '', 'X-Muxplex-Active-Remote-Id': '' })),
-    { name: null, remoteId: '' },
+    { name: null, remoteId: '', connectionId: '' },
     'empty header means no active session — a valid answer, not a missing one');
   assert.equal(app.readViewingHeaders(mk({})), null,
     'absent headers must return null so the caller falls back to GET /api/state');
@@ -4022,19 +4001,21 @@ test('reconcileViewingSession converges on the hinted server session (cross-brow
   app._setLastLocalOpenAt(0);
   app._setViewingSession('alpha');
   app._setViewingRemoteId('');
+  app._setLastCommittedNavigation({ name: 'alpha', remoteId: '', connectionId: 'lease-alpha' });
 
-  // Same session as the server's -> no-op, no work.
-  await app.reconcileViewingSession({ name: 'alpha', remoteId: '' });
+  // Same name AND same lease as the committed server session -> no-op.
+  await app.reconcileViewingSession({ name: 'alpha', remoteId: '', connectionId: 'lease-alpha' });
   assert.deepEqual(fetchedUrls, [], 'reconcile must do nothing while already on the server session');
 
   // Server moved to 'beta' -> adopt it, still without a /api/state read.
-  await app.reconcileViewingSession({ name: 'beta', remoteId: '' });
+  await app.reconcileViewingSession({ name: 'beta', remoteId: '', connectionId: 'lease-beta' });
   assert.ok(!fetchedUrls.includes('/api/state'),
     'the hint must be used instead of a second request');
   assert.equal(app._getViewingSession(), 'beta',
     'reconcile must adopt the server session so the sidebar tracks the truly-displayed session');
 
   app._setViewingSession(null);
+  app._setLastCommittedNavigation(null);
   globalThis.fetch = undefined;
 });
 
@@ -4585,7 +4566,7 @@ test('openSession with integer remoteId=0 POSTs to federation proxy URL, not loc
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
+  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true, json: async () => ({ connection_id: 'test-lease' }) }; };
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = () => {};
@@ -4613,7 +4594,7 @@ test('openSession with integer remoteId=0 passes 0 to window._openTerminal as se
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async () => ({ ok: true });
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ connection_id: 'test-lease' }) });
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = (fn) => { fn(); };
@@ -4631,14 +4612,14 @@ test('openSession with integer remoteId=0 passes 0 to window._openTerminal as se
   globalThis.setTimeout = origSetTimeout;
 });
 
-test('closeSession after openSession with remoteId=0 does NOT fire DELETE /api/sessions/current', async () => {
+test('closeSession with numeric remoteId=0 issues only a guarded coordinator disconnect', async () => {
   const origFetch = globalThis.fetch;
   const origGetById = globalThis.document.getElementById;
   const origQS = globalThis.document.querySelector;
   const origSetTimeout = globalThis.setTimeout;
 
   // Open a remote session with remoteId=0 — sets _viewingRemoteId = 0
-  globalThis.fetch = async () => ({ ok: true });
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ connection_id: 'test-lease' }) });
   globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
   globalThis.document.querySelector = () => null;
   globalThis.setTimeout = () => {};
@@ -4652,13 +4633,15 @@ test('closeSession after openSession with remoteId=0 does NOT fire DELETE /api/s
 
   // Reset fetch tracking
   const fetchCalls = [];
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
+  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true, json: async () => ({ connection_id: 'test-lease' }) }; };
 
   await app.closeSession();
   await new Promise((r) => setTimeout(r, 0));
 
-  const deleteCall = fetchCalls.find((c) => c.url === '/api/sessions/current' && c.opts && c.opts.method === 'DELETE');
-  assert.ok(!deleteCall, 'closeSession must NOT fire DELETE for remoteId=0 session (it is a remote session)');
+  const deleteCall = fetchCalls.find((c) => c.url.startsWith('/api/sessions/current?') && c.opts && c.opts.method === 'DELETE');
+  assert.ok(deleteCall, 'remote view should clear only the coordinator active pair');
+  assert.match(deleteCall.url, /expected_session=muxplex-updates/);
+  assert.match(deleteCall.url, /expected_remote_id=0/);
 
   globalThis.fetch = origFetch;
   globalThis.document.getElementById = origGetById;
@@ -4982,65 +4965,54 @@ test('renderSheetList item HTML includes data-remote-id attribute for remote ses
   globalThis.document.getElementById = origGetById;
 });
 
-test('openSession PATCHes /api/state with active_remote_id after successful connect', async () => {
-  const fetchCalls = [];
-  const origFetch = globalThis.fetch;
-  const origGetById = globalThis.document.getElementById;
-  const origQS = globalThis.document.querySelector;
-  const origSetTimeout = globalThis.setTimeout;
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
-  globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
-  globalThis.document.querySelector = () => null;
-  globalThis.setTimeout = (fn) => { fn(); };  // invoke immediately so animation resolves
-  globalThis.window._openTerminal = () => {};
-
-  await app.openSession('remote-session', { remoteId: 'fed-abc123' });
-
-  const patchCall = fetchCalls.find((c) => c.url === '/api/state' && c.opts && c.opts.method === 'PATCH');
-  assert.ok(patchCall, 'openSession should PATCH /api/state after successful connect');
-  const body = JSON.parse(patchCall.opts.body);
-  assert.strictEqual(body.active_remote_id, 'fed-abc123', 'PATCH body should include active_remote_id');
-
-  globalThis.fetch = origFetch;
-  globalThis.document.getElementById = origGetById;
-  globalThis.document.querySelector = origQS;
-  globalThis.setTimeout = origSetTimeout;
+test('remote open does not perform a late /api/state PATCH (server owns the pair)', async () => {
+  const calls = [];
+  const old = { fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout };
+  globalThis.fetch = async (url, opts) => { calls.push({ url, opts }); return { ok: true, json: async () => ({ connection_id: 'test-lease' }) }; };
+  document.getElementById = () => ({ textContent: '', style: {}, classList: { add() {}, remove() {} } });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = () => {};
+  try {
+    await app.openSession('remote-session', { remoteId: 'fed-abc123' });
+    assert.ok(calls.some(c => c.url === '/api/federation/fed-abc123/connect/remote-session'),
+      'remote /connect now commits session and remote ID atomically');
+    assert.ok(!calls.some(c => c.url === '/api/state' && c.opts?.method === 'PATCH'),
+      'a stale PATCH used to overwrite another tab’s later navigation');
+  } finally {
+    app.closeSession({ skipDisconnect: true });
+    globalThis.fetch = old.fetch;
+    document.getElementById = old.get;
+    document.querySelector = old.qs;
+    globalThis.setTimeout = old.timer;
+  }
 });
 
-test('closeSession PATCHes /api/state to clear active_remote_id', async () => {
-  const origFetch = globalThis.fetch;
-  const origGetById = globalThis.document.getElementById;
-  const origQS = globalThis.document.querySelector;
-  const origSetTimeout = globalThis.setTimeout;
-
-  // Open a remote session first so _viewingRemoteId is set
-  globalThis.fetch = async () => ({ ok: true });
-  globalThis.document.getElementById = () => ({ textContent: '', style: {}, classList: { remove: () => {}, add: () => {} } });
-  globalThis.document.querySelector = () => null;
-  globalThis.setTimeout = (fn) => { fn(); };
-  globalThis.window._openTerminal = () => {};
-  globalThis.window._closeTerminal = () => {};
-
-  await app.openSession('remote-sess', { remoteId: 'fed-abc123' });
-
-  globalThis.setTimeout = origSetTimeout;
-
-  // Reset fetch tracking
-  const fetchCalls = [];
-  globalThis.fetch = async (url, opts) => { fetchCalls.push({ url, opts }); return { ok: true }; };
-
-  await app.closeSession();
-  await new Promise((r) => setTimeout(r, 0));
-
-  const patchCall = fetchCalls.find((c) => c.url === '/api/state' && c.opts && c.opts.method === 'PATCH');
-  assert.ok(patchCall, 'closeSession should PATCH /api/state to clear remote session state');
-  const body = JSON.parse(patchCall.opts.body);
-  assert.strictEqual(body.active_remote_id, null, 'PATCH should clear active_remote_id to null');
-
-  globalThis.fetch = origFetch;
-  globalThis.document.getElementById = origGetById;
-  globalThis.document.querySelector = origQS;
-  globalThis.setTimeout = origSetTimeout;
+test('a remote close uses expected pair instead of unconditional active-state PATCH', async () => {
+  const calls = [];
+  const old = { fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout };
+  globalThis.fetch = async (url, opts) => { calls.push({ url, opts }); return { ok: true, json: async () => ({ connection_id: 'test-lease' }) }; };
+  document.getElementById = () => ({ textContent: '', style: {}, classList: { add() {}, remove() {} } });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = () => {};
+  window._closeTerminal = () => {};
+  try {
+    await app.openSession('remote-sess', { remoteId: 'fed-abc123' });
+    await app.closeSession();
+    await Promise.resolve();
+    const del = calls.find(c => c.opts?.method === 'DELETE');
+    assert.ok(del && del.url.includes('expected_session=remote-sess') &&
+      del.url.includes('expected_remote_id=fed-abc123'));
+    assert.ok(!calls.some(c => c.url === '/api/state' && c.opts?.method === 'PATCH'));
+  } finally {
+    globalThis.fetch = old.fetch;
+    document.getElementById = old.get;
+    document.querySelector = old.qs;
+    globalThis.setTimeout = old.timer;
+  }
 });
 
 // ─── Task 2: Replace localStorage storage layer with server-settings-cache ───
@@ -8326,5 +8298,230 @@ test('an open menu survives a re-render that REORDERS folders (name keys, not in
   } finally {
     w.restore();
     unstub();
+  }
+});
+
+// ─── Regression #31: stale navigation and header pointer identity ───────────
+async function withNavigationHarness(run) {
+  const old = { fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout,
+    open: window._openTerminal, close: window._closeTerminal };
+  const pending = new Map();
+  const requests = [];
+  const terminals = [];
+  globalThis.fetch = (url, opts = {}) => {
+    requests.push({ url, opts });
+    if (opts.method === 'POST' && url.includes('/connect')) {
+      return new Promise((resolve, reject) => {
+        pending.set(url, {
+          resolve: (value) => resolve({
+            ...value,
+            json: async () => ({ connection_id: 'test-lease-' + url })
+          }),
+          reject
+        });
+      });
+    }
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  document.getElementById = () => ({
+    textContent: '', style: {},
+    classList: { add() {}, remove() {} },
+  });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = (name, rid) => terminals.push([name, rid]);
+  window._closeTerminal = () => {};
+  async function waitFor(url) {
+    for (let i = 0; i < 20 && !pending.has(url); i++) await Promise.resolve();
+    assert.ok(pending.has(url), 'expected request ' + url);
+    return pending.get(url);
+  }
+  try {
+    await run({ pending, requests, terminals, waitFor });
+  } finally {
+    // Cancel stray UI work without issuing any new server mutation.
+    app.closeSession({ skipDisconnect: true });
+    app._setLastLocalOpenAt(0);
+    globalThis.fetch = old.fetch;
+    document.getElementById = old.get;
+    document.querySelector = old.qs;
+    globalThis.setTimeout = old.timer;
+    window._openTerminal = old.open;
+    window._closeTerminal = old.close;
+  }
+}
+
+test('rapid A then B switch waits for A server operation, and only mounts B', async () => {
+  await withNavigationHarness(async ({ requests, terminals, waitFor }) => {
+    const a = app.openSession('alpha', { skipAnimation: true });
+    const first = await waitFor('/api/sessions/alpha/connect');
+    const b = app.openSession('beta', { skipAnimation: true });
+    assert.deepEqual(requests.filter(x => x.url.includes('/connect')).map(x => x.url),
+      ['/api/sessions/alpha/connect'], 'B must be serialized behind in-flight A');
+    first.resolve({ ok: true });
+    await a;
+    const second = await waitFor('/api/sessions/beta/connect');
+    second.resolve({ ok: true });
+    await b;
+    assert.deepEqual(terminals, [['beta', '']], 'stale A continuation must not mount');
+    assert.equal(app._getViewingSession(), 'beta');
+  });
+});
+
+test('rapid A, B, C drops B before it sends a /connect POST', async () => {
+  await withNavigationHarness(async ({ requests, terminals, waitFor }) => {
+    const a = app.openSession('alpha', { skipAnimation: true });
+    const first = await waitFor('/api/sessions/alpha/connect');
+    const b = app.openSession('beta', { skipAnimation: true });
+    const c = app.openSession('charlie', { skipAnimation: true });
+    first.resolve({ ok: true });
+    await a;
+    await b;
+    const last = await waitFor('/api/sessions/charlie/connect');
+    last.resolve({ ok: true });
+    await c;
+    assert.deepEqual(requests.filter(x => x.url.includes('/connect')).map(x => x.url),
+      ['/api/sessions/alpha/connect', '/api/sessions/charlie/connect']);
+    assert.deepEqual(terminals, [['charlie', '']]);
+  });
+});
+
+test('an older failed /connect does not close a newer successful chat', async () => {
+  await withNavigationHarness(async ({ terminals, waitFor }) => {
+    const a = app.openSession('alpha', { skipAnimation: true });
+    const first = await waitFor('/api/sessions/alpha/connect');
+    const b = app.openSession('beta', { skipAnimation: true });
+    first.reject(new Error('stale failed connect'));
+    await a;
+    const second = await waitFor('/api/sessions/beta/connect');
+    second.resolve({ ok: true });
+    await b;
+    assert.equal(app._getViewingSession(), 'beta');
+    assert.deepEqual(terminals, [['beta', '']]);
+  });
+});
+
+test('a delayed local /connect cannot be overwritten by old poll reconciliation', async () => {
+  await withNavigationHarness(async ({ waitFor }) => {
+    const open = app.openSession('slow', { skipAnimation: true });
+    const slow = await waitFor('/api/sessions/slow/connect');
+    app._setLastLocalOpenAt(0); // simulate a request taking longer than 3s
+    await app.reconcileViewingSession({ name: 'old-session', remoteId: '' });
+    assert.equal(app._getViewingSession(), 'slow',
+      'pending navigation must win over old shared active-session hints');
+    slow.resolve({ ok: true });
+    await open;
+  });
+});
+
+test('same-named federated sessions preserve device ID through serialized navigation', async () => {
+  await withNavigationHarness(async ({ terminals, waitFor }) => {
+    const a = app.openSession('shared', { remoteId: 'device-a', skipAnimation: true });
+    const first = await waitFor('/api/federation/device-a/connect/shared');
+    const b = app.openSession('shared', { remoteId: 'device-b', skipAnimation: true });
+    first.resolve({ ok: true });
+    await a;
+    const second = await waitFor('/api/federation/device-b/connect/shared');
+    second.resolve({ ok: true });
+    await b;
+    assert.deepEqual(terminals, [['shared', 'device-b']]);
+  });
+});
+
+test('header press identity blocks a click retargeted by poll-driven pill/menu reorder', () => {
+  const el = (data) => {
+    const node = { dataset: data };
+    node.closest = () => node;
+    return node;
+  };
+  const a = el({ session: 'alpha', remoteId: 'device-a' });
+  const b = el({ session: 'beta', remoteId: 'device-a' });
+  const anotherDevice = el({ session: 'alpha', remoteId: 'device-b' });
+  app._epRecordPointerDown({ button: 0, target: a });
+  assert.equal(app._epClickMatchesPointer({ detail: 1, target: b }), false);
+  app._epRecordPointerDown({ button: 0, target: a });
+  assert.equal(app._epClickMatchesPointer({ detail: 1, target: anotherDevice }), false);
+  app._epRecordPointerDown({ button: 0, target: a });
+  assert.equal(app._epClickMatchesPointer({ detail: 1, target: a }), true);
+  app._epRecordPointerDown({ button: 0, target: el({ pillMenu: 'c:f:old' }) });
+  assert.equal(app._epClickMatchesPointer({
+    detail: 1, target: el({ pillMenu: 'c:f:new' }),
+  }), false);
+  app._epRecordPointerDown({ button: 0, target: a });
+  assert.equal(app._epClickMatchesPointer({ detail: 0, target: b }), true,
+    'keyboard-triggered clicks must remain usable');
+});
+
+test('initial openSession forwards exactly the server-issued connection lease to terminal', async () => {
+  const previous = {
+    fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout,
+    open: window._openTerminal, close: window._closeTerminal
+  };
+  const mounted = [];
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    calls.push(url);
+    return {
+      ok: true,
+      json: async () => ({ connection_id: 'server-lease-of-alpha' })
+    };
+  };
+  document.getElementById = () => ({
+    style: {}, textContent: '',
+    classList: { add() {}, remove() {} },
+  });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = (...args) => mounted.push(args);
+  window._closeTerminal = () => {};
+  try {
+    await app.openSession('alpha', { skipAnimation: true });
+    assert.ok(calls.includes('/api/sessions/alpha/connect'));
+    assert.equal(mounted.length, 1);
+    assert.equal(mounted[0][0], 'alpha');
+    assert.equal(mounted[0][1], '');
+    assert.equal(mounted[0][3], 'server-lease-of-alpha',
+      'socket must carry the exact /connect response lease');
+  } finally {
+    await app.closeSession({ skipDisconnect: true });
+    globalThis.fetch = previous.fetch;
+    document.getElementById = previous.get;
+    document.querySelector = previous.qs;
+    globalThis.setTimeout = previous.timer;
+    window._openTerminal = previous.open;
+    window._closeTerminal = previous.close;
+  }
+});
+
+test('openSession refuses to mount when a legacy server omits connection_id', async () => {
+  const previous = {
+    fetch: globalThis.fetch, get: document.getElementById,
+    qs: document.querySelector, timer: globalThis.setTimeout,
+    open: window._openTerminal, close: window._closeTerminal
+  };
+  let mounted = 0;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+  document.getElementById = () => ({
+    style: {}, textContent: '',
+    classList: { add() {}, remove() {} },
+  });
+  document.querySelector = () => null;
+  globalThis.setTimeout = (fn) => { fn(); return 1; };
+  window._openTerminal = () => mounted++;
+  window._closeTerminal = () => {};
+  try {
+    await app.openSession('legacy-peer', { skipAnimation: true });
+    assert.equal(mounted, 0, 'unbound WebSocket is unsafe');
+    assert.equal(app._getViewingSession(), null);
+  } finally {
+    await app.closeSession({ skipDisconnect: true });
+    globalThis.fetch = previous.fetch;
+    document.getElementById = previous.get;
+    document.querySelector = previous.qs;
+    globalThis.setTimeout = previous.timer;
+    window._openTerminal = previous.open;
+    window._closeTerminal = previous.close;
   }
 });

@@ -16,6 +16,11 @@ from muxplex.main import app
 @pytest.fixture(autouse=True)
 def patch_startup_and_state(tmp_path, monkeypatch):
     """Redirect state/PID files to tmp_path, mock kill_orphan_ttyd, replace _poll_loop with no-op."""
+    # A new lock per test avoids binding the shared ttyd mutex to the
+    # different event loops used by TestClient and async regression tests.
+    import asyncio
+    monkeypatch.setattr("muxplex.main._ttyd_transition_lock", asyncio.Lock())
+
     # Redirect state files
     tmp_state_dir = tmp_path / "state"
     tmp_state_path = tmp_state_dir / "state.json"
@@ -652,6 +657,7 @@ def test_connect_session_returns_200(client, monkeypatch):
     assert response.status_code == 200
     data = response.json()
     assert data["active_session"] == "alpha"
+    assert isinstance(data["connection_id"], str) and data["connection_id"]
     assert data["ttyd_port"] == 7682
 
 
@@ -2401,6 +2407,7 @@ def test_federation_connect_proxies_to_remote(client, monkeypatch, tmp_path):
         mock_resp.status_code = 200
         mock_resp.json.return_value = {
             "active_session": "my-session",
+            "connection_id": "remote-test-lease",
             "ttyd_port": 7682,
         }
         return mock_resp
@@ -2428,7 +2435,11 @@ def test_federation_connect_proxies_to_remote(client, monkeypatch, tmp_path):
     # Verify the response is the remote's JSON
     data = response.json()
     assert data["active_session"] == "my-session"
+    assert data["active_remote_id"] == "0"
     assert data["ttyd_port"] == 7682
+    from muxplex.state import load_state
+    state = load_state()
+    assert (state["active_session"], state["active_remote_id"]) == ("my-session", "0")
 
 
 def test_federation_connect_returns_404_for_invalid_remote_id(
@@ -3856,6 +3867,7 @@ def test_federation_connect_by_device_id(client, monkeypatch, tmp_path):
         mock_resp.status_code = 200
         mock_resp.json.return_value = {
             "active_session": "my-session",
+            "connection_id": "remote-test-lease",
             "ttyd_port": 7682,
         }
         return mock_resp
@@ -4108,3 +4120,509 @@ def test_rename_session_blank_name_is_422(client, monkeypatch, tmp_path):
     )
     response = client.post("/api/sessions/old/rename", json={"new_name": "   "})
     assert response.status_code == 422
+
+# ---------------------------------------------------------------------------
+# Regression #31: shared ttyd navigation must be serialized and identity-safe.
+# ---------------------------------------------------------------------------
+
+
+async def test_two_concurrent_connects_never_interleave_ttyd_kill_spawn(monkeypatch):
+    """A blocked first spawn cannot let a second /connect kill its new ttyd."""
+    import asyncio
+    import muxplex.main as main_mod
+    from muxplex.state import load_state
+
+    monkeypatch.setattr(main_mod, "get_session_list", lambda: ["alpha", "beta"])
+    events = []
+    first_spawn_started = asyncio.Event()
+    allow_first_spawn = asyncio.Event()
+
+    async def mock_kill():
+        events.append("kill")
+
+    async def mock_spawn(name):
+        events.append(f"spawn:{name}")
+        if name == "alpha":
+            first_spawn_started.set()
+            await allow_first_spawn.wait()
+
+    monkeypatch.setattr(main_mod, "kill_ttyd", mock_kill)
+    monkeypatch.setattr(main_mod, "spawn_ttyd", mock_spawn)
+
+    first = asyncio.create_task(main_mod.connect_session("alpha"))
+    await asyncio.wait_for(first_spawn_started.wait(), timeout=2)
+    second = asyncio.create_task(main_mod.connect_session("beta"))
+    await asyncio.sleep(0)
+    assert events == ["kill", "spawn:alpha"], "second operation must wait for first"
+    allow_first_spawn.set()
+    await asyncio.gather(first, second)
+    assert events == ["kill", "spawn:alpha", "kill", "spawn:beta"]
+    state = load_state()
+    assert state["active_session"] == "beta"
+    assert state["active_remote_id"] is None
+
+
+def test_local_connect_clears_previous_remote_id_atomically(client, monkeypatch):
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "same-name"
+    state["active_remote_id"] = "remote-uuid"
+    save_state(state)
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["same-name"])
+
+    async def mock_kill():
+        return True
+
+    async def mock_spawn(name):
+        assert name == "same-name"
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+    response = client.post("/api/sessions/same-name/connect")
+    assert response.status_code == 200
+    state = load_state()
+    assert (state["active_session"], state["active_remote_id"]) == ("same-name", None)
+
+
+def test_stale_tab_close_skips_current_other_tab_connection(client, monkeypatch):
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "beta"
+    save_state(state)
+    killed = []
+
+    async def mock_kill():
+        killed.append(True)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    response = client.delete(
+        "/api/sessions/current?expected_session=alpha&expected_remote_id="
+    )
+    assert response.status_code == 200
+    assert response.json()["skipped"] is True
+    assert load_state()["active_session"] == "beta"
+    assert killed == [], "stale Back must not kill beta's ttyd"
+
+
+def test_closing_remote_clears_coordinator_pair_without_killing_local_ttyd(client, monkeypatch):
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "remote-chat"
+    state["active_remote_id"] = "fed-b"
+    save_state(state)
+    killed = []
+
+    async def mock_kill():
+        killed.append(True)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    response = client.delete(
+        "/api/sessions/current?expected_session=remote-chat&expected_remote_id=fed-b"
+    )
+    assert response.status_code == 200
+    assert load_state()["active_session"] is None
+    assert load_state()["active_remote_id"] is None
+    assert killed == [], "closing coordinator view must not terminate remote ttyd"
+
+
+@pytest.mark.parametrize("remote_id", ["remote-uuid", 0])
+async def test_poll_never_clears_a_remote_active_session_using_local_tmux_names(
+    monkeypatch, remote_id
+):
+    import muxplex.main as main_mod
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "remote-chat"
+    state["active_remote_id"] = remote_id
+    save_state(state)
+
+    async def enumerate_local():
+        return ["local-chat"]
+
+    async def snapshot(names):
+        return {"local-chat": "ok"}
+
+    async def paths():
+        return {}
+
+    async def bells(names, state):
+        return None
+
+    monkeypatch.setattr(main_mod, "enumerate_sessions", enumerate_local)
+    monkeypatch.setattr(main_mod, "snapshot_all", snapshot)
+    monkeypatch.setattr(main_mod, "list_session_paths", paths)
+    monkeypatch.setattr(main_mod, "process_bell_flags", bells)
+    monkeypatch.setattr(main_mod, "apply_bell_clear_rule", lambda state: None)
+    monkeypatch.setattr(main_mod, "_federation_client", None)
+    monkeypatch.setattr(main_mod, "_settings_sync_counter", 0)
+
+    async def forbidden_kill():
+        raise AssertionError("remote active session must not be reaped")
+
+    monkeypatch.setattr(main_mod, "kill_ttyd", forbidden_kill)
+    await main_mod._run_poll_cycle()
+    latest = load_state()
+    assert (latest["active_session"], latest["active_remote_id"]) == (
+        "remote-chat", remote_id
+    )
+
+def test_active_session_poll_headers_preserve_legacy_numeric_device_zero(client, monkeypatch):
+    from muxplex.state import empty_state, save_state
+    state = empty_state()
+    state["active_session"] = "shared-name"
+    state["active_remote_id"] = 0
+    save_state(state)
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["local-only"])
+    response = client.get("/api/sessions")
+    assert response.status_code == 200
+    assert response.headers["X-Muxplex-Active-Session"] == "shared-name"
+    assert response.headers["X-Muxplex-Active-Remote-Id"] == "0"
+
+@pytest.mark.parametrize("new_active", [None, "other-chat"])
+def test_expired_session_reconnect_returns_404_before_lease_cas(
+    client, monkeypatch, new_active
+):
+    """An ended tmux session reports 'Session ended', not 'switched tab'."""
+    from muxplex.state import empty_state, load_state, save_state
+
+    state = empty_state()
+    state["active_session"] = new_active
+    state["active_connection_id"] = "other-lease" if new_active else None
+    save_state(state)
+    calls = []
+
+    async def forbid_kill():
+        calls.append("kill")
+
+    async def forbid_spawn(name):
+        calls.append("spawn:" + name)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", forbid_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", forbid_spawn)
+    # A completed process can leave zero tmux sessions, not just a list that
+    # excludes this name; empty must still be interpreted as absent on reconnect.
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+
+    async def no_tmux_session(*args):
+        raise RuntimeError("session not found")
+
+    monkeypatch.setattr("muxplex.main.run_tmux", no_tmux_session)
+    response = client.post(
+        "/api/sessions/dead/connect?reconnect=true&connection_id=old-lease"
+    )
+    assert response.status_code == 404, response.text
+    assert calls == [], "a dead session must not restart ttyd"
+    assert load_state() == state, "rejected reconnect may not mutate state"
+
+
+def test_stale_local_reconnect_returns_409_without_killing_ttyd(client, monkeypatch):
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "newer-chat"
+    state["active_connection_id"] = "newer-lease"
+    save_state(state)
+    calls = []
+
+    async def mock_kill():
+        calls.append("kill")
+
+    async def mock_spawn(name):
+        calls.append("spawn:" + name)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+    monkeypatch.setattr(
+        "muxplex.main.get_session_list", lambda: ["old-chat", "newer-chat"]
+    )
+    response = client.post("/api/sessions/old-chat/connect?reconnect=true&connection_id=old-lease")
+    assert response.status_code == 409
+    assert calls == []
+    assert load_state()["active_session"] == "newer-chat"
+
+
+def test_reconnect_of_current_local_chat_remains_allowed(client, monkeypatch):
+    from muxplex.state import empty_state, save_state, load_state
+
+    state = empty_state()
+    state["active_session"] = "current-chat"
+    state["active_connection_id"] = "current-lease"
+    save_state(state)
+    calls = []
+
+    async def mock_kill():
+        calls.append("kill")
+
+    async def mock_spawn(name):
+        calls.append("spawn:" + name)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+    monkeypatch.setattr(
+        "muxplex.main.get_session_list", lambda: ["current-chat"]
+    )
+    response = client.post("/api/sessions/current-chat/connect?reconnect=true&connection_id=current-lease")
+    assert response.status_code == 200
+    assert response.json()["connection_id"] == "current-lease"
+    assert calls == ["kill", "spawn:current-chat"]
+    assert load_state()["active_session"] == "current-chat"
+    assert load_state()["active_connection_id"] == "current-lease"
+
+
+def test_stale_federation_reconnect_returns_409_without_remote_POST(
+    client, monkeypatch, tmp_path
+):
+    from muxplex.state import empty_state, save_state, load_state
+    import muxplex.settings as settings_mod
+    import json
+
+    settings_path = tmp_path / "settings-reconnect.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [{"url": "http://remote:8088", "device_id": "dev-a",
+                              "name": "Dev A", "key": "secret"}]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    state = empty_state()
+    state["active_session"] = "other-chat"
+    state["active_remote_id"] = "dev-a"
+    state["active_connection_id"] = "other-lease"
+    save_state(state)
+    posts = []
+
+    async def mock_post(url, **kwargs):
+        posts.append(url)
+        raise AssertionError("must not contact remote for stale reconnect")
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", mock_post)
+    response = client.post("/api/federation/dev-a/connect/old-chat?reconnect=true&connection_id=old-lease")
+    assert response.status_code == 409
+    assert posts == []
+    assert load_state()["active_session"] == "other-chat"
+
+
+def test_remote_reconnect_for_active_pair_forwards_guard(client, monkeypatch, tmp_path):
+    from muxplex.state import empty_state, save_state
+    import muxplex.settings as settings_mod
+    import json
+    from unittest.mock import MagicMock
+
+    settings_path = tmp_path / "settings-reconnect.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [{"url": "http://remote:8088", "device_id": "dev-a",
+                              "name": "Dev A", "key": "secret"}]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    state = empty_state()
+    state["active_session"] = "active-chat"
+    state["active_remote_id"] = "dev-a"
+    state["active_connection_id"] = "existing-remote-lease"
+    save_state(state)
+    posts = []
+
+    async def mock_post(url, **kwargs):
+        posts.append(url)
+        resp = MagicMock()
+        resp.json.return_value = {"active_session": "active-chat", "ttyd_port": 7682,
+                                  "connection_id": "existing-remote-lease"}
+        return resp
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", mock_post)
+    response = client.post(
+        "/api/federation/dev-a/connect/active-chat"
+        "?reconnect=true&connection_id=existing-remote-lease"
+    )
+    assert response.status_code == 200
+    assert response.json()["connection_id"] == "existing-remote-lease"
+    assert posts == [
+        "http://remote:8088/api/sessions/active-chat/connect"
+        "?reconnect=true&connection_id=existing-remote-lease"
+    ]
+    from muxplex.state import load_state
+    persisted = load_state()
+    assert (persisted["active_session"], persisted["active_remote_id"],
+            persisted["active_connection_id"]) == (
+        "active-chat", "dev-a", "existing-remote-lease"
+    )
+
+@pytest.mark.parametrize("old_lease", ["L1", "", None])
+def test_local_reconnect_aba_lease_rejected_before_ttyd_mutation(
+    client, monkeypatch, old_lease
+):
+    """A delayed alpha/L1 reconnect must not kill the newer alpha/L3 ttyd."""
+    from muxplex.state import empty_state, save_state, load_state
+
+    latest = empty_state()
+    latest["active_session"] = "alpha"  # A -> B -> A ended at the same name
+    latest["active_connection_id"] = "L3"
+    save_state(latest)
+    operations = []
+
+    async def mock_kill():
+        operations.append("kill")
+
+    async def mock_spawn(name):
+        operations.append("spawn:" + name)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha", "beta"])
+
+    path = "/api/sessions/alpha/connect?reconnect=true"
+    if old_lease is not None:
+        path += "&connection_id=" + old_lease
+    response = client.post(path)
+
+    assert response.status_code == 409, response.text
+    assert operations == [], "a stale or missing lease may not restart ttyd"
+    assert load_state() == latest, "stale reconnect must not change persisted state"
+
+
+@pytest.mark.parametrize("old_lease", ["L1", "", None])
+def test_federation_reconnect_aba_lease_rejected_before_remote_post(
+    client, monkeypatch, tmp_path, old_lease
+):
+    """The coordinator must reject alpha/L1 after another tab returned to alpha/L3."""
+    import json
+    import muxplex.settings as settings_mod
+    from muxplex.state import empty_state, save_state, load_state
+
+    settings_path = tmp_path / "settings-reconnect-aba.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [
+            {"url": "http://remote:8088", "device_id": "dev-a", "key": "secret"}
+        ]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+
+    latest = empty_state()
+    latest["active_session"] = "alpha"
+    latest["active_remote_id"] = "dev-a"
+    latest["active_connection_id"] = "L3"
+    save_state(latest)
+    posts = []
+
+    async def forbidden_remote_post(url, **kwargs):
+        posts.append(url)
+        raise AssertionError("stale client lease must never reach the remote")
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", forbidden_remote_post)
+
+    path = "/api/federation/dev-a/connect/alpha?reconnect=true"
+    if old_lease is not None:
+        path += "&connection_id=" + old_lease
+    response = client.post(path)
+
+    assert response.status_code == 409, response.text
+    assert posts == [], "no remote request may be sent for an obsolete lease"
+    assert load_state() == latest, "rejected reconnect must not modify coordinator state"
+
+
+def test_federated_reconnect_rejects_remote_lease_rotation(client, monkeypatch, tmp_path):
+    """Even an incorrect 200 response cannot replace a validated reconnection lease."""
+    import httpx
+    import json
+    import muxplex.settings as settings_mod
+    from muxplex.state import empty_state, save_state, load_state
+
+    settings_path = tmp_path / "settings-remote-lease-change.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [
+            {"url": "http://remote:8088", "device_id": "dev-a", "key": "secret"}
+        ]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+
+    latest = empty_state()
+    latest["active_session"] = "alpha"
+    latest["active_remote_id"] = "dev-a"
+    latest["active_connection_id"] = "L3"
+    save_state(latest)
+    forwarded = []
+
+    async def rotated_lease_post(url, **kwargs):
+        forwarded.append(url)
+        return httpx.Response(
+            200, json={"active_session": "alpha", "connection_id": "L4"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", rotated_lease_post)
+    response = client.post(
+        "/api/federation/dev-a/connect/alpha?reconnect=true&connection_id=L3"
+    )
+
+    assert response.status_code == 409, response.text
+    assert forwarded == ["http://remote:8088/api/sessions/alpha/connect?reconnect=true&connection_id=L3"]
+    assert load_state() == latest, "remote must not rotate coordinator's reconnect lease"
+
+
+def test_upstream_reconnect_409_remains_409_at_coordinator(client, monkeypatch, tmp_path):
+    """An actual httpx 409 from a remote must not be converted to 502."""
+    import httpx
+    import json
+    import muxplex.settings as settings_mod
+    from muxplex.state import empty_state, save_state, load_state
+
+    settings_path = tmp_path / "settings-remote-409.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [
+            {"url": "http://node-b:8088", "device_id": "node-b", "key": "secret"}
+        ]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    state = empty_state()
+    state["active_session"] = "alpha"
+    state["active_remote_id"] = "node-b"
+    state["active_connection_id"] = "original-remote-lease"
+    save_state(state)
+
+    calls = []
+    async def reject_post(url, **kwargs):
+        calls.append(url)
+        return httpx.Response(
+            409, json={"detail": "Active session changed"},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", reject_post)
+    response = client.post("/api/federation/node-b/connect/alpha?reconnect=true&connection_id=original-remote-lease")
+    assert response.status_code == 409, response.text
+    assert calls == ["http://node-b:8088/api/sessions/alpha/connect?reconnect=true&connection_id=original-remote-lease"]
+    latest = load_state()
+    assert (latest["active_session"], latest["active_remote_id"],
+            latest["active_connection_id"]) == (
+        "alpha", "node-b", "original-remote-lease"
+    ), "a rejected reconnect must never publish a different lease"
+
+
+def test_federation_connect_rejects_legacy_peer_without_lease(client, monkeypatch, tmp_path):
+    """A legacy peer cannot safely perform identity-bound WebSocket handshakes."""
+    import httpx
+    import json
+    import muxplex.settings as settings_mod
+    from muxplex.state import empty_state, save_state, load_state
+
+    settings_path = tmp_path / "settings-legacy.json"
+    settings_path.write_text(json.dumps({
+        "remote_instances": [
+            {"url": "http://legacy:8088", "device_id": "legacy", "key": "secret"}
+        ]
+    }))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+
+    async def legacy_post(url, **kwargs):
+        return httpx.Response(
+            200, json={"active_session": "alpha", "ttyd_port": 7682},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(client.app.state.federation_client, "post", legacy_post)
+    save_state(empty_state())
+    response = client.post("/api/federation/legacy/connect/alpha")
+    assert response.status_code == 502
+    assert "connection_id" in response.json()["detail"]
+    assert load_state()["active_session"] is None
