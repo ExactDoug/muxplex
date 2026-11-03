@@ -400,7 +400,7 @@ async function reconcileViewingSession(viewing) {
       serverLease = state.active_connection_id || '';
     }
     // A state fallback GET can finish after a new local click. Never adopt its
-    // stale result, and never follow an old poll while /connect is in flight.
+    // stale result, and never follow an old poll during a pending navigation.
     if (observedNavigation !== _navigationSeq || _pendingNavigationId ||
         Date.now() - _lastLocalOpenAt < RECONCILE_GRACE_MS) return;
     // Never adopt a session without a server-issued ttyd attachment lease:
@@ -3978,6 +3978,11 @@ function _setLastLocalOpenAt(ts) {
   _lastLocalOpenAt = ts;
 }
 
+/** Test-only helper: establish the server-ACKed identity for convergence checks. */
+function _setLastCommittedNavigation(connected) {
+  _lastCommittedNavigation = connected;
+}
+
 /** Test-only helper: read _viewingSession directly. */
 function _getViewingSession() {
   return _viewingSession;
@@ -7500,6 +7505,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _setViewingSession,
     _getViewingSession,
     _setLastLocalOpenAt,
+    _setLastCommittedNavigation,
     handleGlobalKeydown,
     bindStaticEventListeners,
     openBottomSheet,
