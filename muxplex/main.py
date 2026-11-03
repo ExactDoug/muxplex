@@ -125,6 +125,23 @@ def _active_connection_id(state: dict) -> str:
     value = state.get("active_connection_id")
     return value if isinstance(value, str) else ""
 
+
+async def _session_exists_for_attach(name: str) -> bool:
+    """Check cached tmux membership, probing only on a cache miss.
+
+    A freshly created session or a server restart can precede the first
+    poll-cycle cache refresh. Treating an empty cache as proof of a dead tmux
+    session would strand a valid lease. Only the exceptional miss pays for
+    an exact-name tmux has-session probe.
+    """
+    if name in get_session_list():
+        return True
+    try:
+        await run_tmux("has-session", "-t", "=" + name)
+    except (RuntimeError, OSError):
+        return False
+    return True
+
 # Monotonic counter bumped once per completed poll cycle.  It is part of the
 # /api/sessions payload cache key so a cached body can never outlive the cycle
 # that produced it, even for inputs the key does not enumerate (e.g. a git repo
@@ -1057,7 +1074,10 @@ async def connect_session(
         # Check existence *before* the connection CAS so a dead session is 404,
         # not a misleading "another tab switched" 409.
         known = get_session_list()
-        if (reconnect and name not in known) or (not reconnect and known and name not in known):
+        if reconnect:
+            if not await _session_exists_for_attach(name):
+                raise HTTPException(status_code=404, detail=f"Session '{name}' not found")
+        elif known and name not in known:
             raise HTTPException(status_code=404, detail=f"Session '{name}' not found")
         if reconnect:
             # A previously scheduled WebSocket recovery must never hijack ttyd
@@ -1559,7 +1579,7 @@ async def terminal_ws_proxy(websocket: WebSocket) -> None:
                 # cache first, even if ttyd is still listening and even if the
                 # state already dropped the lease. A missing session is 4404,
                 # whereas a different active lease is 4409.
-                if expected and expected not in get_session_list():
+                if expected and not await _session_exists_for_attach(expected):
                     _log.info("WS proxy: refusing vanished session '%s'", expected)
                     await _reject_ended_terminal_ws(websocket)
                     return
