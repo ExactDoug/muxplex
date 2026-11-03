@@ -271,7 +271,9 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    Clearing the name while leaving the process alive is what made the loop self-sustaining
    with zero frontend involvement.
    (b) `terminal_ws_proxy` checks `get_session_list()` **before lease CAS and
-   before connecting to ttyd**, even if ttyd is still listening. A vanished session
+   before connecting to ttyd**, even if ttyd is still listening. A cached miss
+   is verified by exact-name `tmux has-session` before declaring it dead, since a
+   new session may not yet appear in the first poll snapshot. A vanished session
    returns WebSocket close **4404** (ended), distinct from **4409** (stale lease /
    session switched), with no ttyd auto-spawn. Otherwise, auto-spawn requires the
    matching `expected_session` and `connection_id` under
