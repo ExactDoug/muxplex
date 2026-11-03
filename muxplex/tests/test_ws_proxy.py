@@ -59,6 +59,8 @@ def patch_startup_and_state(tmp_path, monkeypatch):
     save_state(state)
     monkeypatch.setattr("muxplex.main._ttyd_transition_lock", asyncio.Lock())
     monkeypatch.setattr("muxplex.main._ttyd_is_listening", lambda: True)
+    # WS validates tmux membership even if the ttyd listener is still alive.
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["test-session"])
 
     # Redirect PID files
     tmp_pid_dir = tmp_path / "ttyd"
@@ -282,12 +284,30 @@ def test_ws_proxy_refuses_to_spawn_ttyd_for_vanished_session(monkeypatch):
     )
 
     with _make_authed_client() as c:
-        with c.websocket_connect("/terminal/ws?expected_session=ghost&connection_id=test-lease") as _:
-            pass
+        with c.websocket_connect("/terminal/ws?expected_session=ghost&connection_id=test-lease") as ws:
+            assert ws.receive()["code"] == 4404
 
     assert spawn_calls == [], (
         "spawn_ttyd must NOT be called for a session missing from the live list"
     )
+
+
+def test_ws_vanished_after_poll_cleared_active_lease_reports_4404(monkeypatch):
+    """A dead tmux session is ended, not a stale tab, even after poll reaping."""
+    from muxplex.state import empty_state, save_state
+    save_state(empty_state())  # poll already cleared name and connection lease
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["still-live"])
+    attaches = []
+    monkeypatch.setattr(
+        "muxplex.main.websockets.connect",
+        lambda *args, **kwargs: attaches.append(args[0]) or FakeTtydWs(responses=[]),
+    )
+    with _make_authed_client() as c:
+        with c.websocket_connect(
+            "/terminal/ws?expected_session=dead&connection_id=previous-lease"
+        ) as ws:
+            assert ws.receive()["code"] == 4404
+    assert attaches == [], "a vanished session must not reach ttyd"
 
 
 def test_terminal_ws_proxy_does_not_use_receive_bytes():
@@ -792,8 +812,9 @@ def test_missing_ttyd_lease_is_rejected_before_any_ttyd_connect(monkeypatch):
             assert ws.receive()["code"] == 4409
     assert attaches == []
 
-def test_federation_forwards_remote_4409_without_retrying_wrong_terminal(monkeypatch):
-    """The remote can change independently after coordinator CAS; preserve 4409."""
+@pytest.mark.parametrize("remote_code", [4409, 4404])
+def test_federation_forwards_remote_terminal_close_code(monkeypatch, remote_code):
+    """Forward stale-lease and ended-session close reasons from remote peers."""
     from muxplex.state import empty_state, save_state
     from websockets.exceptions import ConnectionClosedError
     from websockets.frames import Close
@@ -814,7 +835,7 @@ def test_federation_forwards_remote_4409_without_retrying_wrong_terminal(monkeyp
             # The remote accepted WS then rejected the lease before sending
             # ttyd output, as its local active session became beta.
             raise ConnectionClosedError(
-                Close(4409, "Active remote session changed"), None
+                Close(remote_code, "Remote session unavailable"), None
             )
             yield  # mark as async generator
 
@@ -826,4 +847,4 @@ def test_federation_forwards_remote_4409_without_retrying_wrong_terminal(monkeyp
         with c.websocket_connect(
             "/federation/node-b/terminal/ws?expected_session=alpha&connection_id=lease-alpha"
         ) as ws:
-            assert ws.receive()["code"] == 4409
+            assert ws.receive()["code"] == remote_code
