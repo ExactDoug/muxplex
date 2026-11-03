@@ -3472,7 +3472,9 @@ test('closeSession reapplies fit layout when returning to dashboard', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const fnStart = source.indexOf('function closeSession');
   assert.ok(fnStart !== -1, 'closeSession function must exist');
-  const fnBody = source.substring(fnStart, fnStart + 1500);
+  const fnEnd = source.indexOf('\n}', fnStart);
+  assert.ok(fnEnd !== -1, 'closeSession must have a complete function body');
+  const fnBody = source.substring(fnStart, fnEnd + 2);
   assert.ok(
     fnBody.includes('applyFitLayout'),
     'closeSession must call applyFitLayout for fit mode when returning to dashboard'
@@ -3999,8 +4001,9 @@ test('reconcileViewingSession converges on the hinted server session (cross-brow
   app._setLastLocalOpenAt(0);
   app._setViewingSession('alpha');
   app._setViewingRemoteId('');
+  app._setLastCommittedNavigation({ name: 'alpha', remoteId: '', connectionId: 'lease-alpha' });
 
-  // Same session as the server's -> no-op, no work.
+  // Same name AND same lease as the committed server session -> no-op.
   await app.reconcileViewingSession({ name: 'alpha', remoteId: '', connectionId: 'lease-alpha' });
   assert.deepEqual(fetchedUrls, [], 'reconcile must do nothing while already on the server session');
 
@@ -4012,6 +4015,7 @@ test('reconcileViewingSession converges on the hinted server session (cross-brow
     'reconcile must adopt the server session so the sidebar tracks the truly-displayed session');
 
   app._setViewingSession(null);
+  app._setLastCommittedNavigation(null);
   globalThis.fetch = undefined;
 });
 
