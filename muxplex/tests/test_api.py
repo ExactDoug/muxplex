@@ -4282,6 +4282,38 @@ def test_active_session_poll_headers_preserve_legacy_numeric_device_zero(client,
     assert response.headers["X-Muxplex-Active-Session"] == "shared-name"
     assert response.headers["X-Muxplex-Active-Remote-Id"] == "0"
 
+@pytest.mark.parametrize("new_active", [None, "other-chat"])
+def test_expired_session_reconnect_returns_404_before_lease_cas(
+    client, monkeypatch, new_active
+):
+    """An ended tmux session reports 'Session ended', not 'switched tab'."""
+    from muxplex.state import empty_state, load_state, save_state
+
+    state = empty_state()
+    state["active_session"] = new_active
+    state["active_connection_id"] = "other-lease" if new_active else None
+    save_state(state)
+    calls = []
+
+    async def forbid_kill():
+        calls.append("kill")
+
+    async def forbid_spawn(name):
+        calls.append("spawn:" + name)
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", forbid_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", forbid_spawn)
+    # A completed process can leave zero tmux sessions, not just a list that
+    # excludes this name; empty must still be interpreted as absent on reconnect.
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    response = client.post(
+        "/api/sessions/dead/connect?reconnect=true&connection_id=old-lease"
+    )
+    assert response.status_code == 404, response.text
+    assert calls == [], "a dead session must not restart ttyd"
+    assert load_state() == state, "rejected reconnect may not mutate state"
+
+
 def test_stale_local_reconnect_returns_409_without_killing_ttyd(client, monkeypatch):
     from muxplex.state import empty_state, save_state, load_state
 
