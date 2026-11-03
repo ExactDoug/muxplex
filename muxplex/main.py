@@ -1053,6 +1053,12 @@ async def connect_session(
     coordinator's active_remote_id is explicitly cleared for local sessions.
     """
     async with _ttyd_transition_lock:
+        # The tmux session may have exited while the browser was recovering.
+        # Check existence *before* the connection CAS so a dead session is 404,
+        # not a misleading "another tab switched" 409.
+        known = get_session_list()
+        if (reconnect and name not in known) or (not reconnect and known and name not in known):
+            raise HTTPException(status_code=404, detail=f"Session '{name}' not found")
         if reconnect:
             # A previously scheduled WebSocket recovery must never hijack ttyd
             # after a different browser selects another active session.
@@ -1068,9 +1074,6 @@ async def connect_session(
                 or _active_connection_id(latest) != connection_id
             ):
                 raise HTTPException(status_code=409, detail="Active session changed")
-        known = get_session_list()
-        if known and name not in known:
-            raise HTTPException(status_code=404, detail=f"Session '{name}' not found")
 
         # Reconnecting the *same* ttyd session keeps its lease so an existing
         # browser can safely reattach. A user navigation always gets a new
@@ -1520,6 +1523,12 @@ async def _reject_stale_terminal_ws(websocket: WebSocket) -> None:
     await websocket.close(code=4409, reason="Active terminal session changed")
 
 
+async def _reject_ended_terminal_ws(websocket: WebSocket) -> None:
+    """4404 means the named tmux session ended; it is not a tab switch."""
+    await websocket.accept(subprotocol="tty")
+    await websocket.close(code=4404, reason="Terminal session ended")
+
+
 def _ws_expected_connection(websocket: WebSocket) -> tuple[str, str]:
     """Require a session label AND opaque server-issued ttyd connection lease."""
     return (
@@ -1545,6 +1554,15 @@ async def terminal_ws_proxy(websocket: WebSocket) -> None:
     try:
         async with contextlib.AsyncExitStack() as stack:
             async with _ttyd_transition_lock:
+                # A completed tmux session can disappear before the poll clears
+                # its stored connection lease. Always check the live-session
+                # cache first, even if ttyd is still listening and even if the
+                # state already dropped the lease. A missing session is 4404,
+                # whereas a different active lease is 4409.
+                if expected and expected not in get_session_list():
+                    _log.info("WS proxy: refusing vanished session '%s'", expected)
+                    await _reject_ended_terminal_ws(websocket)
+                    return
                 async with state_lock:
                     state = load_state()
                 if (not expected or not lease
@@ -1554,18 +1572,13 @@ async def terminal_ws_proxy(websocket: WebSocket) -> None:
                     await _reject_stale_terminal_ws(websocket)
                     return
 
-                # Restart after service failure is permitted only for the
-                # matching active lease. Never auto-spawn a stale browser's
-                # different session, or one that no longer exists in tmux.
+                # Only the validated, still-live session can have ttyd
+                # respawned. A dead session must never restart the loop.
                 if not _ttyd_is_listening():
-                    known = get_session_list()
-                    if known and expected not in known:
-                        _log.info("WS proxy: refusing to revive vanished session '%s'", expected)
-                    else:
-                        _log.info("WS proxy: re-spawning ttyd for '%s'", expected)
-                        await kill_ttyd()
-                        await spawn_ttyd(expected)
-                        await asyncio.sleep(0.8)
+                    _log.info("WS proxy: re-spawning ttyd for '%s'", expected)
+                    await kill_ttyd()
+                    await spawn_ttyd(expected)
+                    await asyncio.sleep(0.8)
 
                 # IMPORTANT: websocket.connect and accept are inside the
                 # transition lock; relay happens outside it. AsyncExitStack
@@ -1704,6 +1717,7 @@ async def federation_terminal_ws_proxy(websocket: WebSocket, device_id: str) -> 
                         subprotocols=[Subprotocol("tty")],
                         additional_headers=auth_headers,
                         ssl=ssl_context,
+                        open_timeout=3,
                     )
                 )
                 await websocket.accept(subprotocol="tty")
@@ -1730,8 +1744,11 @@ async def federation_terminal_ws_proxy(websocket: WebSocket, device_id: str) -> 
                     # A remote instance can switch after coordinator validation.
                     # Forward its explicit mismatch close, not an ordinary 1000
                     # that would cause an endless retry loop in the browser.
-                    if exc.code == 4409:
+                    remote_code = exc.rcvd.code if exc.rcvd else None
+                    if remote_code == 4409:
                         await websocket.close(code=4409, reason="Active remote session changed")
+                    elif remote_code == 4404:
+                        await websocket.close(code=4404, reason="Remote terminal session ended")
                     else:
                         _log.debug("federation ws remote closed: %s", exc)
                 except Exception as exc:
