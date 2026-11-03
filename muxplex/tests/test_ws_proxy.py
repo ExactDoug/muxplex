@@ -283,6 +283,11 @@ def test_ws_proxy_refuses_to_spawn_ttyd_for_vanished_session(monkeypatch):
         "muxplex.main.get_session_list", lambda: ["alive-1", "alive-2"]
     )
 
+    async def missing_tmux(*args):
+        raise RuntimeError("ghost does not exist")
+
+    monkeypatch.setattr("muxplex.main.run_tmux", missing_tmux)
+
     with _make_authed_client() as c:
         with c.websocket_connect("/terminal/ws?expected_session=ghost&connection_id=test-lease") as ws:
             assert ws.receive()["code"] == 4404
@@ -297,6 +302,11 @@ def test_ws_vanished_after_poll_cleared_active_lease_reports_4404(monkeypatch):
     from muxplex.state import empty_state, save_state
     save_state(empty_state())  # poll already cleared name and connection lease
     monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["still-live"])
+
+    async def missing_tmux(*args):
+        raise RuntimeError("dead session does not exist")
+
+    monkeypatch.setattr("muxplex.main.run_tmux", missing_tmux)
     attaches = []
     monkeypatch.setattr(
         "muxplex.main.websockets.connect",
@@ -308,6 +318,29 @@ def test_ws_vanished_after_poll_cleared_active_lease_reports_4404(monkeypatch):
         ) as ws:
             assert ws.receive()["code"] == 4404
     assert attaches == [], "a vanished session must not reach ttyd"
+
+
+def test_ws_cache_miss_does_not_end_a_live_new_session(monkeypatch):
+    """A live new session may not appear in the poll cache yet."""
+    probes = []
+
+    async def has_session(*args):
+        probes.append(args)
+        return ""  # tmux has-session exits successfully without output
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    monkeypatch.setattr("muxplex.main.run_tmux", has_session)
+    monkeypatch.setattr(
+        "muxplex.main.websockets.connect",
+        lambda *args, **kw: FakeTtydWs(responses=["live-output"]),
+    )
+    with _make_authed_client() as c:
+        with c.websocket_connect(
+            "/terminal/ws?expected_session=test-session&connection_id=test-lease"
+        ) as ws:
+            assert ws.receive_text() == "live-output"
+
+    assert probes == [("has-session", "-t", "=test-session")]
 
 
 def test_terminal_ws_proxy_does_not_use_receive_bytes():
