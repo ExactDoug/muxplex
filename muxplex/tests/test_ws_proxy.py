@@ -340,7 +340,12 @@ def test_ws_cache_miss_does_not_end_a_live_new_session(monkeypatch):
         ) as ws:
             assert ws.receive_text() == "live-output"
 
-    assert probes == [("has-session", "-t", "=test-session")]
+    # The patch is module-wide, so the app lifespan's own run_tmux calls (the
+    # global alert-bell set-hook at startup) are recorded too. Assert on the
+    # existence probe only: exactly one exact-name has-session.
+    assert [p for p in probes if p[:1] == ("has-session",)] == [
+        ("has-session", "-t", "=test-session")
+    ]
 
 
 def test_terminal_ws_proxy_does_not_use_receive_bytes():

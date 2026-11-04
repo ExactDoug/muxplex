@@ -5,27 +5,28 @@ contracts, gotchas) and carries no status. GitHub Issues own item-level state; t
 referenced here by number and never restated. Per-feature design and rationale live in
 `docs/plans/`, linked below.
 
-Last updated: 2026-11-03 (PR #35 in review; dev11 not merged).
+Last updated: 2026-11-03.
 
 ## Current state
 
-- **`main` @ `79bbb54`**, version **0.9.6.dev10**; PR #35 proposes
-  **0.9.6.dev11** with mandatory terminal connection leases and the frontend
-  cache-buster update. **Not merged, released, or deployed.** The last tagged
-  release remains **0.9.5**.
-- **Verified baseline on main:** frontend suites 543 / 66 / 16 (review of PR #35,
-  2026-11-03). The reviewer ran 1,472 non-integration Python tests successfully
-  on PR #35 at `77ee447`, but reported five failing frontend tests there. Corrections
-  are committed after that head; **the complete updated suites are not yet verified**.
-  Commands are in `CLAUDE.md` § Tests.
-- **Start new work from `main` in a worktree.** `.worktrees/mobile-keybar-fixes` (branch
-  `fix/mobile-keybar-paste-and-geometry`, merged in PR #21) is stale and can be removed.
+- **Version 0.9.6.dev11 on `main`.** It merged 2026-11-03 and has run on this machine's
+  live server since that day. **This fork has no git tags and no GitHub releases.**
+  `CHANGELOG.md` version headings are dev builds, not tagged releases. The last non-dev
+  heading is v0.9.5 (2026-06-19). Upstream `bkrabach/muxplex` tags a separate
+  `v0.6x` line.
+- **Last verified suites (2026-11-03, v0.9.6.dev11):** pytest non-integration
+  **1,477 passed**; frontend `test_app` **550**, `test_terminal` **77**,
+  `test_mobile_keyboard` **16**, all with 0 failures. Commands are in `CLAUDE.md` § Tests.
+  **The suites run locally only.** GitHub Actions has never run on this fork, so CI
+  gates nothing (#38).
+- **Start new work from `main` in a worktree.**
 
 ## Workstreams
 
 | Workstream | Status | Shipped in | Design / record |
 |---|---|---|---|
-| OSC 52 UTF-8 clipboard + lease-bound local/federated navigation (#30, #31) | **IN REVIEW**, PR #35; coordinate all peers and reload browser tabs | pending v0.9.6.dev11 | PR #35, CHANGELOG.md |
+| OSC 52 UTF-8 clipboard + lease-bound local/federated navigation (#30, #31) | **DONE** 2026-11-03. Follow-up #36: stale pre-upgrade tabs should fail closed | PR #35, v0.9.6.dev11 | `CHANGELOG.md` v0.9.6.dev11; `CLAUDE.md` frontend contracts #8, #9 |
+| ttyd port cleanup can SIGTERM the server itself (`lsof -ti :7682` has no LISTEN filter) | Issue #28; fix proposed in PR #29 | — | #28 |
 | Header strip: every project folder as a pill, MRU order, Other Sessions folder menu (#24) | **DONE** 2026-10-06 | PR #25, v0.9.6.dev10 | `docs/plans/2026-10-06-header-project-folders-plan.md` |
 | Mobile keybar: terminal sizing for the iOS keyboard, Paste key | **DONE** 2026-09-16 | PR #21, v0.9.6.dev8–dev9 | `docs/plans/2026-07-27-mobile-terminal-keybar.md` |
 | Mobile keybar follow-ups | **OPEN**: #14, #16, #17, #18, #19, #20, #22, #23 | — | issues |
@@ -58,12 +59,6 @@ when a winner is picked".
 
 ## Candidate follow-ups (no issue filed yet)
 
-- **The production `kill_ttyd` port fallback may be able to SIGTERM the server itself.**
-  It runs `lsof -ti :7682` with no LISTEN filter, which matches *either* end of a connection,
-  and the muxplex server holds a client socket to ttyd while a terminal is open. During the
-  test suite this killed the live ttyd *and* the live server (fixed for tests only, in
-  `e0f6ea2`). What is **unverified** is whether any production path reaches that fallback
-  while a terminal is open.
 - **Make the grid's Settings → Sort → "Recent" real.** It is a no-op today. `/api/sessions`
   now carries `lastAttached` / `created`, which is what it needs.
 - Full arrow-key navigation for the header menus (an accessibility enhancement).
