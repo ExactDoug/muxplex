@@ -71,12 +71,18 @@ async def _wait_for_exit(pid: int, timeout: float) -> bool:
 def _kill_pids_on_port(port: int, sig: int) -> bool:
     """Find and signal all processes listening on *port* via lsof.
 
+    Only LISTENING sockets are matched (``-sTCP:LISTEN``): plain
+    ``lsof -ti :<port>`` matches EITHER end of a connection, so a caller
+    holding client sockets to the port (the muxplex server proxying terminal
+    WebSockets) would signal itself (issue #28).  As belt-and-braces, our own
+    PID is never signalled even if lsof lists it.
+
     Returns True if at least one PID was found and signalled.
     Silently ignores lsof unavailability and already-dead processes.
     """
     try:
         result = _subprocess.run(
-            ["lsof", "-ti", f":{port}"],
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -84,15 +90,21 @@ def _kill_pids_on_port(port: int, sig: int) -> bool:
         if result.returncode != 0 or not result.stdout.strip():
             return False
         sent = False
+        my_pid = os.getpid()
         for pid_str in result.stdout.strip().split("\n"):
             pid_str = pid_str.strip()
             if not pid_str:
                 continue
             try:
                 orphan_pid = int(pid_str)
+            except ValueError:
+                continue
+            if orphan_pid == my_pid:
+                continue
+            try:
                 os.kill(orphan_pid, sig)
                 sent = True
-            except (ValueError, ProcessLookupError, PermissionError):
+            except (ProcessLookupError, PermissionError):
                 pass
         return sent
     except Exception:  # noqa: BLE001

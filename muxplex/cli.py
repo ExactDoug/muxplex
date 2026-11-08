@@ -323,16 +323,20 @@ def _kill_stale_port_holder(port: int) -> None:
     restarts it in an infinite loop (observed: 2075+ restarts before manual
     intervention).
 
-    Uses ``lsof -ti :<port>`` to find occupants, sends SIGTERM, then waits 1 s
-    for the port to free.  Silently swallows all errors so that a missing ``lsof``
-    or a permission error never prevents the server from starting.
+    Uses ``lsof -ti TCP:<port> -sTCP:LISTEN`` to find the listener, sends
+    SIGTERM, then waits 1 s for the port to free.  Plain ``lsof -ti :<port>``
+    matches EITHER end of a connection, so clients of the port (not the port
+    holder) would also be signalled (issue #28); restricting to listening
+    sockets signals only the actual holder.  Silently swallows all errors so
+    that a missing ``lsof`` or a permission error never prevents the server
+    from starting.
     """
     import signal
     import time
 
     try:
         result = subprocess.run(
-            ["lsof", "-ti", f":{port}"],
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
             capture_output=True,
             text=True,
             timeout=5,
