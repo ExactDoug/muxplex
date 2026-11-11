@@ -4512,7 +4512,7 @@ test('index.html loads xterm.css from local /vendor/ path (not CDN)', () => {
   );
 });
 
-test('index.html loads all 5 xterm JS scripts from local /vendor/ paths (not CDN)', () => {
+test('index.html loads all 6 xterm JS scripts from local /vendor/ paths (not CDN)', () => {
   const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   const vendorScripts = [
     '/vendor/xterm.js',
@@ -4520,6 +4520,7 @@ test('index.html loads all 5 xterm JS scripts from local /vendor/ paths (not CDN
     '/vendor/xterm-addon-web-links.js',
     '/vendor/xterm-addon-search.js',
     '/vendor/addon-image.js',
+    '/vendor/xterm-addon-unicode11.js',
   ];
   for (const script of vendorScripts) {
     assert.ok(

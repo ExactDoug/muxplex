@@ -129,7 +129,7 @@ def test_index_all_asset_urls_have_version_suffix(client):
 
 
 def test_index_vendor_scripts_each_versioned(client):
-    """All five vendor JS bundles must carry the version suffix, not just app.js.
+    """All six vendor JS bundles must carry the version suffix, not just app.js.
 
     The browser-tester on spark-1 observed bare vendor URLs.  This test
     ensures that xterm.js and its addons are cache-busted alongside the
@@ -146,6 +146,7 @@ def test_index_vendor_scripts_each_versioned(client):
         f"/vendor/xterm-addon-web-links.js?v={version}",
         f"/vendor/xterm-addon-search.js?v={version}",
         f"/vendor/addon-image.js?v={version}",
+        f"/vendor/xterm-addon-unicode11.js?v={version}",
         f"/app.js?v={version}",
         f"/terminal.js?v={version}",
     ]

@@ -351,6 +351,22 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    terminal. A separate menu Escape listener once closed the menu first, after which the
    fullscreen branch ran `closeSession()`.
 
+13. **xterm.js measures characters with the Unicode 11 table** (v0.9.6.dev12,
+   `vendor/xterm-addon-unicode11.js` 0.6.0, the release paired with xterm 5.3.0) —
+   xterm's built-in Unicode 6 table gives emoji **one** cell, while tmux (glibc
+   `wcwidth`) and the apps inside it (Claude Code's Ink uses `string-width`) give them
+   **two**. That disagreement is not cosmetic: every emoji pulls the rest of its row one
+   column left (jagged table borders, a glyph overlapping its neighbour), and tmux's
+   cursor-addressed redraws then land in the wrong columns. `createTerminal()` loads the
+   addon and sets `_term.unicode.activeVersion = '11'` **before any output is written**
+   (widths are applied as text is parsed, so a late switch leaves existing rows wrong);
+   it needs `allowProposedApi: true`. A missing or failing addon degrades to the default
+   table rather than failing to open the terminal. It is not a font problem, so no font
+   change fixes it. Residual gap (measured against glibc 2.39): about 700 code points
+   glibc calls wide that v11 does not, namely ~110 emoji added after 2018 (🫠, 🛟) and
+   ~600 in rare historic scripts (Khitan, Tangut) and Yijing hexagrams. Do not patch
+   those one by one; a newer width provider is the real fix.
+
 ## Hard-won backend contracts (2026-08-08 efficiency work; tests enforce them)
 
 Full rationale and measurements: `docs/plans/2026-08-08-resource-efficiency-plan.md`.
