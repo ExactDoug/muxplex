@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.9.6.dev12 (unreleased; PR #40, 2026-11-10) — emoji cell widths
+
+### Bug fixes
+
+- **Tables with emoji no longer misalign in the terminal.** xterm.js 5.3 counted emoji
+  such as ✅ 🔍 📊 as one column, while tmux and the programs inside it (Claude Code
+  included) count two. Each emoji pulled the rest of its row one column left, so table
+  borders went jagged, the emoji overlapped the next character, and redraws could leave
+  stray fragments. The terminal now uses the Unicode 11 width table
+  (`xterm-addon-unicode11` 0.6.0, vendored), which agrees with tmux on all but about
+  110 emoji, all added after 2018 (🫠, 🛟 and similar), which still count as one
+  column. Copied text was never affected.
+
+### Deployment
+
+- **Frontend cache-buster bump to 0.9.6.dev12.** After updating, run
+  `uv sync --extra dev` before restarting, then reload open muxplex tabs.
+
 ## v0.9.6.dev11 (unreleased; PR #35, 2026-11-03) — clipboard and session identity
 
 ### Bug fixes
