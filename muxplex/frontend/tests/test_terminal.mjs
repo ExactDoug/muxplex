@@ -1655,10 +1655,24 @@ test('title and preference frames between the halves do not disturb a split char
   openForOutput(t, 'split-utf8');
   const bytes = new TextEncoder().encode('a─b');  // 61 E2 94 80 62
   t.fireMessage(outputFrame(bytes.subarray(0, 2)));
-  const title = new Uint8Array([0x31, 0x78]);
-  t.fireMessage(title.buffer);
+  t.fireMessage(new Uint8Array([0x31, 0x78]).buffer);              // title
+  t.fireMessage(new Uint8Array([0x32, 0x7b, 0x7d]).buffer);        // preferences: {}
   t.fireMessage(outputFrame(bytes.subarray(2)));
   assert.equal(t.termWriteMessages.join(''), 'a─b');
+});
+
+test('an automatic reconnect on the same terminal starts with a fresh decoder (#41)', () => {
+  const t = loadTerminal();
+  openForOutput(t, 'split-utf8');
+  // The first socket drops while holding the first two bytes of ─.
+  t.fireMessage(outputFrame(new Uint8Array([0xE2, 0x94])));
+  const socketsBefore = t.wsCreateCount;
+  t.patchTimeout(() => t.fireClose(1006));  // abnormal close: the retry timer is captured
+  t.fireReconnect();                         // same terminal, replacement socket
+  assert.ok(t.wsCreateCount > socketsBefore, 'the retry opened a replacement socket');
+  t.termWriteMessages.length = 0;
+  t.fireMessage(outputFrame(new TextEncoder().encode('ok')));
+  assert.deepEqual(t.termWriteMessages, ['ok'], 'stale bytes must not leak into the replacement socket');
 });
 
 test('a partial character from one connection never prefixes the next connection (#41)', () => {

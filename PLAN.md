@@ -14,7 +14,7 @@ Last updated: 2026-11-10.
   heading is v0.9.5 (2026-06-19). Upstream `bkrabach/muxplex` tags a separate
   `v0.6x` line.
 - **Last verified suites (2026-11-10, branch `fix/split-utf8-ws-frames`, v0.9.6.dev13):**
-  pytest non-integration **1,477 passed**; frontend `test_app` **550**, `test_terminal` **83**,
+  pytest non-integration **1,477 passed**; frontend `test_app` **550**, `test_terminal` **84**,
   `test_mobile_keyboard` **16**, all with 0 failures. Commands are in `CLAUDE.md` § Tests.
   **The suites run locally only.** GitHub Actions has never run on this fork, so CI
   gates nothing (#38).
