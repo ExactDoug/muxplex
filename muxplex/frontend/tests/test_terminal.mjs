@@ -36,7 +36,9 @@ function makeContainerStub() {
   };
 }
 
-function loadTerminal() {
+// opts.unicode11: undefined → no Unicode11Addon global (the historical harness);
+//   'real' → the actual vendored addon file; 'broken' → an addon that registers nothing.
+function loadTerminal(opts = {}) {
   // Delete from require cache so each test gets fresh module-level state
   const modulePath = join(__dirname, '..', 'terminal.js');
   delete require.cache[require.resolve(modulePath)];
@@ -57,6 +59,12 @@ function loadTerminal() {
   let onDataCallCount = 0;
   let onResizeCallCount = 0;
   let focusCallCount = 0;
+  const loadedAddons = [];
+  // Mirrors xterm's UnicodeService: v6 is built in, addons register more, and
+  // setting an unregistered activeVersion throws.
+  const unicodeProviders = { '6': { version: '6' } };
+  let unicodeActiveVersion = '6';
+  let writesBeforeUnicodeActivation = null;
 
   const mockTerm = {
     cols: 80,
@@ -64,7 +72,21 @@ function loadTerminal() {
     open: () => {},
     onData: (fn) => { onDataCallCount++; capturedOnDataFn = fn; },
     onResize: (fn) => { onResizeCallCount++; capturedOnResizeFn = fn; },
-    loadAddon: () => {},
+    // Like xterm: loadAddon() calls the addon's activate(terminal).
+    loadAddon: (addon) => {
+      loadedAddons.push(addon);
+      if (addon && typeof addon.activate === 'function') addon.activate(mockTerm);
+    },
+    unicode: {
+      register: (provider) => { unicodeProviders[provider.version] = provider; },
+      get versions() { return Object.keys(unicodeProviders); },
+      get activeVersion() { return unicodeActiveVersion; },
+      set activeVersion(v) {
+        if (!unicodeProviders[v]) throw new Error(`unknown Unicode version "${v}"`);
+        unicodeActiveVersion = v;
+        writesBeforeUnicodeActivation = termWriteMessages.length;
+      },
+    },
     dispose: () => {},
     write: (data) => { termWriteMessages.push(data); },
     focus: () => { focusCallCount++; },
@@ -128,6 +150,11 @@ function loadTerminal() {
     _openTerminal: undefined,
     _closeTerminal: undefined,
   };
+  if (opts.unicode11 === 'real') {
+    globalThis.window.Unicode11Addon = require(join(__dirname, '..', 'vendor', 'xterm-addon-unicode11.js'));
+  } else if (opts.unicode11 === 'broken') {
+    globalThis.window.Unicode11Addon = { Unicode11Addon: function Unicode11Addon() { return { activate() {} }; } };
+  }
 
   require(modulePath);
 
@@ -167,6 +194,10 @@ function loadTerminal() {
     get osc52Handler() { return capturedOsc52Handler; },
     get termWriteMessages() { return termWriteMessages; },
     get focusCallCount() { return focusCallCount; },
+    get loadedAddons() { return loadedAddons; },
+    get unicodeActiveVersion() { return unicodeActiveVersion; },
+    get writesBeforeUnicodeActivation() { return writesBeforeUnicodeActivation; },
+    unicodeProvider(v) { return unicodeProviders[v]; },
     fireClose(code) { if (capturedCloseHandler) capturedCloseHandler(code == null ? {} : { code }); },
     fireOpen() { if (lastOpenHandler) lastOpenHandler(); },
     fireMessage(data) {
@@ -1218,6 +1249,70 @@ test('OSC 52 ignores clipboard queries, empty and malformed payloads without ove
     if (oldClipboard === undefined) delete globalThis.navigator.clipboard;
     else globalThis.navigator.clipboard = oldClipboard;
     t.closeTerminal();
+  }
+});
+
+// --- Emoji cell widths (Unicode 11 width table) ---
+// xterm.js 5.3's built-in Unicode 6 table gives emoji ONE cell; tmux (glibc wcwidth)
+// and Claude Code (string-width) give them TWO, so every emoji in a table row pulled
+// the rest of the row one column left. These run the REAL vendored addon.
+
+test('openTerminal activates the Unicode 11 width table before any output is written', () => {
+  const t = loadTerminal({ unicode11: 'real' });
+  const oldTimeout = globalThis.setTimeout;
+  try {
+    globalThis.setTimeout = () => 1;
+    t.openTerminal('emoji-widths');
+    assert.equal(t.unicodeActiveVersion, '11', 'emoji must be measured with the Unicode 11 table');
+    assert.equal(t.writesBeforeUnicodeActivation, 0, 'widths must be set before the first write');
+    const Unicode11Addon = globalThis.window.Unicode11Addon.Unicode11Addon;
+    assert.ok(t.loadedAddons.some((a) => a instanceof Unicode11Addon), 'the vendored addon must be loaded');
+  } finally {
+    globalThis.setTimeout = oldTimeout;
+    t.closeTerminal();
+  }
+});
+
+test('Unicode 11 table counts table emoji as two cells and box drawing as one', () => {
+  const t = loadTerminal({ unicode11: 'real' });
+  const oldTimeout = globalThis.setTimeout;
+  try {
+    globalThis.setTimeout = () => 1;
+    t.openTerminal('emoji-widths');
+    const p = t.unicodeProvider('11');
+    const width = (s) => [...s].reduce((n, ch) => n + p.wcwidth(ch.codePointAt(0)), 0);
+    for (const ch of [...'✅❌💡⬜📌🔍📊📝💾🧹📡😀日']) {
+      assert.equal(p.wcwidth(ch.codePointAt(0)), 2, `${ch} must be two cells`);
+    }
+    for (const ch of [...'─│┌┬┐├┼┤└┴┘●❯⏺é']) {
+      assert.equal(p.wcwidth(ch.codePointAt(0)), 1, `${ch} must be one cell`);
+    }
+    // A Claude Code table row and its separator, padded for two-cell emoji, must
+    // measure the same; under the v6 table the row came out two columns short.
+    const sep = '├────────────┼────────────────────────┼─────────────────┤';
+    const row = '│ 8:56       │ 📡 Disk monitoring     │ ✅ Done         │';
+    assert.equal(width(row), width(sep));
+  } finally {
+    globalThis.setTimeout = oldTimeout;
+    t.closeTerminal();
+  }
+});
+
+test('openTerminal still opens with the default widths when the Unicode 11 addon is absent or fails', () => {
+  for (const mode of [undefined, 'broken']) {
+    const t = loadTerminal({ unicode11: mode });
+    const oldTimeout = globalThis.setTimeout;
+    const oldWarn = console.warn;
+    console.warn = () => {};
+    try {
+      globalThis.setTimeout = () => 1;
+      assert.doesNotThrow(() => t.openTerminal('emoji-widths'), `mode=${mode}`);
+      assert.equal(t.unicodeActiveVersion, '6', `mode=${mode}: falls back to the built-in table`);
+    } finally {
+      console.warn = oldWarn;
+      globalThis.setTimeout = oldTimeout;
+      t.closeTerminal();
+    }
   }
 });
 

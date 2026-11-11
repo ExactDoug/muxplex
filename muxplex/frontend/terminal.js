@@ -704,6 +704,26 @@ function createTerminal(fontSize) {
   _fitAddon = new window.FitAddon.FitAddon();
   _term.loadAddon(_fitAddon);
 
+  // Character widths: count emoji as two columns, as tmux and the apps inside it do.
+  // xterm.js 5.3 ships only the Unicode 6 width table, which predates wide emoji, so
+  // ✅ 🔍 📊 etc. get ONE cell while glibc wcwidth (tmux) and string-width (Claude
+  // Code, Ink) give them two. Every emoji then pulls the rest of its row one column
+  // left: table borders go jagged, the glyph overlaps its neighbour, and tmux's
+  // cursor-addressed redraws land in the wrong columns. Unicode 11 matches glibc for
+  // all but ~700 code points: ~110 emoji added after 2018 (🫠, 🛟) and ~600 in rare
+  // historic scripts (Khitan, Tangut) and Yijing hexagrams. Must activate before
+  // any output is written; needs allowProposedApi (set above). Degrade to xterm's
+  // default table if the addon is missing rather than fail to open the terminal.
+  var Unicode11Addon = window.Unicode11Addon && window.Unicode11Addon.Unicode11Addon;
+  if (Unicode11Addon) {
+    try {
+      _term.loadAddon(new Unicode11Addon());
+      _term.unicode.activeVersion = '11';
+    } catch (e) {
+      console.warn('[terminal] Unicode 11 widths unavailable; emoji may misalign:', e);
+    }
+  }
+
   // Clickable URLs — Ctrl+Click (Windows/Linux) or Cmd+Click (macOS) opens in new tab.
   // xterm-addon-web-links auto-detects URLs and adds hover underlines.
   // Plain click is preserved for normal terminal text selection.
