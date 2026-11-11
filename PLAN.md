@@ -9,13 +9,12 @@ Last updated: 2026-11-10.
 
 ## Current state
 
-- **Version 0.9.6.dev11 on `main`.** It merged 2026-11-03 and has run on this machine's
-  live server since that day. **This fork has no git tags and no GitHub releases.**
+- **Version 0.9.6.dev12 on `main`** (PR #40, merged 2026-11-10). **This fork has no git tags and no GitHub releases.**
   `CHANGELOG.md` version headings are dev builds, not tagged releases. The last non-dev
   heading is v0.9.5 (2026-06-19). Upstream `bkrabach/muxplex` tags a separate
   `v0.6x` line.
-- **Last verified suites (2026-11-03, v0.9.6.dev11):** pytest non-integration
-  **1,477 passed**; frontend `test_app` **550**, `test_terminal` **77**,
+- **Last verified suites (2026-11-10, branch `fix/split-utf8-ws-frames`, v0.9.6.dev13):**
+  pytest non-integration **1,477 passed**; frontend `test_app` **550**, `test_terminal` **83**,
   `test_mobile_keyboard` **16**, all with 0 failures. Commands are in `CLAUDE.md` § Tests.
   **The suites run locally only.** GitHub Actions has never run on this fork, so CI
   gates nothing (#38).
@@ -25,7 +24,8 @@ Last updated: 2026-11-10.
 
 | Workstream | Status | Shipped in | Design / record |
 |---|---|---|---|
-| Emoji cell widths: tables with emoji misaligned because xterm.js counted emoji as one column (tmux counts two) | **IN REVIEW**, PR #40 | v0.9.6.dev12 (branch `fix/emoji-cell-width`) | `CHANGELOG.md` v0.9.6.dev12; `CLAUDE.md` frontend contract #13 |
+| Split UTF-8 characters across WebSocket messages showed `�` and stray border fragments (#41) | **IN REVIEW**, PR #42 | v0.9.6.dev13 (branch `fix/split-utf8-ws-frames`) | `CHANGELOG.md` v0.9.6.dev13; `CLAUDE.md` frontend contract #14 |
+| Emoji cell widths: tables with emoji misaligned because xterm.js counted emoji as one column (tmux counts two) | **DONE** 2026-11-10 | PR #40, v0.9.6.dev12 | `CHANGELOG.md` v0.9.6.dev12; `CLAUDE.md` frontend contract #13 |
 | OSC 52 UTF-8 clipboard + lease-bound local/federated navigation (#30, #31) | **DONE** 2026-11-03. Follow-up #36: stale pre-upgrade tabs should fail closed | PR #35, v0.9.6.dev11 | `CHANGELOG.md` v0.9.6.dev11; `CLAUDE.md` frontend contracts #8, #9 |
 | ttyd port cleanup can SIGTERM the server itself (`lsof -ti :7682` has no LISTEN filter) | Issue #28; fix proposed in PR #29 | — | #28 |
 | Header strip: every project folder as a pill, MRU order, Other Sessions folder menu (#24) | **DONE** 2026-10-06 | PR #25, v0.9.6.dev10 | `docs/plans/2026-10-06-header-project-folders-plan.md` |
@@ -60,6 +60,14 @@ when a winner is picked".
 
 ## Candidate follow-ups (no issue filed yet)
 
+- **Decide whether to sync with upstream.** Checked 2026-11-10: this fork is **508 commits
+  behind and 146 ahead** of `bkrabach/muxplex` `main`, merge base `57a4c77` (2026-05-18).
+  Upstream had already fixed two bugs this fork fixed again independently: OSC 52 UTF-8
+  copy (upstream #9, 2026-07-10; ours #30) and Unicode 11 emoji widths (upstream #50,
+  2026-08-18; ours PR #40, the same add-on and activation). The split-character decode
+  (#41) is **not** fixed upstream; its `terminal.js` still decodes each message on its
+  own, so that fix could go upstream. Before re-solving a terminal bug, check upstream's
+  history first.
 - **Make the grid's Settings → Sort → "Recent" real.** It is a no-op today. `/api/sessions`
   now carries `lastAttached` / `created`, which is what it needs.
 - Full arrow-key navigation for the header menus (an accessibility enhancement).
