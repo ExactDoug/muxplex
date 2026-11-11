@@ -5,7 +5,7 @@ contracts, gotchas) and carries no status. GitHub Issues own item-level state; t
 referenced here by number and never restated. Per-feature design and rationale live in
 `docs/plans/`, linked below.
 
-Last updated: 2026-11-03.
+Last updated: 2026-11-10.
 
 ## Current state
 
@@ -25,6 +25,7 @@ Last updated: 2026-11-03.
 
 | Workstream | Status | Shipped in | Design / record |
 |---|---|---|---|
+| Emoji cell widths: tables with emoji misaligned because xterm.js counted emoji as one column (tmux counts two) | **IN REVIEW**, PR #40 | v0.9.6.dev12 (branch `fix/emoji-cell-width`) | `CHANGELOG.md` v0.9.6.dev12; `CLAUDE.md` frontend contract #13 |
 | OSC 52 UTF-8 clipboard + lease-bound local/federated navigation (#30, #31) | **DONE** 2026-11-03. Follow-up #36: stale pre-upgrade tabs should fail closed | PR #35, v0.9.6.dev11 | `CHANGELOG.md` v0.9.6.dev11; `CLAUDE.md` frontend contracts #8, #9 |
 | ttyd port cleanup can SIGTERM the server itself (`lsof -ti :7682` has no LISTEN filter) | Issue #28; fix proposed in PR #29 | — | #28 |
 | Header strip: every project folder as a pill, MRU order, Other Sessions folder menu (#24) | **DONE** 2026-10-06 | PR #25, v0.9.6.dev10 | `docs/plans/2026-10-06-header-project-folders-plan.md` |
