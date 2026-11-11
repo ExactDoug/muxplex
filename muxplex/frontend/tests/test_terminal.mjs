@@ -1608,6 +1608,77 @@ test('message handler writes decoded UTF-8 string (not raw Uint8Array) to xterm'
     'decoded output must be the original Unicode character ─, not garbled â bytes');
 });
 
+// --- Characters split across WebSocket messages (#41) ---
+// ttyd frames output at arbitrary byte boundaries. Decoding each message on its own
+// turned a split character into 2–3 U+FFFD (each a full column), shifting the rest of
+// the line right of where tmux thinks it is and leaving stray border fragments behind.
+
+function outputFrame(bytes) {
+  const msg = new Uint8Array(1 + bytes.length);
+  msg[0] = 0x30;
+  msg.set(bytes, 1);
+  return msg.buffer;
+}
+
+function openForOutput(t, name) {
+  const orig = globalThis.setTimeout;
+  globalThis.setTimeout = () => 0;
+  try { t.openTerminal(name); } finally { globalThis.setTimeout = orig; }
+}
+
+test('a character split across output messages is written intact, never as U+FFFD (#41)', () => {
+  const cases = [
+    ['─', [1]],          // E2 | 94 80  → was ���
+    ['─', [2]],          // E2 94 | 80  → was ��
+    ['😀', [1, 2]],      // F0 | 9F | 98 80, a 4-byte emoji in three messages
+    ['├──┼✅┤ é 日', [2, 5, 9, 13]],  // a table fragment cut in several places
+    ['\x1b[31m─\x1b[0m│\x1b[1;5H', [3, 6, 13]],  // cut inside an escape AND inside ─
+  ];
+  for (const [text, cuts] of cases) {
+    const t = loadTerminal();
+    openForOutput(t, 'split-utf8');
+    const bytes = new TextEncoder().encode(text);
+    let start = 0;
+    for (const cut of [...cuts, bytes.length]) {
+      t.fireMessage(outputFrame(bytes.subarray(start, cut)));
+      start = cut;
+    }
+    const written = t.termWriteMessages.join('');
+    assert.equal(written, text, `${JSON.stringify(text)} cut at ${cuts}`);
+    assert.doesNotMatch(written, /�/, 'no replacement characters');
+    assert.ok(t.termWriteMessages.every((m) => m.length > 0), 'no empty writes for a partial-only message');
+  }
+});
+
+test('title and preference frames between the halves do not disturb a split character (#41)', () => {
+  const t = loadTerminal();
+  openForOutput(t, 'split-utf8');
+  const bytes = new TextEncoder().encode('a─b');  // 61 E2 94 80 62
+  t.fireMessage(outputFrame(bytes.subarray(0, 2)));
+  const title = new Uint8Array([0x31, 0x78]);
+  t.fireMessage(title.buffer);
+  t.fireMessage(outputFrame(bytes.subarray(2)));
+  assert.equal(t.termWriteMessages.join(''), 'a─b');
+});
+
+test('a partial character from one connection never prefixes the next connection (#41)', () => {
+  const t = loadTerminal();
+  openForOutput(t, 'split-utf8');
+  // The first socket dies holding the first two bytes of ─.
+  t.fireMessage(outputFrame(new Uint8Array([0xE2, 0x94])));
+  const origTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = () => 0;
+  try {
+    t.closeTerminal();
+    t.openTerminal('split-utf8-next');  // a fresh socket, as on a session switch
+  } finally {
+    globalThis.setTimeout = origTimeout;
+  }
+  t.termWriteMessages.length = 0;
+  t.fireMessage(outputFrame(new TextEncoder().encode('ok')));
+  assert.deepEqual(t.termWriteMessages, ['ok'], 'stale bytes must not leak into the new connection');
+});
+
 // --- Federation reconnect routing ---
 
 test('terminal.js reconnect uses federation connect path for remote sessions', () => {

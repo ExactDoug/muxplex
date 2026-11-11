@@ -128,11 +128,7 @@ function hideSessionEndedOverlay() {
 // ─── Module-level encoding helpers ──────────────────────────────────────────
 // Hoisted here so the clipboard key handler (in openTerminal) can also use them.
 const _encoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
-// TextDecoder: used to decode UTF-8 bytes received from ttyd before writing to xterm.js.
-// xterm.js write(Uint8Array) treats each byte as Latin-1, not UTF-8 — multi-byte characters
-// like ─ (U+2500, bytes E2 94 80) render as â (Latin-1 0xE2) without decoding first.
-// Matches ttyd's official client pattern: textDecoder.decode(payload) → _term.write(string).
-const _decoder = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
+// Output decoding lives in _connectWebSocket(): one streaming TextDecoder per socket (#41).
 
 function _encodePayload(typeChar, str) {
   // Returns Uint8Array: [typeCharCode, ...utf8bytes]
@@ -335,6 +331,16 @@ function connectWebSocket(name, remoteId, connectionId) {
     const ws = new WebSocket(url, ['tty']);
     _ws = ws;
     ws.binaryType = 'arraybuffer';
+    // ttyd frames PTY output at arbitrary byte boundaries, so one UTF-8 character can
+    // arrive split across two messages. Decoding each message on its own turned the
+    // halves into two or three U+FFFD, each a full column wide: the rest of the line
+    // drew one or two columns right of where tmux thinks it is, and tmux's later
+    // in-place redraw left the overshoot behind as stray border fragments (#41).
+    // decode(…, { stream: true }) holds a partial character until its last byte
+    // arrives. One decoder PER SOCKET, so a partial sequence from a dead connection
+    // can never prefix the next connection's output. (The vendored xterm 5.3.0 would
+    // also decode a Uint8Array itself, split-safe; the fallback below relies on that.)
+    const decoder = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
 
     ws.addEventListener('open', function() {
       if (ws !== _ws || !isCurrentTerminal()) return; // stale socket/session
@@ -380,8 +386,10 @@ function connectWebSocket(name, remoteId, connectionId) {
         var msgType = msg[0];
         var payload = msg.slice(1);
         if (msgType === 0x30) {  // '0' = terminal output — write to xterm.js
-          // decode: Uint8Array → UTF-8 string. write(Uint8Array) treats bytes as Latin-1.
-          _term.write(_decoder ? _decoder.decode(payload) : payload);
+          // Streaming decode (see `decoder` above): a message ending mid-character
+          // yields only its complete characters; the rest waits for the next one.
+          var text = decoder ? decoder.decode(payload, { stream: true }) : payload;
+          if (text.length) _term.write(text);
         }
         // 0x31 ('1') = window title, 0x32 ('2') = preferences — ignore for now
       } else if (typeof e.data === 'string') {
