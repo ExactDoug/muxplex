@@ -33,6 +33,13 @@ uv run muxplex serve         # http://127.0.0.1:8088 — settings from ~/.config
   the hardcoded port 7682) and re-points the global tmux `alert-bell` hook at itself. Verify
   backend changes through the pytest `TestClient`; to move the live server to another
   checkout, stop the old one first.
+- **Testing a PR branch on the live server** (the owner tests fixes live before merging):
+  `uv sync --extra dev` in the branch's worktree, stop the running server (its PID is on
+  `ss -ltnp 'sport = :8088'`; SIGTERM and wait for it to exit), then start
+  `.venv/bin/muxplex serve` **from the worktree** with the `setsid nohup` line above.
+  tmux sessions survive; only ttyd's single PID is stopped. After the merge, `git pull` and
+  `uv sync --extra dev` in the root checkout and move the server back **before** removing
+  the worktree, or it keeps running from a deleted directory. Reload open tabs each time.
 - **Stopping a foreground `serve` leaves no orphan** as of the Phase 0/1 efficiency work:
   ttyd is spawned with `start_new_session=True` (so it survives the spawning HTTP
   request) and therefore does NOT receive the Ctrl-C SIGINT; the lifespan shutdown now

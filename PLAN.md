@@ -9,22 +9,28 @@ Last updated: 2026-11-10.
 
 ## Current state
 
-- **Version 0.9.6.dev12 on `main`** (PR #40, merged 2026-11-10). **This fork has no git tags and no GitHub releases.**
+- **Version 0.9.6.dev13 on `main`** (PR #42, merged 2026-11-10). The live server runs it from
+  the root checkout as a detached process (not a service), restarted 2026-11-10 22:41.
+  **This fork has no git tags and no GitHub releases.**
   `CHANGELOG.md` version headings are dev builds, not tagged releases. The last non-dev
   heading is v0.9.5 (2026-06-19). Upstream `bkrabach/muxplex` tags a separate
   `v0.6x` line.
-- **Last verified suites (2026-11-10, branch `fix/split-utf8-ws-frames`, v0.9.6.dev13):**
+- **Last verified suites (2026-11-10, `main` @ `da4e178`, v0.9.6.dev13):**
   pytest non-integration **1,477 passed**; frontend `test_app` **550**, `test_terminal` **84**,
   `test_mobile_keyboard` **16**, all with 0 failures. Commands are in `CLAUDE.md` § Tests.
   **The suites run locally only.** GitHub Actions has never run on this fork, so CI
   gates nothing (#38).
+- **Terminal Unicode display (#40, #41), owner-checked on the live server.** After #40 the
+  owner reported emoji tables "WAY better". #41's `�` and right-edge fragments appeared
+  while wheel-scrolling a large table; none were reported after #42 shipped. If any
+  reappear, capture a screenshot and the scrolled content before assuming a new cause.
 - **Start new work from `main` in a worktree.**
 
 ## Workstreams
 
 | Workstream | Status | Shipped in | Design / record |
 |---|---|---|---|
-| Split UTF-8 characters across WebSocket messages showed `�` and stray border fragments (#41) | **IN REVIEW**, PR #42 | v0.9.6.dev13 (branch `fix/split-utf8-ws-frames`) | `CHANGELOG.md` v0.9.6.dev13; `CLAUDE.md` frontend contract #14 |
+| Split UTF-8 characters across WebSocket messages showed `�` and stray border fragments (#41) | **DONE** 2026-11-10 | PR #42, v0.9.6.dev13 | `CHANGELOG.md` v0.9.6.dev13; `CLAUDE.md` frontend contract #14 |
 | Emoji cell widths: tables with emoji misaligned because xterm.js counted emoji as one column (tmux counts two) | **DONE** 2026-11-10 | PR #40, v0.9.6.dev12 | `CHANGELOG.md` v0.9.6.dev12; `CLAUDE.md` frontend contract #13 |
 | OSC 52 UTF-8 clipboard + lease-bound local/federated navigation (#30, #31) | **DONE** 2026-11-03. Follow-up #36: stale pre-upgrade tabs should fail closed | PR #35, v0.9.6.dev11 | `CHANGELOG.md` v0.9.6.dev11; `CLAUDE.md` frontend contracts #8, #9 |
 | ttyd port cleanup can SIGTERM the server itself (`lsof -ti :7682` has no LISTEN filter) | Issue #28; fix proposed in PR #29 | — | #28 |
@@ -60,6 +66,9 @@ when a winner is picked".
 
 ## Candidate follow-ups (no issue filed yet)
 
+- **Clipboard write failures are silent.** `_copyToClipboard` in `terminal.js` swallows a
+  rejected `navigator.clipboard.writeText()` (`.catch(function() {})`), so a blocked copy
+  gives no feedback. Noted in #30's investigation; never tracked.
 - **Decide whether to sync with upstream.** Checked 2026-11-10: this fork is **508 commits
   behind and 146 ahead** of `bkrabach/muxplex` `main`, merge base `57a4c77` (2026-05-18).
   Upstream had already fixed two bugs this fork fixed again independently: OSC 52 UTF-8
