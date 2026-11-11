@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.9.6.dev13 (unreleased; PR #42, 2026-11-10) — split UTF-8 characters
+
+### Bug fixes
+
+- **No more `�` and stray border fragments while scrolling (#41).** ttyd sends terminal
+  output in chunks cut at arbitrary byte boundaries, and each chunk was decoded on its own,
+  so a character split across two chunks became two or three `�`. Each `�` took a column,
+  which pushed the rest of the line right of where tmux thought it was, and tmux's later
+  redraw left the overshoot behind as stray `┤` / `─┤` fragments past a table's right
+  edge. Wheel-scrolling a large table made it frequent. Output is now decoded as a stream,
+  with one decoder per connection.
+
+### Deployment
+
+- **Frontend cache-buster bump to 0.9.6.dev13.** After updating, run
+  `uv sync --extra dev` before restarting, then reload open muxplex tabs.
+
 ## v0.9.6.dev12 (unreleased; PR #40, 2026-11-10) — emoji cell widths
 
 ### Bug fixes

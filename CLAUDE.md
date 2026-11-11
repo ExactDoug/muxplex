@@ -367,6 +367,22 @@ Decided 2026-06-04 (fork PRs #1/#2); details in `CHANGELOG.md` v0.6.8 and
    ~600 in rare historic scripts (Khitan, Tangut) and Yijing hexagrams. Do not patch
    those one by one; a newer width provider is the real fix.
 
+14. **Terminal output is decoded as a STREAM, one decoder per socket** (v0.9.6.dev13,
+   #41) — ttyd frames PTY output at arbitrary byte boundaries, so a UTF-8 character can
+   be split across two `0x30` messages. Decoding each message on its own turns the halves
+   into two or three U+FFFD, each a full column: the rest of the line draws right of
+   where tmux thinks it is, and tmux's in-place redraws (no erase-to-end, since it
+   believes those cells are blank) leave the overshoot behind as stray `┤`/`─┤`
+   fragments. `_connectWebSocket()` therefore creates a `TextDecoder` **per socket** and
+   calls `decode(payload, { stream: true })`, skipping the write when a message held only
+   a partial character. Do not hoist it back to module scope: a shared streaming decoder
+   carries a dead socket's partial bytes into the next connection (a test pins this). The
+   old comment claiming `xterm.write(Uint8Array)` reads bytes as Latin-1 was **false** for
+   the vendored 5.3.0, which decodes UTF-8 byte arrays itself, split-safe (verified);
+   passing raw bytes would also work, but strings to `write()` is the established
+   contract here. The OSC 52 handler keeps its own separate `fatal` decoder, since each
+   call decodes one complete payload.
+
 ## Hard-won backend contracts (2026-08-08 efficiency work; tests enforce them)
 
 Full rationale and measurements: `docs/plans/2026-08-08-resource-efficiency-plan.md`.
